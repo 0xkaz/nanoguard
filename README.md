@@ -188,7 +188,10 @@ User dictionaries follow the standard format with the entity name in the second 
 enabled = true
 action  = "mask"
 dict_paths = ["dicts/my-org-pii.txt"]
+placeholder_style = "bare"   # "bare" | "indexed" | "llm_guard"
 ```
+
+`placeholder_style` controls how matches are formatted. The default `bare` style emits `[EMAIL]`, which is fastest but loses the distinction between different values. `indexed` emits `[EMAIL_1]`, `[EMAIL_2]` so the LLM can tell apart two distinct emails in the same prompt — this is also a stepping stone toward Vault-backed deanonymization. `llm_guard` emits `[REDACTED_EMAIL_1]` for wire-compatibility with prompts that follow the LLM Guard convention.
 
 #### Obfuscation handling
 

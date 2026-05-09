@@ -142,6 +142,16 @@ pub struct PiiConfig {
     /// top of the built-in entity set; appears as `[ENTITY_NAME]` placeholders.
     #[serde(default)]
     pub dict_paths: Vec<String>,
+    /// Placeholder format. "bare" → `[EMAIL]`, "indexed" → `[EMAIL_1]`,
+    /// "llm_guard" → `[REDACTED_EMAIL_1]`. Indexed forms preserve information
+    /// when the same prompt has multiple distinct values of one entity type
+    /// and are required for future Vault-backed deanonymization.
+    #[serde(default = "default_placeholder_style")]
+    pub placeholder_style: String,
+}
+
+fn default_placeholder_style() -> String {
+    "bare".to_string()
 }
 
 impl Default for PiiConfig {
@@ -150,6 +160,7 @@ impl Default for PiiConfig {
             enabled: true,
             action: PiiAction::Mask,
             dict_paths: vec![],
+            placeholder_style: default_placeholder_style(),
         }
     }
 }

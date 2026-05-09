@@ -21,11 +21,16 @@ async fn main() -> Result<()> {
 
     let matchers = Arc::new(matcher::Matchers::build(&cfg.input.keyword)?);
     tracing::info!("matcher engine: {}", matchers.engine_name());
-    let redactor = Arc::new(proxy::redact::Redactor::build(
+    let redactor = Arc::new(proxy::redact::Redactor::build_with_style(
         &proxy::redact::default_inline_patterns(),
         &cfg.input.pii.dict_paths,
+        proxy::redact::PlaceholderStyle::from_str(&cfg.input.pii.placeholder_style),
     )?);
-    tracing::info!("redactor: {} entity rules", redactor.rule_count());
+    tracing::info!(
+        "redactor: {} entity rules, style={:?}",
+        redactor.rule_count(),
+        redactor.style()
+    );
     let backend = backend::Backend::new(cfg.backend.clone());
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
 

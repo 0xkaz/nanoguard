@@ -1,21 +1,50 @@
 //! Entity-named PII redactor.
 //!
-//! Replaces matches with `[<ENTITY_NAME>]` placeholders. Patterns are loaded
-//! from a `dicts/pii-regex.txt`-style file plus an inline default set, so
-//! users can tune the entity list without recompiling.
+//! Replaces matches with `[<ENTITY_NAME>]` (or indexed variants) placeholders.
+//! Patterns are loaded from a `dicts/pii-regex.txt`-style file plus an inline
+//! default set, so users can tune the entity list without recompiling.
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
+/// How replacement placeholders are formatted.
+///
+/// - `Bare`: legacy `[<ENTITY>]` — stateless, fastest, but two emails collapse
+///   to the same placeholder so the LLM cannot distinguish them.
+/// - `Indexed`: `[<ENTITY>_<N>]` — same value reuses the same index within
+///   one text scan; different values get different indices. Required step
+///   toward reversible (Vault-backed) deanonymization.
+/// - `LlmGuard`: `[REDACTED_<ENTITY>_<N>]` — wire-compatible with prompts
+///   that follow the LLM Guard convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderStyle {
+    Bare,
+    Indexed,
+    LlmGuard,
+}
+
+impl PlaceholderStyle {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "indexed" => PlaceholderStyle::Indexed,
+            "llm_guard" | "llmguard" => PlaceholderStyle::LlmGuard,
+            _ => PlaceholderStyle::Bare,
+        }
+    }
+}
+
 pub struct Redactor {
     rules: Vec<RedactRule>,
+    style: PlaceholderStyle,
 }
 
 struct RedactRule {
     #[allow(dead_code)] // used in upcoming per-entity action map
     entity: String,
-    placeholder: String,
+    placeholder: String, // pre-formatted bare placeholder; ignored for indexed styles
     regex: Regex,
 }
 
@@ -26,6 +55,14 @@ impl Redactor {
     /// reuses the existing dict loader convention but keys patterns by
     /// entity name, not by BLOCK/ALERT/FLAG).
     pub fn build(inline: &[(&str, &str)], dict_paths: &[String]) -> Result<Self> {
+        Self::build_with_style(inline, dict_paths, PlaceholderStyle::Bare)
+    }
+
+    pub fn build_with_style(
+        inline: &[(&str, &str)],
+        dict_paths: &[String],
+        style: PlaceholderStyle,
+    ) -> Result<Self> {
         let mut rules = Vec::new();
         for (entity, pattern) in inline {
             rules.push(compile(entity, pattern)?);
@@ -34,11 +71,15 @@ impl Redactor {
             load_redactor_file(path, &mut rules)
                 .with_context(|| format!("loading redactor file {path}"))?;
         }
-        Ok(Self { rules })
+        Ok(Self { rules, style })
     }
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    pub fn style(&self) -> PlaceholderStyle {
+        self.style
     }
 
     pub fn contains_pii(&self, text: &str) -> bool {
@@ -46,12 +87,46 @@ impl Redactor {
     }
 
     pub fn redact_text(&self, text: &str) -> String {
+        match self.style {
+            PlaceholderStyle::Bare => self.redact_text_bare(text),
+            PlaceholderStyle::Indexed | PlaceholderStyle::LlmGuard => {
+                self.redact_text_indexed(text)
+            }
+        }
+    }
+
+    fn redact_text_bare(&self, text: &str) -> String {
         let mut out = text.to_string();
         for rule in &self.rules {
             out = rule
                 .regex
                 .replace_all(&out, rule.placeholder.as_str())
                 .into_owned();
+        }
+        out
+    }
+
+    /// Indexed redaction: assign a per-(entity, value) index inside one text
+    /// scan. The same original value reuses the same index; different values
+    /// for the same entity type get separate indices. Output format depends
+    /// on `self.style` (Indexed vs LlmGuard).
+    fn redact_text_indexed(&self, text: &str) -> String {
+        let mut indexer = Indexer::new(self.style);
+        // Walk rules in declaration order to preserve precedence (more specific
+        // patterns listed first win). For each rule, find all matches and
+        // substitute with a stable indexed placeholder.
+        let mut out = text.to_string();
+        for rule in &self.rules {
+            // Collect all matches; replace from right to left so offsets stay valid.
+            let matches: Vec<(usize, usize, String)> = rule
+                .regex
+                .find_iter(&out)
+                .map(|m| (m.start(), m.end(), m.as_str().to_string()))
+                .collect();
+            for (start, end, value) in matches.into_iter().rev() {
+                let placeholder = indexer.placeholder(&rule.entity, &value);
+                out.replace_range(start..end, &placeholder);
+            }
         }
         out
     }
@@ -91,6 +166,44 @@ impl Redactor {
             }
         }
         changed
+    }
+}
+
+/// Per-text indexer that assigns stable placeholders to (entity, value) pairs.
+struct Indexer {
+    style: PlaceholderStyle,
+    /// (entity, value) → assigned index, so duplicate values reuse one index.
+    seen: HashMap<(String, String), u32>,
+    /// entity → next free index counter.
+    next: HashMap<String, u32>,
+}
+
+impl Indexer {
+    fn new(style: PlaceholderStyle) -> Self {
+        Self {
+            style,
+            seen: HashMap::new(),
+            next: HashMap::new(),
+        }
+    }
+
+    fn placeholder(&mut self, entity: &str, value: &str) -> String {
+        let key = (entity.to_string(), value.to_string());
+        let idx = if let Some(&i) = self.seen.get(&key) {
+            i
+        } else {
+            let counter = self.next.entry(entity.to_string()).or_insert(0);
+            *counter += 1;
+            let assigned = *counter;
+            self.seen.insert(key, assigned);
+            assigned
+        };
+        match self.style {
+            PlaceholderStyle::Indexed => format!("[{}_{}]", entity, idx),
+            PlaceholderStyle::LlmGuard => format!("[REDACTED_{}_{}]", entity, idx),
+            // Bare doesn't use the indexer; fall back defensively.
+            PlaceholderStyle::Bare => format!("[{}]", entity),
+        }
     }
 }
 
@@ -240,6 +353,56 @@ mod tests {
         let r = redactor();
         assert!(r.contains_pii("AKIAIOSFODNN7EXAMPLE"));
         assert!(!r.contains_pii("hello world"));
+    }
+
+    fn indexed_redactor() -> Redactor {
+        Redactor::build_with_style(
+            &default_inline_patterns(),
+            &[],
+            PlaceholderStyle::Indexed,
+        )
+        .unwrap()
+    }
+
+    fn llm_guard_redactor() -> Redactor {
+        Redactor::build_with_style(
+            &default_inline_patterns(),
+            &[],
+            PlaceholderStyle::LlmGuard,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn indexed_distinguishes_two_distinct_emails() {
+        let r = indexed_redactor();
+        let out = r.redact_text("contact alice@x.com or bob@y.com");
+        assert!(out.contains("[EMAIL_1]"), "got `{out}`");
+        assert!(out.contains("[EMAIL_2]"), "got `{out}`");
+    }
+
+    #[test]
+    fn indexed_reuses_index_for_repeated_value() {
+        let r = indexed_redactor();
+        let out = r.redact_text("alice@x.com again alice@x.com");
+        let count_1 = out.matches("[EMAIL_1]").count();
+        assert_eq!(count_1, 2, "same value should reuse index 1, got `{out}`");
+        assert!(!out.contains("[EMAIL_2]"));
+    }
+
+    #[test]
+    fn indexed_separate_counters_per_entity() {
+        let r = indexed_redactor();
+        let out = r.redact_text("ssn 123-45-6789 email alice@x.com");
+        assert!(out.contains("[SSN_1]"), "got `{out}`");
+        assert!(out.contains("[EMAIL_1]"), "got `{out}`");
+    }
+
+    #[test]
+    fn llm_guard_style_uses_redacted_prefix() {
+        let r = llm_guard_redactor();
+        let out = r.redact_text("contact alice@x.com");
+        assert!(out.contains("[REDACTED_EMAIL_1]"), "got `{out}`");
     }
 
     #[test]
