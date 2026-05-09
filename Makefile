@@ -1,6 +1,6 @@
-.PHONY: all build dev test e2e check clean run run-openai ollama-start \
-        docker docker-run release watch-docker watch watch-test watch-check \
-        bench coverage miri audit
+.PHONY: all build dev test e2e check lint fmt clean run run-openai ollama-start \
+        docker docker-run release watch-docker watch watch-test watch-lint \
+        bench coverage miri audit ci
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -20,9 +20,14 @@ test:
 e2e:
 	./e2e_test.sh
 
-check:
+# lint = clippy + fmt check (CI と同じ判定)
+lint:
 	cargo clippy -- -D warnings
 	cargo fmt --check
+	@echo "=== lint OK ==="
+
+# check は lint の別名（後方互換）
+check: lint
 
 fmt:
 	cargo fmt
@@ -35,8 +40,10 @@ watch:
 watch-test:
 	cargo watch -x "test"
 
-watch-check:
-	cargo watch -x "clippy -- -D warnings"
+watch-lint:
+	cargo watch -w src -w benches -s "cargo clippy -- -D warnings && cargo fmt --check && echo '=== lint OK ==='"
+
+watch-check: watch-lint
 
 # ── Code coverage (requires: cargo install cargo-llvm-cov) ───────────────────
 # Install: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview
