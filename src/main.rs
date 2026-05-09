@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 mod backend;
+mod budget;
 mod config;
 mod matcher;
 mod proxy;
@@ -16,6 +17,7 @@ pub struct AppState {
     pub matchers: matcher::Matchers,
     pub backend: backend::Backend,
     pub http_client: reqwest::Client,
+    pub budget: Option<Arc<dyn budget::BudgetStore>>,
 }
 
 impl AppState {
@@ -39,15 +41,25 @@ async fn main() -> Result<()> {
     let backend = backend::Backend::new(cfg.backend.clone());
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
 
+    let budget = if cfg.budget.enabled {
+        tracing::info!("budget: enabled (db={})", cfg.budget.db_path);
+        Some(budget::build(&cfg.budget).await?)
+    } else {
+        tracing::info!("budget: disabled");
+        None
+    };
+
     let state = Arc::new(AppState {
         config: cfg.clone(),
         matchers,
         backend,
         http_client,
+        budget,
     });
 
     let app = Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/messages", post(proxy::anthropic::messages))
         .route("/v1/models", get(proxy::list_models))
         .route("/health", get(|| async { "ok" }))
         .with_state(state);

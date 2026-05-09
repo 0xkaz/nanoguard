@@ -15,8 +15,8 @@ enabled = true
 dict_paths = [
   "dicts/prompt_injection.txt",
   "dicts/pii.txt",
+  "dicts/pii-regex.txt",
   "dicts/off_topic.txt",
-  # "dicts/pii-regex.txt",  # requires iword-rs regex feature
 ]
 inline_block = [
   "ignore previous instructions",
@@ -38,3 +38,7 @@ enabled = true
 [output.pii]
 enabled = true
 action = "mask"
+
+[budget]
+enabled = false          # set true to enable token budget tracking
+db_path = "nanoguard.db"

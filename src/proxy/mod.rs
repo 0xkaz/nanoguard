@@ -1,3 +1,5 @@
+pub mod anthropic;
+
 use axum::{
     extract::State,
     http::StatusCode,
@@ -8,7 +10,11 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::{matcher::InputVerdict, AppState};
+use crate::{
+    budget::store::{BudgetCheck, SpendRecord},
+    matcher::InputVerdict,
+    AppState,
+};
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
@@ -34,6 +40,29 @@ pub async fn chat_completions(
                 // Continue but log
             }
             InputVerdict::Clean => {}
+        }
+    }
+
+    // Budget check (before forwarding to LLM)
+    let api_key = extract_api_key(&body);
+    if let Some(budget) = &state.budget {
+        match budget.check(&api_key).await {
+            Ok(BudgetCheck::Exceeded { usage, limit }) => {
+                warn!("budget exceeded for key={api_key}: {usage}/{limit} tokens");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": {
+                            "message": format!("nanoguard: token budget exceeded ({usage}/{limit})"),
+                            "type": "budget_exceeded",
+                            "code": "budget_exceeded"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => warn!("budget check error: {}", e),
         }
     }
 
@@ -84,6 +113,38 @@ pub async fn chat_completions(
             }
         };
 
+        // Record spend after successful response (LiteLLM pattern: count on response)
+        if let Some(budget) = &state.budget {
+            let prompt = resp_json
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let completion = resp_json
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let model = resp_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let record = SpendRecord {
+                api_key: api_key.clone(),
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                model,
+                created_at: chrono::Utc::now(),
+            };
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                if let Err(e) = budget.record_spend(&record).await {
+                    tracing::warn!("budget record_spend error: {}", e);
+                }
+            });
+        }
+
         let filtered = if state.config.output.enabled {
             filter_response_json(&state, resp_json)
         } else {
@@ -118,6 +179,14 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn extract_api_key(body: &Value) -> String {
+    // Use "user" field as api_key identifier if present, else "default"
+    body.get("user")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string()
+}
 
 fn extract_messages_text(body: &Value) -> String {
     body.get("messages")

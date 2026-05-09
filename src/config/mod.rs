@@ -11,6 +11,8 @@ pub struct Config {
     pub input: InputConfig,
     #[serde(default)]
     pub output: OutputConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -111,6 +113,21 @@ pub enum PiiAction {
     Log,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct BudgetConfig {
+    pub enabled: bool,
+    pub db_path: String,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: "nanoguard.db".to_string(),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -147,6 +164,7 @@ impl Config {
                 },
                 input: InputConfig::default(),
                 output: OutputConfig::default(),
+                budget: BudgetConfig::default(),
             })
         }
     }
