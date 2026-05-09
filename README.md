@@ -198,6 +198,26 @@ project_codename  1          # ALERT
 dict_paths = ["dicts/company.txt", "dicts/prompt_injection.txt"]
 ```
 
+## Performance
+
+Measured on Apple M-series (single core, release build). These are the guardrail hot-path costs — not including network round-trip to the LLM.
+
+| Operation | Time |
+|---|---|
+| Input check — clean (no match) | ~10 µs |
+| Input check — blocked (early exit) | ~7 µs |
+| Input check — multiline normalization + block | ~7 µs |
+| Output filter — no sensitive words | ~4 µs |
+| Output filter — mask SSN + credit card | ~7 µs |
+
+Input scanning is O(N) in prompt length. A 2,700-character prompt costs ~950 µs on the same machine.
+
+Run benchmarks locally:
+
+```bash
+make bench   # criterion HTML report → target/criterion/
+```
+
 ## Use cases
 
 - **Local LLM protection** — wrap Ollama with guardrails for team use

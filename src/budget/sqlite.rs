@@ -93,6 +93,23 @@ impl BudgetStore for SqliteBudgetStore {
         Ok(limit)
     }
 
+    async fn set_limit(&self, api_key: &str, limit: u64) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let api_key = api_key.to_string();
+        spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO api_key_limits (api_key, token_limit)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(api_key) DO UPDATE SET token_limit = excluded.token_limit",
+                params![api_key, limit],
+            )?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
     async fn reset_usage(&self, api_key: &str) -> Result<()> {
         let conn = Arc::clone(&self.conn);
         let api_key = api_key.to_string();

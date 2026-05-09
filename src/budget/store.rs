@@ -23,6 +23,9 @@ pub trait BudgetStore: Send + Sync {
     /// Token limit for this api_key (None = unlimited).
     async fn get_limit(&self, api_key: &str) -> Result<Option<u64>>;
 
+    /// Set or update the token limit for this api_key.
+    async fn set_limit(&self, api_key: &str, limit: u64) -> Result<()>;
+
     /// Reset usage counter for this api_key (called by budget reset scheduler).
     async fn reset_usage(&self, api_key: &str) -> Result<()>;
 

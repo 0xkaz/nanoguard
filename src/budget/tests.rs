@@ -1,12 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use crate::budget::{BudgetStore, SqliteBudgetStore};
     use crate::budget::store::{BudgetCheck, SpendRecord};
+    use crate::budget::{BudgetStore, SqliteBudgetStore};
     use chrono::Utc;
 
     async fn test_store() -> SqliteBudgetStore {
         // Use in-memory SQLite for tests
-        SqliteBudgetStore::open(":memory:").await.expect("open :memory:")
+        SqliteBudgetStore::open(":memory:")
+            .await
+            .expect("open :memory:")
     }
 
     #[tokio::test]
@@ -65,14 +67,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn budget_ok_when_under_limit() {
+        let store = test_store().await;
+        store.set_limit("key-limited", 1000).await.unwrap();
+
+        let record = SpendRecord {
+            api_key: "key-limited".to_string(),
+            prompt_tokens: 300,
+            completion_tokens: 100,
+            model: "test".to_string(),
+            created_at: Utc::now(),
+        };
+        store.record_spend(&record).await.unwrap();
+
+        let check = store.check("key-limited").await.unwrap();
+        assert!(matches!(
+            check,
+            BudgetCheck::Ok {
+                usage: 400,
+                limit: 1000
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn budget_exceeded_when_over_limit() {
         let store = test_store().await;
+        store.set_limit("key-exceeded", 100).await.unwrap();
 
-        // Insert limit directly via raw SQL isn't exposed, so we
-        // test the BudgetCheck::Ok path via unlimited for now.
-        // Full exceeded path is covered in integration/e2e.
-        let check = store.check("no-such-key").await.unwrap();
-        assert!(matches!(check, BudgetCheck::Unlimited));
+        let record = SpendRecord {
+            api_key: "key-exceeded".to_string(),
+            prompt_tokens: 80,
+            completion_tokens: 40,
+            model: "test".to_string(),
+            created_at: Utc::now(),
+        };
+        store.record_spend(&record).await.unwrap(); // total = 120 > 100
+
+        let check = store.check("key-exceeded").await.unwrap();
+        assert!(matches!(
+            check,
+            BudgetCheck::Exceeded {
+                usage: 120,
+                limit: 100
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_limit_updates_existing_limit() {
+        let store = test_store().await;
+        store.set_limit("key-update", 500).await.unwrap();
+        assert_eq!(store.get_limit("key-update").await.unwrap(), Some(500));
+
+        store.set_limit("key-update", 2000).await.unwrap();
+        assert_eq!(store.get_limit("key-update").await.unwrap(), Some(2000));
     }
 
     #[tokio::test]
