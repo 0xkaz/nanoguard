@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use crate::{audit, backend, budget, config, matcher};
+use crate::{audit, backend, budget, config, matcher, proxy};
 
 pub struct AppState {
     pub config: config::Config,
     pub matchers: Arc<matcher::Matchers>,
+    pub redactor: Arc<proxy::redact::Redactor>,
     pub backend: backend::Backend,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::{matcher::InputVerdict, AppState};
+use crate::{config::PiiAction, matcher::InputVerdict, AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct AnthropicRequest {
@@ -60,7 +60,7 @@ impl AnthropicContent {
 
 pub async fn messages(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<AnthropicRequest>,
+    Json(mut req): Json<AnthropicRequest>,
 ) -> Response {
     // Collect all message text for scanning
     let user_text = req
@@ -96,7 +96,63 @@ pub async fn messages(
         }
     }
 
-    // Convert Anthropic → OpenAI format
+    // PII redaction (Anthropic-native shape: content can be a string or an
+    // array of blocks; mutate in place before forwarding).
+    if state.config.input.pii.enabled {
+        match state.config.input.pii.action {
+            PiiAction::Reject if state.redactor.contains_pii(&user_text) => {
+                warn!("BLOCK input (anthropic): PII detected");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "nanoguard: request blocked — PII detected"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            PiiAction::Mask => {
+                let mut redacted_any = false;
+                for msg in req.messages.iter_mut() {
+                    match &mut msg.content {
+                        AnthropicContent::Text(s) => {
+                            let r = state.redactor.redact_text(s);
+                            if &r != s {
+                                *s = r;
+                                redacted_any = true;
+                            }
+                        }
+                        AnthropicContent::Blocks(blocks) => {
+                            for b in blocks {
+                                if let Some(t) = b.text.as_mut() {
+                                    let r = state.redactor.redact_text(t);
+                                    if &r != t {
+                                        *t = r;
+                                        redacted_any = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if redacted_any {
+                    info!("MASK input (anthropic): PII redacted before forwarding");
+                }
+            }
+            PiiAction::Log => {
+                if state.redactor.contains_pii(&user_text) {
+                    info!("ALERT input (anthropic): PII detected");
+                }
+            }
+            PiiAction::Reject => {}
+        }
+    }
+
+    // Convert Anthropic → OpenAI format (after redaction so the LLM sees the
+    // redacted prompt).
     let mut oai_messages: Vec<Value> = vec![];
     if let Some(system) = &req.system {
         oai_messages.push(json!({"role": "system", "content": system}));

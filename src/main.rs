@@ -21,6 +21,11 @@ async fn main() -> Result<()> {
 
     let matchers = Arc::new(matcher::Matchers::build(&cfg.input.keyword)?);
     tracing::info!("matcher engine: {}", matchers.engine_name());
+    let redactor = Arc::new(proxy::redact::Redactor::build(
+        &proxy::redact::default_inline_patterns(),
+        &cfg.input.pii.dict_paths,
+    )?);
+    tracing::info!("redactor: {} entity rules", redactor.rule_count());
     let backend = backend::Backend::new(cfg.backend.clone());
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
 
@@ -47,6 +52,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         config: cfg.clone(),
         matchers,
+        redactor,
         backend,
         http_client,
         budget,

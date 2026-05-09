@@ -165,15 +165,30 @@ ignore previous instructions · disregard your instructions · jailbreak · dan 
 
 #### PII redaction before forwarding
 
-When `input.pii.enabled = true`, requests are scanned for common PII patterns (email, US SSN, credit-card-shaped numbers, long API-token-shaped strings). The behavior depends on `input.pii.action`:
+When `input.pii.enabled = true`, requests are scanned with a configurable set of named entity patterns. The default set covers email, US SSN, credit cards, AWS access keys, GitHub PATs, OpenAI/Anthropic/Stripe/Google API keys, JWTs, Slack tokens, and a generic high-entropy token catch-all. Add your own via `input.pii.dict_paths`.
 
 | Action | Behavior |
 |---|---|
-| `mask` (default) | Replace each match in `messages[].content` with a labeled placeholder (`[EMAIL]`, `[SSN]`, `[CARD]`, `[TOKEN]`) **before forwarding to the LLM**. Both string content and `parts[].text` arrays (vision/multipart format) are handled. The LLM receives the redacted prompt; the original is never sent. |
-| `reject` | Block the request entirely if any PII is detected. |
+| `mask` (default) | Replace each match in the request body with a `[<ENTITY_NAME>]` placeholder (e.g. `[EMAIL]`, `[AWS_ACCESS_KEY_ID]`, `[JWT]`) **before forwarding to the LLM**. The LLM receives the redacted prompt; the original is never sent. |
+| `reject` | Block the request entirely if any pattern matches. |
 | `log` | Forward unchanged but record an ALERT log line. |
 
-Redaction currently applies to `/v1/chat/completions`. The Anthropic-compatible `/v1/messages` endpoint does not yet apply redaction.
+Both `/v1/chat/completions` (string content and `parts[].text` arrays) and `/v1/messages` (Anthropic `Text` and `Blocks` shapes) are redacted before the request leaves the process.
+
+User dictionaries follow the standard format with the entity name in the second column:
+
+```
+# dicts/my-org-pii.txt
+/\bSEC-\d{6}\b/	INTERNAL_TICKET
+/\bEMP-[A-Z0-9]{8}\b/	EMPLOYEE_ID
+```
+
+```toml
+[input.pii]
+enabled = true
+action  = "mask"
+dict_paths = ["dicts/my-org-pii.txt"]
+```
 
 #### Obfuscation handling
 

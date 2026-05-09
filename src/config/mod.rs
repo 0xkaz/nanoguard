@@ -138,6 +138,10 @@ pub struct PiiConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub action: PiiAction,
+    /// Optional dictionary files in `/regex/<TAB>ENTITY_NAME` form. Loaded on
+    /// top of the built-in entity set; appears as `[ENTITY_NAME]` placeholders.
+    #[serde(default)]
+    pub dict_paths: Vec<String>,
 }
 
 impl Default for PiiConfig {
@@ -145,6 +149,7 @@ impl Default for PiiConfig {
         Self {
             enabled: true,
             action: PiiAction::Mask,
+            dict_paths: vec![],
         }
     }
 }
