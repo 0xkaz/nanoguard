@@ -109,6 +109,10 @@ impl BudgetStore for SqliteBudgetStore {
     }
 }
 
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
 const SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 

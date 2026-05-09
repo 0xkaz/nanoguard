@@ -1,6 +1,8 @@
 # nanoguard
 
 [![CI](https://github.com/0xkaz/nanoguard/actions/workflows/ci.yml/badge.svg)](https://github.com/0xkaz/nanoguard/actions/workflows/ci.yml)
+[![Release](https://github.com/0xkaz/nanoguard/actions/workflows/release.yml/badge.svg)](https://github.com/0xkaz/nanoguard/actions/workflows/release.yml)
+[![ghcr.io](https://img.shields.io/badge/ghcr.io-nanoguard-blue)](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Nano-fast. CPU-only. Offline-first. LLM Guardrails Proxy.**
@@ -35,7 +37,27 @@ filtering prompts and responses in microseconds — no GPU, no cloud, no Python.
 
 ## Quick start
 
-### With Ollama (local, no API key needed)
+### Docker (recommended — no build required)
+
+```bash
+# Pull and run — architecture is auto-detected (arm64 / amd64)
+docker run -p 8080:8080 \
+  -e BACKEND_ENDPOINT=http://host.docker.internal:11434 \
+  ghcr.io/0xkaz/nanoguard:latest
+```
+
+With a custom config:
+
+```bash
+docker run -p 8080:8080 \
+  -v $(pwd)/nanoguard.toml:/app/nanoguard.toml:ro \
+  ghcr.io/0xkaz/nanoguard:latest
+```
+
+> Image is published to [ghcr.io/0xkaz/nanoguard](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard) on every tagged release.
+> Supports `linux/amd64` and `linux/arm64` (Apple Silicon / AWS Graviton).
+
+### With Ollama (build from source)
 
 ```bash
 git clone https://github.com/0xkaz/nanoguard

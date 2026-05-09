@@ -1,5 +1,5 @@
 .PHONY: all build dev test e2e check clean run run-openai ollama-start \
-        docker docker-run watch watch-test watch-check \
+        docker docker-run release watch-docker watch watch-test watch-check \
         coverage miri audit
 
 MODEL ?= qwen3:0.6b
@@ -51,11 +51,14 @@ watch-coverage:
 	cargo watch -s "cargo llvm-cov --summary-only"
 
 # ── Memory / undefined behavior (requires nightly) ───────────────────────────
-# Install: rustup toolchain install nightly && cargo +nightly install cargo-miri
-# Usage: runs unit tests under Miri interpreter (catches memory bugs, UB)
+# Install: rustup toolchain install nightly
+#          rustup component add --toolchain nightly miri
+# Note: tokio::test uses kqueue/epoll — not supported by Miri.
+#       Run only on sync/pure-Rust tests via filter:
+#       make miri TEST=matcher
 
 miri:
-	cargo +nightly miri test
+	cargo +nightly miri test $(TEST)
 
 # ── Security audit (requires: cargo install cargo-audit) ─────────────────────
 # Checks dependencies against RustSec advisory database
@@ -85,6 +88,19 @@ run-openai: build
 
 docker:
 	docker build -t nanoguard:latest .
+
+# Multi-arch build & push to ghcr.io (requires: docker login ghcr.io + buildx)
+release:
+	docker buildx build \
+	  --platform linux/arm64,linux/amd64 \
+	  --tag ghcr.io/0xkaz/nanoguard:latest \
+	  --push \
+	  .
+
+# Watch src/ changes and rebuild Docker image automatically
+watch-docker:
+	cargo watch -w src -w Cargo.toml -w Dockerfile \
+	  -s "docker build -t nanoguard:latest . && echo '=== Docker build OK ==='"
 
 docker-run:
 	docker run --rm -p 8080:8080 \
