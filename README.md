@@ -32,7 +32,7 @@ Cloud guardrail APIs (AWS Bedrock Guardrails, Azure AI Content Safety, Google Cl
 
 For everything else, it is a hard architectural mismatch:
 
-- **Robotics and autonomous systems** require sub-100ms decision cycles. A cloud roundtrip for content filtering can exceed the entire control loop budget.
+- **Robotics and autonomous systems** often expose natural-language operator commands, task planning, and fleet-control interfaces where cloud filtering can add unacceptable latency or fail under poor connectivity.
 - **Industrial IoT and factory floors** often operate on isolated networks with no outbound internet access by design.
 - **Medical and government systems** cannot route patient or classified data through external APIs for policy reasons, regardless of latency.
 - **Edge devices** — from warehouse robots to in-vehicle systems — face intermittent connectivity as a physical reality, not an edge case.
@@ -47,7 +47,7 @@ nanoguard is a deterministic, offline-capable guardrails layer that runs anywher
 
 ### Why Rust
 
-Rust gives deterministic latency without a garbage collector and memory safety without a VM. The release binary is a single statically-linked executable under 10MB — no interpreter, no package manager, nothing to update at deploy time.
+Rust gives deterministic latency without a garbage collector and memory safety without a VM. The release artifact is a compact single binary — no interpreter, no package manager, nothing to update at deploy time.
 
 Go would have been a reasonable alternative: similar deployment story, faster iteration. The tradeoff is GC pause predictability and the fact that a security boundary benefits from compile-time memory safety guarantees. For a proxy that sits in the path of every LLM request, the latency tail and the attack surface both matter.
 
