@@ -1,21 +1,88 @@
 # Prompt injection / jailbreak patterns
 # Format: word<TAB>key<TAB>weight (weight optional, default 1.0)
-# key 0 = BLOCK
+# key 0 = BLOCK, key 1 = ALERT, key 2 = FLAG
+#
+# Patterns drawn from publicly-discussed jailbreak techniques (DAN, "developer
+# mode" jailbreaks, instruction-override prompts). Keep this file curated:
+# every entry should be a phrase that almost never appears in legitimate
+# prompts. Add weighted lower-confidence patterns as ALERT/FLAG, not BLOCK.
 
+# ── Direct instruction override ───────────────────────────────────────────────
 ignore previous instructions	0	10.0
+ignore all previous instructions	0	10.0
+ignore the above	0	8.0
+ignore all instructions	0	10.0
+ignore your instructions	0	10.0
+ignore your previous	0	8.0
 disregard your instructions	0	10.0
 disregard previous instructions	0	10.0
+disregard the above	0	8.0
+disregard all previous	0	10.0
 forget your instructions	0	10.0
-ignore all instructions	0	10.0
+forget everything above	0	10.0
+forget all previous	0	10.0
 override your instructions	0	10.0
+override the above	0	8.0
+overrule your instructions	0	8.0
+
+# ── Role hijack / persona injection ───────────────────────────────────────────
 you are now	0	8.0
+you will now	0	8.0
+you are no longer	0	8.0
+from now on you	0	8.0
 pretend you are	0	8.0
+pretend to be	0	6.0
 act as if	0	6.0
+act as though	0	6.0
+roleplay as	0	6.0
+new instructions:	0	8.0
+new system prompt	0	8.0
+
+# ── Named jailbreak modes ─────────────────────────────────────────────────────
 jailbreak	0	10.0
+jailbroken	0	10.0
 dan mode	0	10.0
-developer mode	0	8.0
 do anything now	0	10.0
-ignore your training	0	8.0
-bypass restrictions	0	8.0
-system prompt	0	6.0
+developer mode	0	8.0
+god mode	0	8.0
+sudo mode	0	8.0
+unrestricted mode	0	8.0
+evil confidant	0	8.0
+aim mode	0	8.0
+stan mode	0	8.0
+opposite mode	0	6.0
+
+# ── System prompt extraction ──────────────────────────────────────────────────
 reveal your instructions	0	8.0
+reveal the system prompt	0	10.0
+print your system prompt	0	10.0
+show me your prompt	0	8.0
+what are your instructions	0	6.0
+repeat your instructions	0	8.0
+repeat the above	0	6.0
+output your instructions	0	8.0
+leak your prompt	0	10.0
+display your system prompt	0	10.0
+
+# ── Safety bypass language ────────────────────────────────────────────────────
+bypass restrictions	0	8.0
+bypass your guidelines	0	10.0
+bypass safety	0	10.0
+without any restrictions	0	8.0
+without restrictions	0	6.0
+no restrictions apply	0	8.0
+ignore your training	0	8.0
+ignore your guidelines	0	8.0
+violate your guidelines	0	10.0
+break character	0	6.0
+
+# ── Conditional/hypothetical jailbreaks ───────────────────────────────────────
+hypothetically speaking, if you had no rules	0	8.0
+in a fictional world where	1	2.0
+for educational purposes only	1	2.0
+this is just a hypothetical	1	2.0
+
+# ── Lower-confidence signals (ALERT, not BLOCK) ───────────────────────────────
+system prompt	1	4.0
+prompt injection	1	4.0
+prompt leak	1	4.0

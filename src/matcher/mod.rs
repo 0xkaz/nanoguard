@@ -343,6 +343,20 @@ impl Matchers {
         self.input.check(&normalize_with(text, &self.normalize))
     }
 
+    /// Like `check_input`, but if `shadow` is true, demote `Blocked(rule)` to
+    /// `Flagged("shadow_block:rule")` so the request is forwarded while the
+    /// audit log still captures what would have been blocked.
+    pub fn check_input_with_shadow(&self, text: &str, shadow: bool) -> InputVerdict {
+        let v = self.check_input(text);
+        if shadow {
+            if let InputVerdict::Blocked(rule) = v {
+                return InputVerdict::Flagged(format!("shadow_block:{rule}"));
+            }
+            return v;
+        }
+        v
+    }
+
     pub fn filter_output(&self, text: &str) -> String {
         self.output.filter(text, Mode::FORBID)
     }

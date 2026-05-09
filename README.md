@@ -182,6 +182,18 @@ Two more are opt-in because they can produce false positives on legitimate text:
 Responses are filtered before reaching your app. Sensitive words are replaced with `***`.
 Streaming responses are filtered chunk-by-chunk on the SSE `delta.content` field.
 
+### Shadow mode
+
+Set `[input] shadow = true` to scan and audit every request without actually blocking. A request that *would* have been blocked passes through to the backend, but the audit log records the verdict as `flag` with the matched rule prefixed `shadow_block:`. Useful when rolling out a new rule set in production — you can confirm the false-positive rate before enforcing.
+
+```json
+{
+  "verdict": "flag",
+  "matched_rule": "shadow_block:jailbreak",
+  ...
+}
+```
+
 ### Audit log
 
 When enabled, every request writes one JSONL line:
@@ -221,6 +233,7 @@ endpoint = "http://localhost:11434"
 
 [input]
 enabled = true
+shadow  = false  # set true to log "would-block" without enforcing — see Shadow mode
 
 [input.keyword]
 engine = "aho-corasick"  # "aho-corasick" (default) or "iword-rs"

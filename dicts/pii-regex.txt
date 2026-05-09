@@ -1,21 +1,77 @@
-# PII detection using regex patterns (requires `regex` feature)
+# PII / secret detection — regex patterns
 # Format: /pattern/<TAB>key<TAB>weight
-# key 1 = ALERT, key 0 = BLOCK
+# key 0 = BLOCK, key 1 = ALERT, key 2 = FLAG
+#
+# Layering: BLOCK for high-precision identifiers (SSN, AWS keys, JWTs).
+# ALERT for medium-precision identifiers worth flagging in audit but not
+# stopping requests by default. FLAG for noisy patterns kept as signals.
 
-# Credit card numbers (Visa, Mastercard, Amex, etc.)
-/\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b/	1	10.0
-
-# Social Security Number (US)
+# ── Identity numbers (US/EU) ──────────────────────────────────────────────────
+# US SSN
 /\b\d{3}-\d{2}-\d{4}\b/	0	10.0
 
-# Email addresses
+# Credit card numbers (Visa, MC, Amex, Discover — 13–19 digits with separators)
+/\b(?:\d[ -]?){13,19}\b/	1	8.0
+
+# IBAN (international bank account)
+/\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/	1	8.0
+
+# Bitcoin address (legacy P2PKH/P2SH)
+/\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b/	1	6.0
+
+# ── Japan-specific identifiers ────────────────────────────────────────────────
+# マイナンバー (12 digits — context required, hence ALERT not BLOCK)
+/\b\d{4}\s?\d{4}\s?\d{4}\b/	1	6.0
+
+# 日本の電話番号 (固定 0X-XXXX-XXXX / 携帯 0X0-XXXX-XXXX)
+/\b0\d{1,3}-\d{1,4}-\d{4}\b/	1	5.0
+
+# ── Email / phone (generic) ───────────────────────────────────────────────────
 /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/	1	6.0
 
-# Phone numbers (US format)
-/\b(\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/	1	6.0
+# US phone with optional country code
+/\b(\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/	1	5.0
 
-# IPv4 addresses
+# ── Network identifiers ───────────────────────────────────────────────────────
 /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/	2	3.0
 
-# API keys / tokens (generic: 20+ alphanumeric chars)
+# IPv6 (compressed and uncompressed common forms)
+/\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){2,7}\b/	2	3.0
+
+# MAC address
+/\b[0-9A-Fa-f]{2}(?:[:\-][0-9A-Fa-f]{2}){5}\b/	2	2.0
+
+# ── Cloud provider secrets (high precision → BLOCK) ───────────────────────────
+# AWS Access Key ID
+/\bAKIA[0-9A-Z]{16}\b/	0	10.0
+
+# AWS Secret Access Key (heuristic: 40-char base64-ish after assignment)
+/\b(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY)\s*[=:]\s*[A-Za-z0-9/+]{40}\b/	0	10.0
+
+# GCP service account key fragment
+/\b-----BEGIN PRIVATE KEY-----/	0	10.0
+
+# Slack tokens
+/\bxox[abpors]-[A-Za-z0-9-]{10,}\b/	0	10.0
+
+# GitHub personal access tokens (classic + fine-grained)
+/\bghp_[A-Za-z0-9]{36}\b/	0	10.0
+/\bgithub_pat_[A-Za-z0-9_]{82}\b/	0	10.0
+
+# OpenAI API key
+/\bsk-[A-Za-z0-9]{20,}\b/	0	10.0
+
+# Anthropic API key
+/\bsk-ant-[A-Za-z0-9_\-]{80,}\b/	0	10.0
+
+# Stripe live secret
+/\b(?:sk|rk)_live_[A-Za-z0-9]{20,}\b/	0	10.0
+
+# Google API key
+/\bAIza[0-9A-Za-z_\-]{35}\b/	0	10.0
+
+# JWT (header.payload.signature, base64url)
+/\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b/	0	10.0
+
+# Generic high-entropy bearer-style tokens (32+ chars), kept as ALERT to limit FP
 /\b[A-Za-z0-9_\-]{32,}\b/	1	4.0
