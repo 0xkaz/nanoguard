@@ -5,6 +5,10 @@ edition = "2021"
 description = "Nano-fast CPU-only offline-first LLM guardrails proxy"
 license = "MIT"
 
+[lib]
+name = "nanoguard"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nanoguard"
 path = "src/main.rs"
@@ -29,3 +33,11 @@ async-stream = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["full"] }
+
+[[bench]]
+name = "guardrails"
+harness = false

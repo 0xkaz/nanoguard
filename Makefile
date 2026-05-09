@@ -1,6 +1,6 @@
 .PHONY: all build dev test e2e check clean run run-openai ollama-start \
         docker docker-run release watch-docker watch watch-test watch-check \
-        coverage miri audit
+        bench coverage miri audit
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -40,6 +40,12 @@ watch-check:
 
 # ── Code coverage (requires: cargo install cargo-llvm-cov) ───────────────────
 # Install: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview
+
+# ── Benchmarks (requires: cargo bench) ───────────────────────────────────────
+# Results saved to target/criterion/  (HTML report auto-generated)
+
+bench:
+	cargo bench
 
 coverage:
 	cargo llvm-cov --html --open

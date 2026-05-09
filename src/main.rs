@@ -6,25 +6,7 @@ use axum::{
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-mod backend;
-mod budget;
-mod config;
-mod matcher;
-mod proxy;
-
-pub struct AppState {
-    pub config: config::Config,
-    pub matchers: matcher::Matchers,
-    pub backend: backend::Backend,
-    pub http_client: reqwest::Client,
-    pub budget: Option<Arc<dyn budget::BudgetStore>>,
-}
-
-impl AppState {
-    pub fn backend_endpoint(&self) -> &str {
-        self.config.backend.endpoint.trim_end_matches('/')
-    }
-}
+use nanoguard::{backend, budget, config, matcher, proxy, AppState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
