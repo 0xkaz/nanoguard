@@ -2,6 +2,7 @@
 # Format: word<TAB>key<TAB>weight (weight optional, default 1.0)
 # key 1 = ALERT
 
+# ── English ───────────────────────────────────────────────────────────────────
 social security	1	8.0
 social security number	1	10.0
 credit card	1	8.0
@@ -9,6 +10,7 @@ card number	1	6.0
 date of birth	1	6.0
 passport number	1	8.0
 driver license	1	6.0
+drivers license	1	6.0
 bank account	1	6.0
 routing number	1	6.0
 api_key	1	8.0
@@ -16,5 +18,27 @@ api key	1	6.0
 secret key	1	8.0
 private key	1	8.0
 access token	1	8.0
+bearer token	1	8.0
+session token	1	6.0
 password	1	6.0
+passphrase	1	6.0
 ssn	1	10.0
+home address	1	6.0
+phone number	1	6.0
+
+# ── Japanese (日本語) ─────────────────────────────────────────────────────────
+マイナンバー	1	10.0
+個人番号	1	8.0
+クレジットカード	1	8.0
+パスワード	1	6.0
+パスフレーズ	1	6.0
+銀行口座	1	6.0
+口座番号	1	8.0
+住所	1	4.0
+電話番号	1	5.0
+パスポート番号	1	8.0
+運転免許証	1	6.0
+健康保険証	1	8.0
+api キー	1	6.0
+秘密鍵	1	8.0
+アクセストークン	1	8.0

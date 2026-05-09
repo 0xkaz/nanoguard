@@ -1,0 +1,50 @@
+# Finance policy pack — PCI-DSS / GLBA / MNPI-aware keyword set
+#
+# Opt-in. Add to your config:
+#   [input.keyword]
+#   dict_paths = ["dicts/policies/finance.txt"]
+#
+# Format: word<TAB>key<TAB>weight
+# key 0 = BLOCK, 1 = ALERT, 2 = FLAG
+
+# ── Payment card / banking (PCI-DSS) ──────────────────────────────────────────
+cvv	1	8.0
+cvc	1	8.0
+card verification value	1	8.0
+expiration date	1	4.0
+account holder	1	5.0
+swift code	1	6.0
+sort code	1	5.0
+iban	1	6.0
+aba routing	1	6.0
+wire transfer	1	5.0
+
+# ── Material non-public information (MNPI) ───────────────────────────────────
+earnings preview	0	8.0
+earnings guidance	0	8.0
+unannounced merger	0	10.0
+unannounced acquisition	0	10.0
+material non-public	0	10.0
+mnpi	0	10.0
+insider information	0	10.0
+
+# ── Investment advice surface (likely regulated under SEC/FINRA) ──────────────
+guaranteed returns	0	6.0
+risk-free investment	0	6.0
+guaranteed profit	0	6.0
+buy this stock	1	5.0
+sell this stock	1	5.0
+
+# ── Loan / credit ─────────────────────────────────────────────────────────────
+loan application	1	4.0
+credit score	1	5.0
+fico score	1	5.0
+debt collection	1	4.0
+
+# ── Japanese (日本語) ─────────────────────────────────────────────────────────
+インサイダー情報	0	10.0
+未公開情報	0	10.0
+口座振込	1	5.0
+キャッシュカード	1	6.0
+暗証番号	1	8.0
+セキュリティコード	1	8.0

@@ -1,0 +1,43 @@
+# Legal policy pack — attorney-client privilege & litigation-sensitive content
+#
+# Opt-in. Add to your config:
+#   [input.keyword]
+#   dict_paths = ["dicts/policies/legal.txt"]
+#
+# Format: word<TAB>key<TAB>weight
+# key 0 = BLOCK, 1 = ALERT, 2 = FLAG
+
+# ── Privilege markers (high confidence: do not leak to third-party LLMs) ──────
+attorney-client privilege	0	10.0
+attorney client privileged	0	10.0
+attorney work product	0	10.0
+work product doctrine	0	10.0
+privileged and confidential	0	10.0
+litigation hold	0	8.0
+under seal	0	6.0
+
+# ── Active matter signals ─────────────────────────────────────────────────────
+pending litigation	1	6.0
+ongoing investigation	1	6.0
+deposition transcript	1	6.0
+sealed document	1	6.0
+settlement agreement	1	5.0
+non-disclosure agreement	1	4.0
+nda violation	1	6.0
+trade secret	1	6.0
+
+# ── Regulatory / contract leakage ─────────────────────────────────────────────
+proprietary information	1	4.0
+confidential memorandum	1	6.0
+confidential settlement	1	8.0
+sealed indictment	0	8.0
+grand jury	1	6.0
+
+# ── Japanese (日本語) ─────────────────────────────────────────────────────────
+弁護士秘匿特権	0	10.0
+弁護士・依頼者間の秘匿特権	0	10.0
+和解契約書	1	6.0
+秘密保持契約	1	5.0
+営業秘密	1	6.0
+訴訟係属中	1	6.0
+不起訴	1	5.0

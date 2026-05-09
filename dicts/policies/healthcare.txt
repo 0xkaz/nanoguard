@@ -1,0 +1,52 @@
+# Healthcare policy pack — HIPAA-aware PHI keyword set
+#
+# Opt-in. Add to your config to enable:
+#   [input.keyword]
+#   dict_paths = ["dicts/policies/healthcare.txt"]
+#
+# Format: word<TAB>key<TAB>weight
+# key 0 = BLOCK, 1 = ALERT, 2 = FLAG
+#
+# These keywords flag prompts likely to contain PHI (Protected Health
+# Information) under HIPAA. They are advisory: a bare word like "diagnosis"
+# is normal in clinical workflow but suspicious in a general-purpose LLM
+# call from an external user. Tune per deployment.
+
+# ── HIPAA identifiers (high confidence) ───────────────────────────────────────
+medical record number	1	8.0
+mrn	1	6.0
+patient id	1	6.0
+health plan	1	5.0
+medicare number	1	8.0
+medicaid id	1	8.0
+nhs number	1	8.0
+health insurance claim number	1	8.0
+
+# ── Clinical fields ───────────────────────────────────────────────────────────
+diagnosis code	1	5.0
+icd-10	1	4.0
+icd10	1	4.0
+prescription	1	4.0
+prescribed medication	1	5.0
+treatment plan	1	4.0
+medical history	1	5.0
+patient chart	1	6.0
+lab results	1	4.0
+discharge summary	1	5.0
+
+# ── Sensitive conditions / categories (HIPAA "sensitive PHI") ─────────────────
+hiv status	0	10.0
+hiv positive	0	10.0
+mental health diagnosis	0	8.0
+substance abuse	0	6.0
+genetic test	1	6.0
+genetic results	1	6.0
+
+# ── Japanese (日本語) ─────────────────────────────────────────────────────────
+カルテ	1	6.0
+診療録	1	6.0
+診断書	1	6.0
+処方箋	1	6.0
+病歴	1	5.0
+保険証	1	6.0
+被保険者番号	1	8.0
