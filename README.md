@@ -32,7 +32,7 @@ Cloud guardrail APIs (AWS Bedrock Guardrails, Azure AI Content Safety, Google Cl
 
 For everything else, it is a hard architectural mismatch:
 
-- **Robotics and autonomous systems** require sub-100ms decision cycles. A 500ms cloud roundtrip for content filtering is longer than the control loop itself.
+- **Robotics and autonomous systems** require sub-100ms decision cycles. A cloud roundtrip for content filtering can exceed the entire control loop budget.
 - **Industrial IoT and factory floors** often operate on isolated networks with no outbound internet access by design.
 - **Medical and government systems** cannot route patient or classified data through external APIs for policy reasons, regardless of latency.
 - **Edge devices** — from warehouse robots to in-vehicle systems — face intermittent connectivity as a physical reality, not an edge case.
@@ -53,7 +53,7 @@ Go would have been a reasonable alternative: similar deployment story, faster it
 
 ### Why deterministic rules, not a second LLM
 
-LLM-based content filtering is appealing — it handles nuance that keyword lists miss. The cost: 100ms–2s added latency, a dependency on model availability, and verdicts that are probabilistic rather than auditable. "The guard model said allow" is not a compliance record.
+LLM-based content filtering is appealing — it handles nuance that keyword lists miss. The cost: significant added latency per call, a dependency on model availability, and verdicts that are probabilistic rather than auditable. "The guard model said allow" is not a compliance record.
 
 For the majority of enterprise policy requirements — prompt injection patterns, PII categories, off-topic domains, banned keywords — a well-curated rule set is sufficient, deterministic, and auditable line by line. nanoguard uses that approach as the default. LLM-based filtering is planned as an opt-in feature.
 
@@ -71,7 +71,7 @@ A 2,700-character prompt scans in ~950 µs. A blocked request exits in ~7 µs. T
 |---|---|---|---|---|---|
 | Deployment | Single binary | Cloud API | Cloud API / Embedded† | Python lib | Python app |
 | Offline | ✅ | ❌ | ❌ / △† | ✅ | ✅ |
-| GPU-free | ✅ | N/A | N/A | △ | ✅ |
+| GPU-free | ✅ | N/A | N/A | depends on scanner | ✅ |
 | Filter latency | ~7–50 µs* | cloud roundtrip | cloud roundtrip | model-dependent | not applicable |
 | External guardrail call | ❌ never | ✅ required | ✅ required | ❌ never | depends |
 | Audit log | ✅ JSONL | ✅ CloudWatch | ✅ Azure Monitor | △ | ✅ (Enterprise) |
