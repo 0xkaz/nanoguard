@@ -70,7 +70,7 @@ pub struct KeywordConfig {
 }
 
 fn default_engine() -> String {
-    "aho-corasick".to_string()
+    "iword-rs".to_string()
 }
 
 impl Default for KeywordConfig {
