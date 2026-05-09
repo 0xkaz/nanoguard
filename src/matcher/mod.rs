@@ -2,8 +2,9 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{bail, Context};
 use iword::{key, Dictionary, Mode};
 use regex::{Regex, RegexBuilder};
+use unicode_normalization::UnicodeNormalization;
 
-use crate::config::KeywordConfig;
+use crate::config::{KeywordConfig, NormalizeConfig};
 
 #[derive(Debug, PartialEq)]
 pub enum InputVerdict {
@@ -15,10 +16,38 @@ pub enum InputVerdict {
 
 // ── Text normalisation (shared by both engines) ───────────────────────────────
 
-fn normalize(text: &str) -> String {
+fn is_zero_width(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+    )
+}
+
+fn leet_fold(ch: char) -> char {
+    match ch {
+        '0' => 'o',
+        '1' | '|' => 'i',
+        '3' => 'e',
+        '4' | '@' => 'a',
+        '5' | '$' => 's',
+        '7' => 't',
+        '8' => 'b',
+        _ => ch,
+    }
+}
+
+fn is_separator(ch: char) -> bool {
+    matches!(ch, '-' | '.' | '_' | '*' | '~')
+}
+
+fn base_normalize(text: &str, opts: &NormalizeConfig) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = true;
     for ch in text.chars() {
+        if opts.zero_width && is_zero_width(ch) {
+            continue;
+        }
+        let ch = if opts.leet { leet_fold(ch) } else { ch };
         if ch == '\n' || ch == '\r' || ch == '\t' {
             if !prev_space {
                 out.push(' ');
@@ -43,6 +72,59 @@ fn normalize(text: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// Collapse "j-a-i-l-b-r-e-a-k" → "jailbreak".
+/// Only collapses when separators are between single ASCII letters/digits;
+/// preserves real words like "co-op" or "e-mail" by requiring runs of length ≥ 4.
+fn collapse_separators(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        // Detect a run: letter/digit, sep, letter/digit, sep, ... ending with letter/digit
+        if chars[i].is_ascii_alphanumeric()
+            && i + 2 < n
+            && is_separator(chars[i + 1])
+            && chars[i + 2].is_ascii_alphanumeric()
+        {
+            let mut j = i;
+            let mut letters = String::new();
+            letters.push(chars[j]);
+            while j + 2 < n && is_separator(chars[j + 1]) && chars[j + 2].is_ascii_alphanumeric() {
+                letters.push(chars[j + 2]);
+                j += 2;
+            }
+            // Require ≥4 letters in run to avoid eating "co-op" / "e-mail"
+            if letters.len() >= 4 {
+                out.push_str(&letters);
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn normalize_with(text: &str, opts: &NormalizeConfig) -> String {
+    // ASCII fast path: NFKC is a no-op for pure-ASCII input, so skip the
+    // unicode-normalization iterator + intermediate allocation entirely.
+    let nfkc_owned;
+    let stage1: &str = if opts.nfkc && !text.is_ascii() {
+        nfkc_owned = text.nfkc().collect::<String>();
+        &nfkc_owned
+    } else {
+        text
+    };
+    let stage2 = base_normalize(stage1, opts);
+    if opts.separators {
+        collapse_separators(&stage2)
+    } else {
+        stage2
+    }
 }
 
 // ── Input scanner trait ───────────────────────────────────────────────────────
@@ -133,15 +215,28 @@ struct RuleBuckets {
 
 impl AcScanner {
     fn build(cfg: &KeywordConfig) -> anyhow::Result<Self> {
+        let opts = &cfg.normalize;
         let mut rules = RuleBuckets {
-            block_literals: cfg.inline_block.iter().map(|s| normalize(s)).collect(),
-            alert_literals: cfg.inline_alert.iter().map(|s| normalize(s)).collect(),
-            flag_literals: cfg.inline_flag.iter().map(|s| normalize(s)).collect(),
+            block_literals: cfg
+                .inline_block
+                .iter()
+                .map(|s| normalize_with(s, opts))
+                .collect(),
+            alert_literals: cfg
+                .inline_alert
+                .iter()
+                .map(|s| normalize_with(s, opts))
+                .collect(),
+            flag_literals: cfg
+                .inline_flag
+                .iter()
+                .map(|s| normalize_with(s, opts))
+                .collect(),
             ..RuleBuckets::default()
         };
 
         for path in &cfg.dict_paths {
-            load_ac_dict_file(path, &mut rules)
+            load_ac_dict_file(path, &mut rules, opts)
                 .with_context(|| format!("loading dictionary file {path}"))?;
         }
 
@@ -211,6 +306,7 @@ impl InputScanner for AcScanner {
 pub struct Matchers {
     input: Box<dyn InputScanner>,
     output: Dictionary,
+    normalize: NormalizeConfig,
 }
 
 impl Matchers {
@@ -232,7 +328,11 @@ impl Matchers {
             .add_many(&["I cannot", "As an AI", "I'm not able"], key::FLAG)
             .build();
 
-        Ok(Self { input, output })
+        Ok(Self {
+            input,
+            output,
+            normalize: cfg.normalize.clone(),
+        })
     }
 
     pub fn engine_name(&self) -> &'static str {
@@ -240,7 +340,7 @@ impl Matchers {
     }
 
     pub fn check_input(&self, text: &str) -> InputVerdict {
-        self.input.check(&normalize(text))
+        self.input.check(&normalize_with(text, &self.normalize))
     }
 
     pub fn filter_output(&self, text: &str) -> String {
@@ -248,7 +348,11 @@ impl Matchers {
     }
 }
 
-fn load_ac_dict_file(path: &str, rules: &mut RuleBuckets) -> anyhow::Result<()> {
+fn load_ac_dict_file(
+    path: &str,
+    rules: &mut RuleBuckets,
+    opts: &NormalizeConfig,
+) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path)?;
     for (idx, raw_line) in content.lines().enumerate() {
         let line = raw_line.trim();
@@ -289,7 +393,7 @@ fn load_ac_dict_file(path: &str, rules: &mut RuleBuckets) -> anyhow::Result<()> 
                 RuleTarget::Flag => rules.flag_regex.push(rule),
             }
         } else {
-            let literal = normalize(pattern);
+            let literal = normalize_with(pattern, opts);
             match target {
                 RuleTarget::Block => rules.block_literals.push(literal),
                 RuleTarget::Alert => rules.alert_literals.push(literal),

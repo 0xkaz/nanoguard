@@ -67,6 +67,35 @@ pub struct KeywordConfig {
     pub inline_block: Vec<String>,
     pub inline_alert: Vec<String>,
     pub inline_flag: Vec<String>,
+    #[serde(default)]
+    pub normalize: NormalizeConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NormalizeConfig {
+    /// NFKC Unicode normalization (full-width → half-width, combining chars). Default: true.
+    #[serde(default = "default_true")]
+    pub nfkc: bool,
+    /// Strip zero-width chars (U+200B/C/D, U+FEFF). Default: true.
+    #[serde(default = "default_true")]
+    pub zero_width: bool,
+    /// Collapse single-char separators ("j-a-i-l" → "jail"). Default: false (off).
+    #[serde(default)]
+    pub separators: bool,
+    /// Leet-speak fold (3→e, 0→o, 1→i, 4→a, 5→s, 7→t, @→a). Default: false (off).
+    #[serde(default)]
+    pub leet: bool,
+}
+
+impl Default for NormalizeConfig {
+    fn default() -> Self {
+        Self {
+            nfkc: true,
+            zero_width: true,
+            separators: false,
+            leet: false,
+        }
+    }
 }
 
 fn default_engine() -> String {
@@ -95,6 +124,7 @@ impl Default for KeywordConfig {
                 "crypto".to_string(),
                 "gambling".to_string(),
             ],
+            normalize: NormalizeConfig::default(),
         }
     }
 }

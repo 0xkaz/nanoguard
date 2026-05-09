@@ -163,6 +163,20 @@ Default blocked patterns (fully configurable):
 ignore previous instructions · disregard your instructions · jailbreak · dan mode · you are now
 ```
 
+PII rules can also run before forwarding. With `input.pii.action = "mask"`, common patterns such as emails, SSNs, credit-card-shaped numbers, and long API-token-shaped strings are redacted before the request is sent to the backend. `reject` blocks the request; `log` records an alert and forwards it unchanged.
+
+#### Obfuscation handling
+
+Input is normalized before scanning. Two transforms are on by default — they are essentially free for ASCII input (NFKC is skipped via a fast path) and only catch attacks that would otherwise slip through:
+
+- **NFKC Unicode normalization** — full-width letters such as `ｊａｉｌｂｒｅａｋ` fold to ASCII before matching.
+- **Zero-width character stripping** — `j​ailb​reak` becomes `jailbreak`.
+
+Two more are opt-in because they can produce false positives on legitimate text:
+
+- **`separators = true`** — collapses runs of single letters joined by `-` `.` `_` `*` `~` (e.g. `j-a-i-l-b-r-e-a-k`). A length-≥4 run threshold preserves common dashed words like `co-op` and `e-mail`.
+- **`leet = true`** — folds digits and symbols to letters (`j41lbr34k` → `jailbreak`). Disabled by default because it affects legitimate text such as `3D printer` or `S3 bucket`.
+
 ### Output (before returning to client)
 
 Responses are filtered before reaching your app. Sensitive words are replaced with `***`.
@@ -215,6 +229,16 @@ inline_block = ["ignore previous instructions", "jailbreak"]
 inline_alert = ["password", "api_key"]
 inline_flag  = ["bitcoin", "crypto"]
 
+[input.keyword.normalize]
+nfkc       = true   # full-width → half-width, combining char folding
+zero_width = true   # strip U+200B/C/D, U+FEFF
+separators = false  # opt-in: collapse "j-a-i-l-b-r-e-a-k" → "jailbreak"
+leet       = false  # opt-in: 3→e, 0→o, 1→i, 4→a, 5→s, 7→t, @→a, $→s
+
+[input.pii]
+enabled = true
+action = "mask"  # mask | reject | log
+
 [output]
 enabled = true
 
@@ -240,6 +264,12 @@ hash_only = true
 | `BACKEND_MODEL` | — | Default model name |
 | `RUST_LOG` | `info` | Log level |
 | `ADMIN_API_KEY` | — | Enables `/v1/admin/budget/*` endpoints |
+
+### Budget tracking
+
+Budget tracking uses the OpenAI `user` field as the budget key identifier, falling back to `default` when `user` is omitted. Usage is recorded from non-streaming backend responses that include OpenAI-compatible `usage.prompt_tokens` and `usage.completion_tokens`.
+
+Streaming responses are currently forwarded without token usage accounting because token totals are usually only available after stream completion and provider formats differ.
 
 ---
 
@@ -301,8 +331,10 @@ The release binary is statically linked — what you audit is what runs.
 ### Limitations
 
 nanoguard is a **policy enforcement layer**, not an adversarial-resistant security boundary.
-Rule-based keyword filtering can be bypassed by a motivated attacker using encoding tricks,
-paraphrasing, or obfuscation. It is designed for:
+The default normalization (NFKC + zero-width stripping) and opt-in transforms (`separators`,
+`leet`) catch common obfuscation patterns, but rule-based filtering will always lose to a
+sufficiently motivated attacker using paraphrasing, base64, multilingual variants, or novel
+encodings. It is designed for:
 
 - Compliance and audit trails
 - Preventing accidental misuse (prompt injection from untrusted content)

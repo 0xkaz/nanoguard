@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::config::KeywordConfig;
+    use crate::config::{KeywordConfig, NormalizeConfig};
     use crate::matcher::{InputVerdict, Matchers};
 
     #[derive(Debug, PartialEq)]
@@ -243,5 +243,118 @@ mod tests {
             assert_eq!(iword_kind, expected, "iword verdict for `{input}`");
             assert_eq!(ac_kind, expected, "aho-corasick verdict for `{input}`");
         }
+    }
+
+    // ── Obfuscation resistance ────────────────────────────────────────────────
+
+    #[test]
+    fn nfkc_full_width_jailbreak_blocked() {
+        let m = default_matchers();
+        assert!(matches!(
+            m.check_input("ｊａｉｌｂｒｅａｋ"),
+            InputVerdict::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn zero_width_chars_stripped_by_default() {
+        let m = default_matchers();
+        let text = "j\u{200B}ailb\u{200B}reak";
+        assert!(matches!(m.check_input(text), InputVerdict::Blocked(_)));
+    }
+
+    #[test]
+    fn separators_off_by_default_preserves_dashed_words() {
+        let m = default_matchers();
+        assert_eq!(
+            m.check_input("j-a-i-l-b-r-e-a-k"),
+            InputVerdict::Clean,
+            "separator collapsing must be opt-in"
+        );
+    }
+
+    #[test]
+    fn separators_on_collapses_dashes() {
+        let cfg = KeywordConfig {
+            normalize: NormalizeConfig {
+                separators: true,
+                ..NormalizeConfig::default()
+            },
+            ..KeywordConfig::default()
+        };
+        let m = Matchers::build(&cfg).expect("build");
+        assert!(matches!(
+            m.check_input("j-a-i-l-b-r-e-a-k"),
+            InputVerdict::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn separators_on_preserves_co_op_email() {
+        // ≥4-letter run threshold keeps "co-op" / "e-mail" intact.
+        let cfg = KeywordConfig {
+            normalize: NormalizeConfig {
+                separators: true,
+                ..NormalizeConfig::default()
+            },
+            ..KeywordConfig::default()
+        };
+        let m = Matchers::build(&cfg).expect("build");
+        assert_eq!(
+            m.check_input("the co-op meets at the e-mail address"),
+            InputVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn leet_off_by_default() {
+        let m = default_matchers();
+        assert_eq!(m.check_input("j41lbr34k"), InputVerdict::Clean);
+    }
+
+    #[test]
+    fn leet_on_blocks_obfuscated_jailbreak() {
+        let cfg = KeywordConfig {
+            normalize: NormalizeConfig {
+                leet: true,
+                ..NormalizeConfig::default()
+            },
+            ..KeywordConfig::default()
+        };
+        let m = Matchers::build(&cfg).expect("build");
+        assert!(matches!(
+            m.check_input("j41lbr34k"),
+            InputVerdict::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn leet_and_separators_combined() {
+        let cfg = KeywordConfig {
+            normalize: NormalizeConfig {
+                leet: true,
+                separators: true,
+                ..NormalizeConfig::default()
+            },
+            ..KeywordConfig::default()
+        };
+        let m = Matchers::build(&cfg).expect("build");
+        assert!(matches!(
+            m.check_input("j-4-1-l-b-r-3-4-k"),
+            InputVerdict::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn nfkc_off_keeps_full_width_distinct() {
+        let cfg = KeywordConfig {
+            normalize: NormalizeConfig {
+                nfkc: false,
+                ..NormalizeConfig::default()
+            },
+            ..KeywordConfig::default()
+        };
+        let m = Matchers::build(&cfg).expect("build");
+        assert_eq!(m.check_input("ｊａｉｌｂｒｅａｋ"), InputVerdict::Clean);
     }
 }
