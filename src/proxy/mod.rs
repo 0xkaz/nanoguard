@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::{
+    audit::{AuditEntry, Verdict},
     budget::store::{BudgetCheck, SpendRecord},
     matcher::InputVerdict,
     AppState,
@@ -21,30 +22,46 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
+    let t0 = std::time::Instant::now();
+    let request_id = crate::audit::new_request_id();
+
     // Extract all message content for scanning
     let user_text = extract_messages_text(&body);
+    let api_key = extract_api_key(&body);
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
 
     // Input Guardrails
     if state.config.input.enabled {
         match state.matchers.check_input(&user_text) {
             InputVerdict::Blocked(word) => {
                 warn!("BLOCK input: {:?}", word);
+                write_audit(
+                    &state,
+                    &request_id,
+                    &api_key,
+                    &model,
+                    &user_text,
+                    Verdict::Block,
+                    Some(word.clone()),
+                    t0.elapsed().as_micros() as u64,
+                );
                 return blocked_response(&format!("prompt injection detected (`{word}`)"));
             }
             InputVerdict::Alert(word) => {
                 info!("ALERT input: {:?}", word);
-                // Continue but log
             }
             InputVerdict::Flagged(info_str) => {
                 info!("FLAG input: {}", info_str);
-                // Continue but log
             }
             InputVerdict::Clean => {}
         }
     }
 
     // Budget check (before forwarding to LLM)
-    let api_key = extract_api_key(&body);
     if let Some(budget) = &state.budget {
         match budget.check(&api_key).await {
             Ok(BudgetCheck::Exceeded { usage, limit }) => {
@@ -139,6 +156,17 @@ pub async fn chat_completions(
                 Ok(bytes::Bytes::from(out))
             });
 
+        write_audit(
+            &state,
+            &request_id,
+            &api_key,
+            &model,
+            &user_text,
+            Verdict::Allow,
+            None,
+            t0.elapsed().as_micros() as u64,
+        );
+
         let body = Body::from_stream(filtered);
         let mut resp = Response::builder().status(status.as_u16());
         for (k, v) in &headers {
@@ -171,7 +199,7 @@ pub async fn chat_completions(
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let model = resp_json
+            let resp_model = resp_json
                 .get("model")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
@@ -180,7 +208,7 @@ pub async fn chat_completions(
                 api_key: api_key.clone(),
                 prompt_tokens: prompt,
                 completion_tokens: completion,
-                model,
+                model: resp_model,
                 created_at: chrono::Utc::now(),
             };
             let budget = budget.clone();
@@ -190,6 +218,17 @@ pub async fn chat_completions(
                 }
             });
         }
+
+        write_audit(
+            &state,
+            &request_id,
+            &api_key,
+            &model,
+            &user_text,
+            Verdict::Allow,
+            None,
+            t0.elapsed().as_micros() as u64,
+        );
 
         let filtered = if state.config.output.enabled {
             filter_response_json(&state, resp_json)
@@ -277,4 +316,30 @@ fn blocked_response(reason: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_audit(
+    state: &AppState,
+    request_id: &str,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    verdict: Verdict,
+    matched_rule: Option<String>,
+    latency_us: u64,
+) {
+    let Some(log) = &state.audit else { return };
+    let prompt_hash = log.hash_prompt(prompt);
+    let entry = AuditEntry {
+        request_id: request_id.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        api_key: api_key.to_string(),
+        model: model.to_string(),
+        prompt_hash,
+        verdict,
+        matched_rule,
+        latency_us,
+    };
+    log.write(&entry);
 }

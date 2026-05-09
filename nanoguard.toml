@@ -43,3 +43,8 @@ action = "mask"
 enabled = false          # set true to enable token budget tracking
 db_path = "nanoguard.db"
 # admin_api_key = "your-secret-key"  # enables /v1/admin/budget/* endpoints
+
+[audit]
+enabled = true                         # set true to enable audit logging
+path = "nanoguard-audit.jsonl"
+hash_only = true                       # true = SHA-256 hash of prompt only (privacy-preserving)

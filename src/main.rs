@@ -6,7 +6,7 @@ use axum::{
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use nanoguard::{admin, backend, budget, config, matcher, proxy, AppState};
+use nanoguard::{admin, audit, backend, budget, config, matcher, proxy, AppState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,12 +31,21 @@ async fn main() -> Result<()> {
         None
     };
 
+    let audit_log = if cfg.audit.enabled {
+        tracing::info!("audit: enabled (path={}, hash_only={})", cfg.audit.path, cfg.audit.hash_only);
+        Some(audit::AuditLog::open(&cfg.audit)?)
+    } else {
+        tracing::info!("audit: disabled");
+        None
+    };
+
     let state = Arc::new(AppState {
         config: cfg.clone(),
         matchers,
         backend,
         http_client,
         budget,
+        audit: audit_log,
     });
 
     let app = Router::new()

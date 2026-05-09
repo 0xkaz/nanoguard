@@ -13,6 +13,8 @@ pub struct Config {
     pub output: OutputConfig,
     #[serde(default)]
     pub budget: BudgetConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,6 +116,31 @@ pub enum PiiAction {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct AuditConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_audit_path")]
+    pub path: String,
+    /// When true, only a SHA-256 hash of the prompt is logged (not the raw text)
+    #[serde(default = "default_true")]
+    pub hash_only: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_audit_path(),
+            hash_only: true,
+        }
+    }
+}
+
+fn default_audit_path() -> String {
+    "nanoguard-audit.jsonl".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct BudgetConfig {
     pub enabled: bool,
     pub db_path: String,
@@ -171,6 +198,7 @@ impl Config {
                     admin_api_key: std::env::var("ADMIN_API_KEY").ok(),
                     ..BudgetConfig::default()
                 },
+                audit: AuditConfig::default(),
             })
         }
     }
