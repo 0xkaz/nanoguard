@@ -1,0 +1,14 @@
+# Off-topic / content moderation signals
+# Format: word<TAB>key<TAB>weight (weight optional, default 1.0)
+# key 2 = FLAG
+
+bitcoin	2
+crypto	2
+cryptocurrency	2
+nft	2
+gambling	2
+casino	2
+poker	2
+lottery	2
+forex	2
+trading signals	2

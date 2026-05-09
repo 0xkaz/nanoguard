@@ -1,0 +1,20 @@
+# PII (Personally Identifiable Information) detection
+# Format: word<TAB>key<TAB>weight (weight optional, default 1.0)
+# key 1 = ALERT
+
+social security	1	8.0
+social security number	1	10.0
+credit card	1	8.0
+card number	1	6.0
+date of birth	1	6.0
+passport number	1	8.0
+driver license	1	6.0
+bank account	1	6.0
+routing number	1	6.0
+api_key	1	8.0
+api key	1	6.0
+secret key	1	8.0
+private key	1	8.0
+access token	1	8.0
+password	1	6.0
+ssn	1	10.0

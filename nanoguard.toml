@@ -1,0 +1,40 @@
+[nanoguard]
+listen = "0.0.0.0:8080"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://localhost:11434"
+model = "qwen3:0.6b"
+# api_key = "sk-..."   # for OpenAI / Anthropic
+
+[input]
+enabled = true
+
+[input.keyword]
+dict_paths = [
+  "dicts/prompt_injection.txt",
+  "dicts/pii.txt",
+  "dicts/off_topic.txt",
+  # "dicts/pii-regex.txt",  # requires iword-rs regex feature
+]
+inline_block = [
+  "ignore previous instructions",
+  "disregard your instructions",
+  "jailbreak",
+  "dan mode",
+  "you are now",
+]
+inline_alert = ["password", "api_key", "secret"]
+inline_flag  = ["bitcoin", "crypto", "gambling"]
+
+[input.pii]
+enabled = true
+action = "mask"   # mask | reject | log
+
+[output]
+enabled = true
+
+[output.pii]
+enabled = true
+action = "mask"

@@ -1,0 +1,21 @@
+# Prompt injection / jailbreak patterns
+# Format: word<TAB>key<TAB>weight (weight optional, default 1.0)
+# key 0 = BLOCK
+
+ignore previous instructions	0	10.0
+disregard your instructions	0	10.0
+disregard previous instructions	0	10.0
+forget your instructions	0	10.0
+ignore all instructions	0	10.0
+override your instructions	0	10.0
+you are now	0	8.0
+pretend you are	0	8.0
+act as if	0	6.0
+jailbreak	0	10.0
+dan mode	0	10.0
+developer mode	0	8.0
+do anything now	0	10.0
+ignore your training	0	8.0
+bypass restrictions	0	8.0
+system prompt	0	6.0
+reveal your instructions	0	8.0
