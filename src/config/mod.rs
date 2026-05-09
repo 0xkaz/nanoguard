@@ -44,6 +44,10 @@ pub struct BackendConfig {
 pub struct InputConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Shadow mode: scan + audit but do not actually block. Useful when rolling
+    /// out new rules — observe what would have been blocked before enforcing.
+    #[serde(default)]
+    pub shadow: bool,
     #[serde(default)]
     pub keyword: KeywordConfig,
     #[serde(default)]

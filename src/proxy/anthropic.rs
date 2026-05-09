@@ -72,7 +72,10 @@ pub async fn messages(
 
     // Input Guardrails
     if state.config.input.enabled {
-        match state.matchers.check_input(&user_text) {
+        match state
+            .matchers
+            .check_input_with_shadow(&user_text, state.config.input.shadow)
+        {
             InputVerdict::Blocked(word) => {
                 warn!("BLOCK input (anthropic): {:?}", word);
                 return (
