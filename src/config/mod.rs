@@ -60,15 +60,23 @@ pub struct OutputConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct KeywordConfig {
+    /// Keyword scan engine: "iword-rs" (default) or "aho-corasick"
+    #[serde(default = "default_engine")]
+    pub engine: String,
     pub dict_paths: Vec<String>,
     pub inline_block: Vec<String>,
     pub inline_alert: Vec<String>,
     pub inline_flag: Vec<String>,
 }
 
+fn default_engine() -> String {
+    "aho-corasick".to_string()
+}
+
 impl Default for KeywordConfig {
     fn default() -> Self {
         Self {
+            engine: default_engine(),
             dict_paths: vec![],
             inline_block: vec![
                 "ignore previous instructions".to_string(),

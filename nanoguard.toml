@@ -12,6 +12,7 @@ model = "qwen3:0.6b"
 enabled = true
 
 [input.keyword]
+engine = "aho-corasick"   # "aho-corasick" (default) or "iword-rs"
 dict_paths = [
   "dicts/prompt_injection.txt",
   "dicts/pii.txt",
