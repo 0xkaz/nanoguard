@@ -1,5 +1,7 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use anyhow::{bail, Context};
 use iword::{key, Dictionary, Mode};
+use regex::{Regex, RegexBuilder};
 
 use crate::config::KeywordConfig;
 
@@ -62,9 +64,15 @@ impl IwordScanner {
         let blocks: Vec<&str> = cfg.inline_block.iter().map(String::as_str).collect();
         let alerts: Vec<&str> = cfg.inline_alert.iter().map(String::as_str).collect();
         let flags: Vec<&str> = cfg.inline_flag.iter().map(String::as_str).collect();
-        if !blocks.is_empty() { b = b.add_many(&blocks, key::BLOCK); }
-        if !alerts.is_empty() { b = b.add_many(&alerts, key::ALERT); }
-        if !flags.is_empty()  { b = b.add_many(&flags,  key::FLAG);  }
+        if !blocks.is_empty() {
+            b = b.add_many(&blocks, key::BLOCK);
+        }
+        if !alerts.is_empty() {
+            b = b.add_many(&alerts, key::ALERT);
+        }
+        if !flags.is_empty() {
+            b = b.add_many(&flags, key::FLAG);
+        }
         for path in &cfg.dict_paths {
             b = b.load_file(path).map_err(|e| anyhow::anyhow!(e))?;
         }
@@ -89,55 +97,113 @@ impl InputScanner for IwordScanner {
         InputVerdict::Clean
     }
 
-    fn engine_name(&self) -> &'static str { "iword-rs" }
+    fn engine_name(&self) -> &'static str {
+        "iword-rs"
+    }
 }
 
 // ── Aho-Corasick engine ───────────────────────────────────────────────────────
 
 struct AcScanner {
-    block: AhoCorasick,
+    block: Option<AhoCorasick>,
     block_words: Vec<String>,
-    alert: AhoCorasick,
+    block_regex: Vec<RegexRule>,
+    alert: Option<AhoCorasick>,
     alert_words: Vec<String>,
-    flag: AhoCorasick,
+    alert_regex: Vec<RegexRule>,
+    flag: Option<AhoCorasick>,
     flag_words: Vec<String>,
+    flag_regex: Vec<RegexRule>,
+}
+
+struct RegexRule {
+    pattern: String,
+    regex: Regex,
+}
+
+#[derive(Default)]
+struct RuleBuckets {
+    block_literals: Vec<String>,
+    alert_literals: Vec<String>,
+    flag_literals: Vec<String>,
+    block_regex: Vec<RegexRule>,
+    alert_regex: Vec<RegexRule>,
+    flag_regex: Vec<RegexRule>,
 }
 
 impl AcScanner {
     fn build(cfg: &KeywordConfig) -> anyhow::Result<Self> {
-        let build = |pats: &[String]| -> anyhow::Result<AhoCorasick> {
-            Ok(AhoCorasickBuilder::new()
-                .match_kind(MatchKind::LeftmostFirst)
-                .build(pats)?)
+        let mut rules = RuleBuckets {
+            block_literals: cfg.inline_block.iter().map(|s| normalize(s)).collect(),
+            alert_literals: cfg.inline_alert.iter().map(|s| normalize(s)).collect(),
+            flag_literals: cfg.inline_flag.iter().map(|s| normalize(s)).collect(),
+            ..RuleBuckets::default()
+        };
+
+        for path in &cfg.dict_paths {
+            load_ac_dict_file(path, &mut rules)
+                .with_context(|| format!("loading dictionary file {path}"))?;
+        }
+
+        let build = |pats: &[String]| -> anyhow::Result<Option<AhoCorasick>> {
+            if pats.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(
+                AhoCorasickBuilder::new()
+                    .match_kind(MatchKind::LeftmostFirst)
+                    .build(pats)?,
+            ))
         };
         Ok(Self {
-            block: build(&cfg.inline_block)?,
-            block_words: cfg.inline_block.clone(),
-            alert: build(&cfg.inline_alert)?,
-            alert_words: cfg.inline_alert.clone(),
-            flag: build(&cfg.inline_flag)?,
-            flag_words: cfg.inline_flag.clone(),
+            block: build(&rules.block_literals)?,
+            block_words: rules.block_literals,
+            block_regex: rules.block_regex,
+            alert: build(&rules.alert_literals)?,
+            alert_words: rules.alert_literals,
+            alert_regex: rules.alert_regex,
+            flag: build(&rules.flag_literals)?,
+            flag_words: rules.flag_literals,
+            flag_regex: rules.flag_regex,
         })
     }
 }
 
 impl InputScanner for AcScanner {
     fn check(&self, norm: &str) -> InputVerdict {
-        if let Some(m) = self.block.find(norm) {
-            return InputVerdict::Blocked(self.block_words[m.pattern()].clone());
+        if let Some(ac) = &self.block {
+            if let Some(m) = ac.find(norm) {
+                return InputVerdict::Blocked(self.block_words[m.pattern()].clone());
+            }
         }
-        if let Some(m) = self.alert.find(norm) {
-            return InputVerdict::Alert(self.alert_words[m.pattern()].clone());
+        if let Some(rule) = self.block_regex.iter().find(|r| r.regex.is_match(norm)) {
+            return InputVerdict::Blocked(rule.pattern.clone());
         }
-        if self.flag.find(norm).is_some() {
-            if let Some(m) = self.flag.find(norm) {
+
+        if let Some(ac) = &self.alert {
+            if let Some(m) = ac.find(norm) {
+                return InputVerdict::Alert(self.alert_words[m.pattern()].clone());
+            }
+        }
+        if let Some(rule) = self.alert_regex.iter().find(|r| r.regex.is_match(norm)) {
+            return InputVerdict::Alert(rule.pattern.clone());
+        }
+
+        if let Some(ac) = &self.flag {
+            if let Some(m) = ac.find(norm) {
                 return InputVerdict::Flagged(self.flag_words[m.pattern()].clone());
             }
         }
+        if let Some(rule) = self.flag_regex.iter().find(|r| r.regex.is_match(norm)) {
+            return InputVerdict::Flagged(rule.pattern.clone());
+        }
+
         InputVerdict::Clean
     }
 
-    fn engine_name(&self) -> &'static str { "aho-corasick" }
+    fn engine_name(&self) -> &'static str {
+        "aho-corasick"
+    }
 }
 
 // ── Public Matchers struct ────────────────────────────────────────────────────
@@ -155,7 +221,10 @@ impl Matchers {
     pub fn build_with_engine(cfg: &KeywordConfig, engine: &str) -> anyhow::Result<Self> {
         let input: Box<dyn InputScanner> = match engine {
             "aho-corasick" => Box::new(AcScanner::build(cfg)?),
-            _ => Box::new(IwordScanner::build(cfg)?),
+            "iword-rs" => Box::new(IwordScanner::build(cfg)?),
+            other => {
+                bail!("unknown keyword engine `{other}` (expected `iword-rs` or `aho-corasick`)")
+            }
         };
 
         let output = Dictionary::builder()
@@ -177,6 +246,71 @@ impl Matchers {
     pub fn filter_output(&self, text: &str) -> String {
         self.output.filter(text, Mode::FORBID)
     }
+}
+
+fn load_ac_dict_file(path: &str, rules: &mut RuleBuckets) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let mut cols = line.split('\t').map(str::trim);
+        let Some(pattern) = cols.next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let key = cols
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{path}:{}: missing key", idx + 1))?;
+        let key = key
+            .parse::<u32>()
+            .with_context(|| format!("{path}:{}: invalid key `{key}`", idx + 1))?;
+
+        let target = match key {
+            0 => RuleTarget::Block,
+            1 => RuleTarget::Alert,
+            2 => RuleTarget::Flag,
+            other => bail!("{path}:{}: unsupported key `{other}`", idx + 1),
+        };
+
+        if let Some(regex_pattern) = parse_regex_pattern(pattern) {
+            let regex = RegexBuilder::new(regex_pattern)
+                .case_insensitive(true)
+                .build()
+                .with_context(|| format!("{path}:{}: invalid regex `{regex_pattern}`", idx + 1))?;
+            let rule = RegexRule {
+                pattern: regex_pattern.to_string(),
+                regex,
+            };
+            match target {
+                RuleTarget::Block => rules.block_regex.push(rule),
+                RuleTarget::Alert => rules.alert_regex.push(rule),
+                RuleTarget::Flag => rules.flag_regex.push(rule),
+            }
+        } else {
+            let literal = normalize(pattern);
+            match target {
+                RuleTarget::Block => rules.block_literals.push(literal),
+                RuleTarget::Alert => rules.alert_literals.push(literal),
+                RuleTarget::Flag => rules.flag_literals.push(literal),
+            }
+        }
+    }
+    Ok(())
+}
+
+enum RuleTarget {
+    Block,
+    Alert,
+    Flag,
+}
+
+fn parse_regex_pattern(pattern: &str) -> Option<&str> {
+    pattern
+        .strip_prefix('/')
+        .and_then(|p| p.strip_suffix('/'))
+        .filter(|p| !p.is_empty())
 }
 
 #[cfg(test)]

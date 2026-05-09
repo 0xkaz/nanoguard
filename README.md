@@ -5,7 +5,7 @@
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-nanoguard-blue)](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**LLM guardrails proxy. Rust. Single binary. No GPU. No cloud. ~7 µs to block.**
+**LLM guardrails proxy. Rust. Single binary. No GPU. No cloud. Sub-microsecond literal blocks.**
 
 nanoguard sits between your application and any OpenAI-compatible LLM backend,
 filtering prompts and responses in microseconds — entirely in-process, entirely offline.
@@ -15,7 +15,7 @@ filtering prompts and responses in microseconds — entirely in-process, entirel
         ↓  POST /v1/chat/completions
   ┌──────────────────────────────────────┐
   │              nanoguard               │
-  │  Input Guardrails  (~7 µs)           │  ← keyword / PII regex / injection patterns
+  │  Input Guardrails  (<1 µs literal)   │  ← keyword / PII regex / injection patterns
   │  Backend Router                      │  ← Ollama / OpenAI / Anthropic / any
   │  Output Guardrails (~4 µs)           │  ← sensitive word masking, streaming
   │  Audit Log                           │  ← JSONL, SHA-256 hash-only mode
@@ -57,11 +57,11 @@ LLM-based content filtering is appealing — it handles nuance that keyword list
 
 For the majority of enterprise policy requirements — prompt injection patterns, PII categories, off-topic domains, banned keywords — a well-curated rule set is sufficient, deterministic, and auditable line by line. nanoguard uses that approach as the default. LLM-based filtering is planned as an opt-in feature.
 
-### Why iword-rs as the filter core
+### Why Aho-Corasick + regex rules
 
-Most keyword filters are O(N × M): one scan per pattern. [iword-rs](https://github.com/0xkaz/iword-rs) uses a sliding-window double rolling hash with binary search lookup — a single O(N) pass where scan time scales with text length, not pattern count. Preprocessing is lightweight (hash table, no automaton construction), which keeps startup cost and memory low — well suited to the typical guardrails use case of tens to a few hundred patterns.
+Most naive keyword filters are O(N × M): one scan per pattern. nanoguard uses [aho-corasick](https://docs.rs/aho-corasick/) for literal rules, so many prompt-injection phrases, PII terms, and policy keywords are matched in a single O(N) pass. Regex rules are compiled separately for patterns that need structure, such as email addresses, SSNs, and API-token shapes.
 
-A 2,700-character prompt scans in ~950 µs. A blocked request exits in ~7 µs. The same engine handles keyword blocks, PII alerts, and regex patterns through one interface.
+The default engine is `aho-corasick`; the older `iword-rs` engine remains available via config for comparison and compatibility.
 
 ---
 
@@ -149,7 +149,7 @@ make run
 
 ### Input (before sending to LLM)
 
-Single O(N) pass via [iword-rs](https://github.com/0xkaz/iword-rs) (sliding-window rolling hash). Blocked requests never reach the backend.
+Literal rules are scanned with Aho-Corasick; regex rules are compiled once at startup. Blocked requests never reach the backend.
 
 | Result | Action |
 |--------|--------|
@@ -209,6 +209,7 @@ endpoint = "http://localhost:11434"
 enabled = true
 
 [input.keyword]
+engine = "aho-corasick"  # "aho-corasick" (default) or "iword-rs"
 dict_paths = []  # additional .txt word list files
 inline_block = ["ignore previous instructions", "jailbreak"]
 inline_alert = ["password", "api_key"]
@@ -258,7 +259,7 @@ Requires: Rust 1.75+
 
 ## Dictionary files
 
-[iword-rs](https://github.com/0xkaz/iword-rs) format — tab-separated:
+nanoguard dictionary format — tab-separated:
 
 ```
 # word          key   weight
@@ -281,12 +282,13 @@ Measured on Apple M-series, single core, release build, warm cache.
 
 | Operation | Time |
 |---|---|
-| Input check — clean | ~10 µs |
-| Input check — blocked (early exit) | ~7 µs |
+| Input check — clean | ~0.5 µs |
+| Input check — blocked (early exit) | ~0.2 µs |
+| Input check — long clean (~2,700 chars) | ~65 µs |
 | Output filter — no match | ~4 µs |
 | Output filter — mask SSN + credit card | ~7 µs |
 
-Input scanning is O(N) in prompt length. A 2,700-character prompt: ~950 µs.
+Input scanning is O(N) in prompt length for literal rules. Regex rules are evaluated after literal BLOCK checks.
 
 ---
 
@@ -316,4 +318,4 @@ require buffered scanning in a future release.
 
 ## Credits
 
-Powered by [iword-rs](https://github.com/0xkaz/iword-rs) — Pure Rust O(N) keyword search.
+Input literal matching uses [aho-corasick](https://docs.rs/aho-corasick/). Legacy `iword-rs` support remains available as an alternate engine.

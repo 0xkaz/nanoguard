@@ -60,7 +60,7 @@ pub struct OutputConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct KeywordConfig {
-    /// Keyword scan engine: "iword-rs" (default) or "aho-corasick"
+    /// Keyword scan engine: "aho-corasick" (default) or "iword-rs"
     #[serde(default = "default_engine")]
     pub engine: String,
     pub dict_paths: Vec<String>,
@@ -70,7 +70,7 @@ pub struct KeywordConfig {
 }
 
 fn default_engine() -> String {
-    "iword-rs".to_string()
+    "aho-corasick".to_string()
 }
 
 impl Default for KeywordConfig {

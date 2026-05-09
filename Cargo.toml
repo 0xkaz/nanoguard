@@ -23,6 +23,7 @@ serde_json = "1"
 toml = "0.8"
 iword-rs = { version = "0.1", features = ["regex"] }
 aho-corasick = "1"
+regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -39,7 +40,6 @@ sha2 = "0.10"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", features = ["full"] }
-aho-corasick = "1"
 
 [[bench]]
 name = "guardrails"

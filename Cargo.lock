@@ -975,6 +975,7 @@ dependencies = [
  "futures-util",
  "iword-rs",
  "once_cell",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

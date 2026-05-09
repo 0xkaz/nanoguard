@@ -33,7 +33,11 @@ async fn main() -> Result<()> {
     };
 
     let audit_log = if cfg.audit.enabled {
-        tracing::info!("audit: enabled (path={}, hash_only={})", cfg.audit.path, cfg.audit.hash_only);
+        tracing::info!(
+            "audit: enabled (path={}, hash_only={})",
+            cfg.audit.path,
+            cfg.audit.hash_only
+        );
         Some(audit::AuditLog::open(&cfg.audit)?)
     } else {
         tracing::info!("audit: disabled");
