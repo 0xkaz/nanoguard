@@ -5,58 +5,41 @@
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-nanoguard-blue)](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Nano-fast. CPU-only. Offline-first. LLM Guardrails Proxy.**
+**LLM guardrails proxy. Rust. Single binary. No GPU. No cloud. ~7 µs to block.**
 
-nanoguard is a Rust-native LLM guardrails proxy.
-It sits between your application and any OpenAI-compatible LLM backend,
-filtering prompts and responses in microseconds — no GPU, no cloud, no Python.
+nanoguard sits between your application and any OpenAI-compatible LLM backend,
+filtering prompts and responses in microseconds — entirely in-process, entirely offline.
 
 ```
-[Your App / Open WebUI / Telegram Bot]
+[Your App / Robot / Edge Device / Open WebUI]
         ↓  POST /v1/chat/completions
-  ┌─────────────────────────────┐
-  │         nanoguard           │
-  │  Input Guardrails  (μs)     │  ← keyword filter, PII detection
-  │  Backend Router             │  ← Ollama / OpenAI / Anthropic
-  │  Output Guardrails (μs)     │  ← sensitive word masking
-  │  Audit Log                  │  ← JSONL, privacy-preserving hash
-  └─────────────────────────────┘
+  ┌──────────────────────────────────────┐
+  │              nanoguard               │
+  │  Input Guardrails  (~7 µs)           │  ← keyword / PII regex / injection patterns
+  │  Backend Router                      │  ← Ollama / OpenAI / Anthropic / any
+  │  Output Guardrails (~4 µs)           │  ← sensitive word masking, streaming
+  │  Audit Log                           │  ← JSONL, SHA-256 hash-only mode
+  └──────────────────────────────────────┘
         ↓
   [LLM Backend]
 ```
 
 ---
 
-## Why nanoguard exists
+## The problem
 
-### The gap this fills
+Cloud guardrail APIs (AWS Bedrock Guardrails, Azure AI Content Safety, Google Cloud) work well when you have a reliable internet connection and can tolerate the added cloud roundtrip latency per request. For a web chatbot, that is fine.
 
-Existing guardrails tools (LLM Guard, NeMo Guardrails) are research-oriented:
-they rely on ML models or GPU-accelerated scanners and carry a 300MB+ footprint.
-They are not designed to run as a transparent proxy in a production request path.
+For everything else, it is a hard architectural mismatch:
 
-Multi-provider LLM gateways (LiteLLM, Portkey, Helicone) solve a different
-problem — routing and observability across many providers — and are excellent at
-that. nanoguard is designed to sit **in front of** those tools, not replace them,
-as a dedicated security boundary.
+- **Robotics and autonomous systems** require sub-100ms decision cycles. A 500ms cloud roundtrip for content filtering is longer than the control loop itself.
+- **Industrial IoT and factory floors** often operate on isolated networks with no outbound internet access by design.
+- **Medical and government systems** cannot route patient or classified data through external APIs for policy reasons, regardless of latency.
+- **Edge devices** — from warehouse robots to in-vehicle systems — face intermittent connectivity as a physical reality, not an edge case.
 
-The gap: there is no lightweight, single-binary, offline-capable tool focused
-purely on enforcing content policy at the LLM traffic boundary, fast enough to
-be invisible in the request path.
+For latency-sensitive or offline applications, safety filtering has to run locally — cloud guardrails are a single point of failure for systems that cannot stop and wait.
 
-### What nanoguard is (and is not)
-
-nanoguard is an **AI Security Gateway** — a thin, auditable layer you place
-in front of any LLM backend to enforce policy at the boundary:
-
-- What content is allowed into the LLM
-- What content is allowed out of the LLM
-- Who sent what, when, and what verdict was applied
-
-It is designed for environments where operational simplicity is a hard constraint:
-air-gapped factories, medical networks, edge devices, or any team that wants a
-sub-millisecond security layer with a 10MB memory budget and a single binary to
-audit and deploy.
+nanoguard is a deterministic, offline-capable guardrails layer that runs anywhere a binary can run.
 
 ---
 
@@ -64,73 +47,39 @@ audit and deploy.
 
 ### Why Rust
 
-Memory safety without garbage collection pauses matters when you are on the hot
-path of every LLM request. Rust gives deterministic latency, a sub-10MB baseline
-RSS, and no runtime — the release artifact is a single statically-linked binary.
-There is no interpreter, no package manager, and no dynamic loader to compromise
-at deploy time.
+Rust gives deterministic latency without a garbage collector and memory safety without a VM. The release binary is a single statically-linked executable under 10MB — no interpreter, no package manager, nothing to update at deploy time.
 
-Rust's ownership model also eliminates entire classes of bugs (use-after-free,
-data races) that are common in C/C++ network daemons, without the GC overhead
-of Go. For a security proxy, that tradeoff is worth the steeper learning curve.
+Go would have been a reasonable alternative: similar deployment story, faster iteration. The tradeoff is GC pause predictability and the fact that a security boundary benefits from compile-time memory safety guarantees. For a proxy that sits in the path of every LLM request, the latency tail and the attack surface both matter.
+
+### Why deterministic rules, not a second LLM
+
+LLM-based content filtering is appealing — it handles nuance that keyword lists miss. The cost: 100ms–2s added latency, a dependency on model availability, and verdicts that are probabilistic rather than auditable. "The guard model said allow" is not a compliance record.
+
+For the majority of enterprise policy requirements — prompt injection patterns, PII categories, off-topic domains, banned keywords — a well-curated rule set is sufficient, deterministic, and auditable line by line. nanoguard uses that approach as the default. LLM-based filtering is planned as an opt-in feature.
 
 ### Why iword-rs as the filter core
 
-Most keyword filters are O(N × M) — they scan the input once per pattern.
-[iword-rs](https://github.com/0xkaz/iword-rs) uses an Aho-Corasick automaton:
-a single O(N) pass over the input, regardless of how many patterns are loaded.
-Loading 10,000 rules costs the same scan time as loading 10.
+Most keyword filters are O(N × M): one scan per pattern. [iword-rs](https://github.com/0xkaz/iword-rs) uses an Aho-Corasick automaton — a single O(N) pass regardless of how many patterns are loaded. 10,000 rules cost the same scan time as 10.
 
-This matters for two reasons:
-
-1. **Latency:** input filtering completes in microseconds, not milliseconds.
-   A 2,700-character prompt scans in ~950 µs on Apple M-series.
-2. **Design consistency:** the same engine handles keyword blocks, PII alerts,
-   and regex patterns through a unified interface. There is no "fast path" and
-   "slow path" — all rules go through one scanner.
-
-### Why no LLM-based filtering
-
-Using a second LLM to judge the first LLM's traffic introduces:
-
-- A second latency budget (100ms–2s per call)
-- A second failure mode (what if the guard LLM is compromised or hallucinating?)
-- A second cost center
-- An internet dependency for cloud-hosted guard models
-
-nanoguard's filter is deterministic and offline. A rule that blocks "SSN" blocks
-it in 7 µs, every time, with no network call and no model inference. For the
-majority of enterprise policy requirements — prompt injection patterns, PII
-categories, off-topic content — deterministic rules are sufficient and auditable
-in a way that LLM-based verdicts are not.
-
-LLM-based filtering is supported as an opt-in future feature, never the default.
-
-### Offline and edge first
-
-Every feature in nanoguard works without internet access. This is a hard
-constraint, not a nice-to-have. The target environments — hospital networks,
-factory floors, government intranets, air-gapped Kubernetes clusters — often
-cannot make outbound HTTP calls. Cloud-only features are prohibited in the core.
+A 2,700-character prompt scans in ~950 µs. A blocked request exits in ~7 µs. The same engine handles keyword blocks, PII alerts, and regex patterns through one interface.
 
 ---
 
 ## Comparison
 
-| | nanoguard | LLM Guard | NeMo | LiteLLM |
-|---|---|---|---|---|
-| Language | Rust | Python | Python | Python |
-| Role | Security Gateway | Guardrails lib | Guardrails lib | LLM Gateway |
-| Proxy | ✅ | ❌ | ❌ | ✅ |
-| Offline | ✅ | ✅ | △ | ✅ |
-| GPU-free | ✅ | △ | ❌ | ✅ |
-| Single binary | ✅ | ❌ | ❌ | ❌ |
-| Memory | ~10MB | ~300MB+ | heavy | ~500MB+ |
-| Filter latency | ~7–50 µs | 10ms–2s | 10ms+ | N/A |
-| Audit log | ✅ (JSONL, hash-only mode) | △ | △ | ✅ (Enterprise) |
+| | nanoguard | AWS Bedrock Guardrails | Azure AI Content Safety | LLM Guard | LiteLLM |
+|---|---|---|---|---|---|
+| Deployment | Single binary | Cloud API | Cloud API / Embedded† | Python lib | Python app |
+| Offline | ✅ | ❌ | ❌ / △† | ✅ | ✅ |
+| GPU-free | ✅ | N/A | N/A | △ | ✅ |
+| Filter latency | ~7–50 µs* | cloud roundtrip | cloud roundtrip | model-dependent | not applicable |
+| Data leaves infra | ❌ never | ✅ always | ✅ always | ❌ never | depends |
+| Audit log | ✅ JSONL | ✅ CloudWatch | ✅ Azure Monitor | △ | ✅ (Enterprise) |
 
-These tools solve different problems. nanoguard pairs well with LiteLLM:
-nanoguard handles the security boundary, LiteLLM handles multi-provider routing.
+\* Measured locally; see [Performance](#performance) section.  
+† Azure Embedded Content Safety requires separate approval and is not generally available.
+
+LiteLLM and multi-provider gateways solve a different problem (routing, observability across providers). nanoguard is designed to sit in front of those tools as a dedicated security boundary, not replace them.
 
 ---
 
@@ -139,13 +88,13 @@ nanoguard handles the security boundary, LiteLLM handles multi-provider routing.
 ### Docker (recommended)
 
 ```bash
-# Architecture is auto-detected (arm64 / amd64)
+# Architecture auto-detected: arm64 / amd64
 docker run -p 8080:8080 \
   -e BACKEND_ENDPOINT=http://host.docker.internal:11434 \
   ghcr.io/0xkaz/nanoguard:latest
 ```
 
-With a custom config:
+With a config file:
 
 ```bash
 docker run -p 8080:8080 \
@@ -153,19 +102,18 @@ docker run -p 8080:8080 \
   ghcr.io/0xkaz/nanoguard:latest
 ```
 
-> Image published to [ghcr.io/0xkaz/nanoguard](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard) on every tagged release.
-> Supports `linux/amd64` and `linux/arm64` (Apple Silicon / AWS Graviton).
+> Image: [ghcr.io/0xkaz/nanoguard](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard) — `linux/amd64` and `linux/arm64`
 
 ### With Ollama (build from source)
 
 ```bash
 git clone https://github.com/0xkaz/nanoguard
 cd nanoguard
-make run   # pulls qwen3:0.6b, runs nanoguard on :8080
+make run   # pulls qwen3:0.6b, starts nanoguard on :8080
 ```
 
 ```bash
-# Use it exactly like the OpenAI API
+# Drop-in for any OpenAI client
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"Hello!"}]}'
@@ -187,13 +135,13 @@ make run
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | OpenAI-compatible chat — proxied through guardrails |
-| `POST /v1/messages` | Anthropic-compatible chat — proxied through guardrails |
-| `GET /v1/models` | List models from backend |
+| `POST /v1/chat/completions` | OpenAI-compatible chat |
+| `POST /v1/messages` | Anthropic-compatible chat |
+| `GET /v1/models` | Proxy to backend model list |
 | `GET /health` | Health check |
-| `GET /v1/admin/budget/:api_key` | Get token usage and limit (requires admin key) |
-| `PUT /v1/admin/budget/:api_key` | Set token limit `{"limit": 100000}` (requires admin key) |
-| `DELETE /v1/admin/budget/:api_key/reset` | Reset usage counter (requires admin key) |
+| `GET /v1/admin/budget/:api_key` | Token usage + limit (requires admin key) |
+| `PUT /v1/admin/budget/:api_key` | Set limit `{"limit": 100000}` |
+| `DELETE /v1/admin/budget/:api_key/reset` | Reset usage counter |
 
 ---
 
@@ -201,33 +149,28 @@ make run
 
 ### Input (before sending to LLM)
 
-Requests are scanned using [iword-rs](https://github.com/0xkaz/iword-rs) — a single-pass O(N) Aho-Corasick engine.
+Single O(N) pass via [iword-rs](https://github.com/0xkaz/iword-rs). Blocked requests never reach the backend.
 
 | Result | Action |
 |--------|--------|
-| **Blocked** | Request rejected immediately, LLM never called |
-| **Alert** | Logged, request forwarded |
-| **Flagged** | Logged, request forwarded |
+| **Blocked** | Rejected immediately, LLM never called |
+| **Alert** | Logged, forwarded |
+| **Flagged** | Logged, forwarded |
 
-Default blocked patterns (configurable):
+Default blocked patterns (fully configurable):
 
 ```
-ignore previous instructions
-disregard your instructions
-jailbreak
-dan mode
-you are now
+ignore previous instructions · disregard your instructions · jailbreak · dan mode · you are now
 ```
 
 ### Output (before returning to client)
 
-LLM responses are scanned and filtered before reaching your application.
-Sensitive words (`ssn`, `credit card`, etc.) are replaced with `***`.
-Streaming responses are filtered chunk-by-chunk.
+Responses are filtered before reaching your app. Sensitive words are replaced with `***`.
+Streaming responses are filtered chunk-by-chunk on the SSE `delta.content` field.
 
 ### Audit log
 
-Every request produces a structured JSONL entry:
+Every request writes one JSONL line:
 
 ```json
 {
@@ -242,9 +185,8 @@ Every request produces a structured JSONL entry:
 }
 ```
 
-`hash_only = true` (default) logs a SHA-256 hash of the prompt instead of the
-raw text — useful for compliance environments where storing user input is
-restricted.
+`hash_only = true` (default): SHA-256 hash of the prompt only — no raw text stored.
+Useful for compliance environments where retaining user input is restricted.
 
 ---
 
@@ -267,7 +209,7 @@ endpoint = "http://localhost:11434"
 enabled = true
 
 [input.keyword]
-dict_paths = []  # load additional .txt word list files
+dict_paths = []  # additional .txt word list files
 inline_block = ["ignore previous instructions", "jailbreak"]
 inline_alert = ["password", "api_key"]
 inline_flag  = ["bitcoin", "crypto"]
@@ -283,7 +225,7 @@ db_path = "nanoguard.db"
 [audit]
 enabled = false
 path = "nanoguard-audit.jsonl"
-hash_only = true   # SHA-256 hash of prompt only (privacy-preserving)
+hash_only = true
 ```
 
 ### Environment variables
@@ -316,13 +258,13 @@ Requires: Rust 1.75+
 
 ## Dictionary files
 
-Load custom word lists in [iword-rs](https://github.com/0xkaz/iword-rs) format:
+[iword-rs](https://github.com/0xkaz/iword-rs) format — tab-separated:
 
 ```
-# words.txt (tab-separated: word  key  weight)
-confidential      0          # BLOCK
-internal use only 0   5.0   # BLOCK, weight 5.0
-project_codename  1          # ALERT
+# word          key   weight
+confidential    0            # BLOCK
+internal only   0     5.0   # BLOCK, weighted
+project_xyz     1            # ALERT
 ```
 
 ```toml
@@ -334,37 +276,25 @@ dict_paths = ["dicts/company.txt", "dicts/prompt_injection.txt"]
 
 ## Performance
 
-Measured on Apple M-series (single core, release build).
-These are guardrail costs only — not including network round-trip to the LLM.
+Measured on Apple M-series, single core, release build.
+Guardrail cost only — excludes network round-trip to LLM.
 
 | Operation | Time |
 |---|---|
-| Input check — clean (no match) | ~10 µs |
+| Input check — clean | ~10 µs |
 | Input check — blocked (early exit) | ~7 µs |
-| Input check — multiline normalization + block | ~7 µs |
-| Output filter — no sensitive words | ~4 µs |
+| Output filter — no match | ~4 µs |
 | Output filter — mask SSN + credit card | ~7 µs |
 
-Input scanning is O(N) in prompt length. A 2,700-character prompt costs ~950 µs.
+Input scanning is O(N) in prompt length. A 2,700-character prompt: ~950 µs.
 
 ---
 
-## Use cases
+## Security
 
-- **Local LLM protection** — wrap Ollama with guardrails for team use
-- **Air-gapped environments** — factory, medical, government networks with no cloud
-- **LiteLLM front layer** — add a security boundary in front of an existing LLM gateway
-- **Bot safety** — protect Telegram / Slack bots from prompt injection
-- **Cost control** — block off-topic or abusive prompts before they reach paid APIs
-
----
-
-## Security policy
-
-nanoguard is written in Rust and intentionally minimizes external dependencies.
-All filtering runs in-process — no network calls, no runtime scripts, no package
-manager at deploy time. The release artifact is a single statically-linked binary.
-What you audit is what runs.
+nanoguard minimizes external dependencies by design.
+All filtering runs in-process with no network calls and no dynamic code at runtime.
+The release binary is statically linked — what you audit is what runs.
 
 ---
 
