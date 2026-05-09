@@ -59,7 +59,7 @@ For the majority of enterprise policy requirements — prompt injection patterns
 
 ### Why iword-rs as the filter core
 
-Most keyword filters are O(N × M): one scan per pattern. [iword-rs](https://github.com/0xkaz/iword-rs) uses an Aho-Corasick automaton — a single O(N) pass regardless of how many patterns are loaded. 10,000 rules cost the same scan time as 10.
+Most keyword filters are O(N × M): one scan per pattern. [iword-rs](https://github.com/0xkaz/iword-rs) uses a rolling hash scan — a single O(N) pass over the text regardless of how many patterns are loaded. 10,000 rules cost the same scan time as 10.
 
 A 2,700-character prompt scans in ~950 µs. A blocked request exits in ~7 µs. The same engine handles keyword blocks, PII alerts, and regex patterns through one interface.
 
@@ -136,7 +136,7 @@ make run
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | OpenAI-compatible chat |
-| `POST /v1/messages` | Anthropic-compatible chat |
+| `POST /v1/messages` | Anthropic-compatible chat (text only; tool_use / vision / streaming not yet supported) |
 | `GET /v1/models` | Proxy to backend model list |
 | `GET /health` | Health check |
 | `GET /v1/admin/budget/:api_key` | Token usage + limit (requires admin key) |
@@ -276,8 +276,8 @@ dict_paths = ["dicts/company.txt", "dicts/prompt_injection.txt"]
 
 ## Performance
 
-Measured on Apple M-series, single core, release build.
-Guardrail cost only — excludes network round-trip to LLM.
+Measured on Apple M-series, single core, release build, warm cache.
+**These are guardrail-only costs — HTTP overhead and LLM round-trip are not included.**
 
 | Operation | Time |
 |---|---|
@@ -295,6 +295,19 @@ Input scanning is O(N) in prompt length. A 2,700-character prompt: ~950 µs.
 nanoguard minimizes external dependencies by design.
 All filtering runs in-process with no network calls and no dynamic code at runtime.
 The release binary is statically linked — what you audit is what runs.
+
+### Limitations
+
+nanoguard is a **policy enforcement layer**, not an adversarial-resistant security boundary.
+Rule-based keyword filtering can be bypassed by a motivated attacker using encoding tricks,
+paraphrasing, or obfuscation. It is designed for:
+
+- Compliance and audit trails
+- Preventing accidental misuse (prompt injection from untrusted content)
+- Enforcing organizational policy on LLM usage
+
+It is **not** designed to defeat adversarial users who are actively trying to circumvent the filter.
+For threat models that include motivated attackers, combine nanoguard with additional controls.
 
 ---
 
