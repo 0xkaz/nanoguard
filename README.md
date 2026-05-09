@@ -5,10 +5,10 @@
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-nanoguard-blue)](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**LLM guardrails proxy. Rust. Single binary. No GPU. No cloud. Sub-microsecond literal blocks.**
+**LLM guardrails proxy. Rust. Single binary. No GPU. No cloud guardrail call. Sub-microsecond literal blocks.**
 
 nanoguard sits between your application and any OpenAI-compatible LLM backend,
-filtering prompts and responses in microseconds — entirely in-process, entirely offline.
+filtering prompts and responses in-process, without an external guardrail API.
 
 ```
 [Your App / Robot / Edge Device / Open WebUI]
@@ -72,14 +72,14 @@ The default engine is `aho-corasick`; the older `iword-rs` engine remains availa
 | Deployment | Single binary | Cloud API | Cloud API / Embedded† | Python lib | Python app |
 | Offline | ✅ | ❌ | ❌ / △† | ✅ | ✅ |
 | GPU-free | ✅ | N/A | N/A | depends on scanner | ✅ |
-| Filter latency | ~7–50 µs* | cloud roundtrip | cloud roundtrip | model-dependent | not applicable |
+| Filter latency | ~0.2–65 µs* | cloud roundtrip | cloud roundtrip | model-dependent | not applicable |
 | External guardrail call | ❌ never | ✅ required | ✅ required | ❌ never | depends |
 | Audit log | ✅ JSONL | ✅ CloudWatch | ✅ Azure Monitor | △ | ✅ (Enterprise) |
 
 \* Measured locally; see [Performance](#performance) section.  
 † Azure Embedded Content Safety requires separate approval and is not generally available.
 
-LiteLLM and multi-provider gateways solve a different problem (routing, observability across providers). nanoguard is designed to sit in front of those tools as a dedicated security boundary, not replace them.
+LiteLLM and multi-provider gateways solve a different problem (routing, observability across providers). nanoguard is designed to sit in front of those tools as a dedicated policy boundary, not replace them.
 
 ---
 
