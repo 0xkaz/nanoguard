@@ -1,4 +1,5 @@
 pub mod anthropic;
+mod sse;
 
 use axum::{
     extract::State,
@@ -149,48 +150,36 @@ pub async fn chat_completions(
         let output_enabled = state.config.output.enabled;
         let matchers = Arc::clone(&state.matchers);
 
-        // Apply output filter to each SSE chunk's content field.
-        // Each chunk is a `data: {...}\n\n` line. We parse the JSON delta and
-        // filter the `choices[].delta.content` string in-place.
-        let filtered = body_stream
-            .map_err(std::io::Error::other)
-            .map(move |chunk| {
-                let chunk = chunk?;
-                if !output_enabled {
-                    return Ok::<_, std::io::Error>(chunk);
-                }
-                // Fast path: skip non-data lines and [DONE]
-                let text = match std::str::from_utf8(&chunk) {
-                    Ok(t) => t,
-                    Err(_) => return Ok(chunk),
-                };
-                if !text.starts_with("data:") || text.contains("[DONE]") {
-                    return Ok(chunk);
-                }
-                let json_str = text.trim_start_matches("data:").trim();
-                let mut val: Value = match serde_json::from_str(json_str) {
-                    Ok(v) => v,
-                    Err(_) => return Ok(chunk),
-                };
-                // Filter delta.content in each choice
-                if let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut()) {
-                    for choice in choices.iter_mut() {
-                        if let Some(content) = choice
-                            .get_mut("delta")
-                            .and_then(|d| d.get_mut("content"))
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string())
-                        {
-                            let filtered = matchers.filter_output(&content);
-                            if let Some(delta) = choice.get_mut("delta") {
-                                delta["content"] = Value::String(filtered);
-                            }
-                        }
+        // Buffer SSE bytes across chunk boundaries, splitting on the blank-line
+        // event terminator before applying the output filter to each event's
+        // `delta.content`. This handles backends that pack multiple events into
+        // one TCP chunk or split a single event across chunks.
+        let mut filter = sse::SseFilter::new(move |s: &str| matchers.filter_output(s));
+        let event_stream = body_stream.map_err(std::io::Error::other);
+        let filtered = async_stream::stream! {
+            futures_util::pin_mut!(event_stream);
+            while let Some(chunk) = event_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err::<bytes::Bytes, std::io::Error>(e);
+                        return;
                     }
+                };
+                if !output_enabled {
+                    yield Ok(chunk);
+                    continue;
                 }
-                let out = format!("data: {}\n\n", val);
-                Ok(bytes::Bytes::from(out))
-            });
+                let out = filter.push(&chunk);
+                if !out.is_empty() {
+                    yield Ok(out);
+                }
+            }
+            let tail = filter.flush();
+            if !tail.is_empty() {
+                yield Ok(tail);
+            }
+        };
 
         write_audit(
             &state,

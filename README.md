@@ -190,7 +190,8 @@ Two more are opt-in because they can produce false positives on legitimate text:
 ### Output (before returning to client)
 
 Responses are filtered before reaching your app. Sensitive words are replaced with `***`.
-Streaming responses are filtered chunk-by-chunk on the SSE `delta.content` field.
+
+Streaming SSE responses are buffered across chunk boundaries and split on the SSE event terminator before each event's `delta.content` is filtered. This handles backends that pack multiple events into a single TCP chunk or split a single event across chunks. Non-data lines (`event:`, comments, `[DONE]`) pass through unchanged.
 
 ### Shadow mode
 
@@ -366,8 +367,7 @@ encodings. It is designed for:
 It is **not** designed to defeat adversarial users who are actively trying to circumvent the filter.
 For threat models that include motivated attackers, combine nanoguard with additional controls.
 
-Streaming output filtering is currently chunk-local. Matches split across SSE chunk boundaries may
-require buffered scanning in a future release.
+Streaming output filtering is per SSE event. A sensitive token that the backend genuinely splits across two events (e.g. `"ss"` then `"n"`) will not be detected; combining nanoguard with full-response scanning is recommended for high-assurance use cases.
 
 ---
 
