@@ -193,6 +193,25 @@ placeholder_style = "bare"   # "bare" | "indexed" | "llm_guard"
 
 `placeholder_style` controls how matches are formatted. The default `bare` style emits `[EMAIL]`, which is fastest but loses the distinction between different values. `indexed` emits `[EMAIL_1]`, `[EMAIL_2]` so the LLM can tell apart two distinct emails in the same prompt — this is also a stepping stone toward Vault-backed deanonymization. `llm_guard` emits `[REDACTED_EMAIL_1]` for wire-compatibility with prompts that follow the LLM Guard convention.
 
+#### Per-entity action overrides
+
+The global `action` setting applies to every entity by default, but you can override it per entity. `reject` always wins: if any reject-class entity matches, the request is blocked before any masking runs.
+
+```toml
+[input.pii]
+action = "mask"   # default for entities not listed below
+
+[input.pii.entities]
+AWS_ACCESS_KEY_ID = "reject"
+ANTHROPIC_KEY     = "reject"
+GITHUB_PAT        = "reject"
+JWT               = "reject"
+EMAIL             = "mask"
+PHONE             = "log"
+```
+
+Entities not present in the redactor (e.g. typos) are silently ignored. Entity names are case-sensitive and match what the redactor emits in placeholders.
+
 #### Obfuscation handling
 
 Input is normalized before scanning. Two transforms are on by default — they are essentially free for ASCII input (NFKC is skipped via a fast path) and only catch attacks that would otherwise slip through:

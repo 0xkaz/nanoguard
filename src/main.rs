@@ -26,10 +26,18 @@ async fn main() -> Result<()> {
         &cfg.input.pii.dict_paths,
         proxy::redact::PlaceholderStyle::from_str(&cfg.input.pii.placeholder_style),
     )?);
+    let pii_actions = Arc::new(proxy::redact::partition_by_action(
+        &redactor.entity_names(),
+        &cfg.input.pii.entities,
+        &cfg.input.pii.action,
+    ));
     tracing::info!(
-        "redactor: {} entity rules, style={:?}",
+        "redactor: {} entity rules, style={:?}, mask={}, reject={}, log={}",
         redactor.rule_count(),
-        redactor.style()
+        redactor.style(),
+        pii_actions.mask.len(),
+        pii_actions.reject.len(),
+        pii_actions.log.len(),
     );
     let backend = backend::Backend::new(cfg.backend.clone());
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
@@ -58,6 +66,7 @@ async fn main() -> Result<()> {
         config: cfg.clone(),
         matchers,
         redactor,
+        pii_actions,
         backend,
         http_client,
         budget,

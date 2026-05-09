@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::{config::PiiAction, matcher::InputVerdict, AppState};
+use crate::{matcher::InputVerdict, AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct AnthropicRequest {
@@ -96,58 +96,60 @@ pub async fn messages(
         }
     }
 
-    // PII redaction (Anthropic-native shape: content can be a string or an
-    // array of blocks; mutate in place before forwarding).
+    // PII redaction with per-entity action overrides.
     if state.config.input.pii.enabled {
-        match state.config.input.pii.action {
-            PiiAction::Reject if state.redactor.contains_pii(&user_text) => {
-                warn!("BLOCK input (anthropic): PII detected");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "type": "error",
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": "nanoguard: request blocked — PII detected"
+        if !state.pii_actions.reject.is_empty()
+            && state
+                .redactor
+                .contains_pii_in(&user_text, &state.pii_actions.reject)
+        {
+            warn!("BLOCK input (anthropic): PII detected (reject-class entity)");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "nanoguard: request blocked — PII detected"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        if !state.pii_actions.mask.is_empty() {
+            let mut redacted_any = false;
+            for msg in req.messages.iter_mut() {
+                match &mut msg.content {
+                    AnthropicContent::Text(s) => {
+                        let r = state.redactor.redact_text_in(s, &state.pii_actions.mask);
+                        if &r != s {
+                            *s = r;
+                            redacted_any = true;
                         }
-                    })),
-                )
-                    .into_response();
-            }
-            PiiAction::Mask => {
-                let mut redacted_any = false;
-                for msg in req.messages.iter_mut() {
-                    match &mut msg.content {
-                        AnthropicContent::Text(s) => {
-                            let r = state.redactor.redact_text(s);
-                            if &r != s {
-                                *s = r;
-                                redacted_any = true;
-                            }
-                        }
-                        AnthropicContent::Blocks(blocks) => {
-                            for b in blocks {
-                                if let Some(t) = b.text.as_mut() {
-                                    let r = state.redactor.redact_text(t);
-                                    if &r != t {
-                                        *t = r;
-                                        redacted_any = true;
-                                    }
+                    }
+                    AnthropicContent::Blocks(blocks) => {
+                        for b in blocks {
+                            if let Some(t) = b.text.as_mut() {
+                                let r = state.redactor.redact_text_in(t, &state.pii_actions.mask);
+                                if &r != t {
+                                    *t = r;
+                                    redacted_any = true;
                                 }
                             }
                         }
                     }
                 }
-                if redacted_any {
-                    info!("MASK input (anthropic): PII redacted before forwarding");
-                }
             }
-            PiiAction::Log => {
-                if state.redactor.contains_pii(&user_text) {
-                    info!("ALERT input (anthropic): PII detected");
-                }
+            if redacted_any {
+                info!("MASK input (anthropic): PII redacted before forwarding");
             }
-            PiiAction::Reject => {}
+        }
+        if !state.pii_actions.log.is_empty()
+            && state
+                .redactor
+                .contains_pii_in(&user_text, &state.pii_actions.log)
+        {
+            info!("ALERT input (anthropic): PII detected (log-class entity)");
         }
     }
 

@@ -148,6 +148,11 @@ pub struct PiiConfig {
     /// and are required for future Vault-backed deanonymization.
     #[serde(default = "default_placeholder_style")]
     pub placeholder_style: String,
+    /// Per-entity action overrides. Keys are entity names (e.g. EMAIL,
+    /// AWS_ACCESS_KEY_ID). Values are "mask" / "reject" / "log". Entities
+    /// not listed here use the global `action`.
+    #[serde(default)]
+    pub entities: std::collections::HashMap<String, PiiAction>,
 }
 
 fn default_placeholder_style() -> String {
@@ -161,6 +166,7 @@ impl Default for PiiConfig {
             action: PiiAction::Mask,
             dict_paths: vec![],
             placeholder_style: default_placeholder_style(),
+            entities: std::collections::HashMap::new(),
         }
     }
 }

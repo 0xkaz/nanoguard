@@ -86,6 +86,99 @@ impl Redactor {
         self.rules.iter().any(|r| r.regex.is_match(text))
     }
 
+    /// Like `contains_pii` but restricted to a set of entity names.
+    pub fn contains_pii_in(&self, text: &str, entities: &std::collections::HashSet<String>) -> bool {
+        self.rules
+            .iter()
+            .any(|r| entities.contains(&r.entity) && r.regex.is_match(text))
+    }
+
+    /// Run only the rules whose entity name appears in `entities`. Used by
+    /// the per-entity action map: build one filtered redactor for "mask"
+    /// entities and a separate scanner for "reject" / "log" entities.
+    pub fn redact_text_in(
+        &self,
+        text: &str,
+        entities: &std::collections::HashSet<String>,
+    ) -> String {
+        // Bare style fast path.
+        if self.style == PlaceholderStyle::Bare {
+            let mut out = text.to_string();
+            for rule in &self.rules {
+                if !entities.contains(&rule.entity) {
+                    continue;
+                }
+                out = rule
+                    .regex
+                    .replace_all(&out, rule.placeholder.as_str())
+                    .into_owned();
+            }
+            return out;
+        }
+        // Indexed/LlmGuard: walk filtered rules with a per-call indexer.
+        let mut indexer = Indexer::new(self.style);
+        let mut out = text.to_string();
+        for rule in &self.rules {
+            if !entities.contains(&rule.entity) {
+                continue;
+            }
+            let matches: Vec<(usize, usize, String)> = rule
+                .regex
+                .find_iter(&out)
+                .map(|m| (m.start(), m.end(), m.as_str().to_string()))
+                .collect();
+            for (start, end, value) in matches.into_iter().rev() {
+                let placeholder = indexer.placeholder(&rule.entity, &value);
+                out.replace_range(start..end, &placeholder);
+            }
+        }
+        out
+    }
+
+    /// Like `redact_messages`, but restricted to the given entity set.
+    pub fn redact_messages_in(
+        &self,
+        body: &mut Value,
+        entities: &std::collections::HashSet<String>,
+    ) -> bool {
+        let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+            return false;
+        };
+        let mut changed = false;
+        for msg in messages {
+            let Some(content) = msg.get_mut("content") else {
+                continue;
+            };
+            if let Some(text) = content.as_str() {
+                let redacted = self.redact_text_in(text, entities);
+                if redacted != text {
+                    *content = Value::String(redacted);
+                    changed = true;
+                }
+            } else if let Some(parts) = content.as_array_mut() {
+                for part in parts {
+                    let Some(text_val) = part.get_mut("text") else {
+                        continue;
+                    };
+                    let Some(text) = text_val.as_str() else {
+                        continue;
+                    };
+                    let redacted = self.redact_text_in(text, entities);
+                    if redacted != text {
+                        *text_val = Value::String(redacted);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// All entity names known to this redactor.
+    pub fn entity_names(&self) -> std::collections::HashSet<String> {
+        self.rules.iter().map(|r| r.entity.clone()).collect()
+    }
+
     pub fn redact_text(&self, text: &str) -> String {
         match self.style {
             PlaceholderStyle::Bare => self.redact_text_bare(text),
@@ -167,6 +260,46 @@ impl Redactor {
         }
         changed
     }
+}
+
+/// Partition the redactor's known entities into three sets keyed by their
+/// configured per-entity action, falling back to `default_action` for any
+/// entity not listed in `overrides`.
+pub fn partition_by_action(
+    all_entities: &std::collections::HashSet<String>,
+    overrides: &std::collections::HashMap<String, crate::config::PiiAction>,
+    default_action: &crate::config::PiiAction,
+) -> ActionPartition {
+    use crate::config::PiiAction;
+    use std::collections::HashSet;
+    let mut mask = HashSet::new();
+    let mut reject = HashSet::new();
+    let mut log = HashSet::new();
+    for entity in all_entities {
+        let action = overrides.get(entity).unwrap_or(default_action);
+        match action {
+            PiiAction::Mask => {
+                mask.insert(entity.clone());
+            }
+            PiiAction::Reject => {
+                reject.insert(entity.clone());
+            }
+            PiiAction::Log => {
+                log.insert(entity.clone());
+            }
+        }
+    }
+    // Entities listed in overrides but not present in the redactor (e.g. user
+    // typo'd an entity name) are silently ignored — surfacing as a warning at
+    // build time would be more useful, but is left to a later pass.
+    ActionPartition { mask, reject, log }
+}
+
+/// Three entity-name buckets: which to mask, which to reject on, which to log.
+pub struct ActionPartition {
+    pub mask: std::collections::HashSet<String>,
+    pub reject: std::collections::HashSet<String>,
+    pub log: std::collections::HashSet<String>,
 }
 
 /// Per-text indexer that assigns stable placeholders to (entity, value) pairs.
@@ -403,6 +536,47 @@ mod tests {
         let r = llm_guard_redactor();
         let out = r.redact_text("contact alice@x.com");
         assert!(out.contains("[REDACTED_EMAIL_1]"), "got `{out}`");
+    }
+
+    #[test]
+    fn redact_text_in_only_filters_listed_entities() {
+        use std::collections::HashSet;
+        let r = redactor();
+        let mut set = HashSet::new();
+        set.insert("EMAIL".to_string());
+        let out = r.redact_text_in("ssn 123-45-6789 email alice@x.com", &set);
+        assert!(out.contains("[EMAIL]"));
+        assert!(out.contains("123-45-6789"), "SSN must NOT be redacted: `{out}`");
+    }
+
+    #[test]
+    fn contains_pii_in_filters_by_entity_set() {
+        use std::collections::HashSet;
+        let r = redactor();
+        let mut email_only = HashSet::new();
+        email_only.insert("EMAIL".to_string());
+        assert!(r.contains_pii_in("alice@x.com", &email_only));
+        assert!(!r.contains_pii_in("123-45-6789", &email_only));
+    }
+
+    #[test]
+    fn partition_buckets_entities_by_action() {
+        use crate::config::PiiAction;
+        use std::collections::{HashMap, HashSet};
+        let mut all = HashSet::new();
+        all.insert("EMAIL".to_string());
+        all.insert("AWS_ACCESS_KEY_ID".to_string());
+        all.insert("PHONE".to_string());
+
+        let mut overrides = HashMap::new();
+        overrides.insert("AWS_ACCESS_KEY_ID".to_string(), PiiAction::Reject);
+        overrides.insert("PHONE".to_string(), PiiAction::Log);
+
+        let p = partition_by_action(&all, &overrides, &PiiAction::Mask);
+        assert!(p.mask.contains("EMAIL"));
+        assert!(p.reject.contains("AWS_ACCESS_KEY_ID"));
+        assert!(p.log.contains("PHONE"));
+        assert!(!p.mask.contains("AWS_ACCESS_KEY_ID"));
     }
 
     #[test]

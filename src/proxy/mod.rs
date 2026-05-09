@@ -15,7 +15,6 @@ use tracing::{info, warn};
 use crate::{
     audit::{AuditEntry, Verdict},
     budget::store::{BudgetCheck, SpendRecord},
-    config::PiiAction,
     matcher::InputVerdict,
     AppState,
 };
@@ -68,32 +67,40 @@ pub async fn chat_completions(
     }
 
     if state.config.input.pii.enabled {
-        match state.config.input.pii.action {
-            PiiAction::Reject if state.redactor.contains_pii(&user_text) => {
-                warn!("BLOCK input: PII detected");
-                write_audit(
-                    &state,
-                    &request_id,
-                    &api_key,
-                    &model,
-                    &user_text,
-                    Verdict::Block,
-                    Some("pii".to_string()),
-                    t0.elapsed().as_micros() as u64,
-                );
-                return blocked_response("PII detected");
-            }
-            PiiAction::Mask => {
-                if state.redactor.redact_messages(&mut body) {
-                    info!("MASK input: PII redacted before forwarding");
-                }
-            }
-            PiiAction::Log => {
-                if state.redactor.contains_pii(&user_text) {
-                    info!("ALERT input: PII detected");
-                }
-            }
-            PiiAction::Reject => {}
+        // Reject takes precedence: any reject-class entity match short-circuits.
+        if !state.pii_actions.reject.is_empty()
+            && state
+                .redactor
+                .contains_pii_in(&user_text, &state.pii_actions.reject)
+        {
+            warn!("BLOCK input: PII detected (reject-class entity)");
+            write_audit(
+                &state,
+                &request_id,
+                &api_key,
+                &model,
+                &user_text,
+                Verdict::Block,
+                Some("pii".to_string()),
+                t0.elapsed().as_micros() as u64,
+            );
+            return blocked_response("PII detected");
+        }
+        // Mask-class entities are redacted in place.
+        if !state.pii_actions.mask.is_empty()
+            && state
+                .redactor
+                .redact_messages_in(&mut body, &state.pii_actions.mask)
+        {
+            info!("MASK input: PII redacted before forwarding");
+        }
+        // Log-class entities are recorded but pass through unchanged.
+        if !state.pii_actions.log.is_empty()
+            && state
+                .redactor
+                .contains_pii_in(&user_text, &state.pii_actions.log)
+        {
+            info!("ALERT input: PII detected (log-class entity)");
         }
     }
 

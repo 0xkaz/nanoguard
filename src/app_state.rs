@@ -6,6 +6,8 @@ pub struct AppState {
     pub config: config::Config,
     pub matchers: Arc<matcher::Matchers>,
     pub redactor: Arc<proxy::redact::Redactor>,
+    /// Pre-computed entity buckets per per-entity action override.
+    pub pii_actions: Arc<proxy::redact::ActionPartition>,
     pub backend: backend::Backend,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,
