@@ -73,7 +73,7 @@ A 2,700-character prompt scans in ~950 µs. A blocked request exits in ~7 µs. T
 | Offline | ✅ | ❌ | ❌ / △† | ✅ | ✅ |
 | GPU-free | ✅ | N/A | N/A | △ | ✅ |
 | Filter latency | ~7–50 µs* | cloud roundtrip | cloud roundtrip | model-dependent | not applicable |
-| Data leaves infra | ❌ never | ✅ always | ✅ always | ❌ never | depends |
+| External guardrail call | ❌ never | ✅ required | ✅ required | ❌ never | depends |
 | Audit log | ✅ JSONL | ✅ CloudWatch | ✅ Azure Monitor | △ | ✅ (Enterprise) |
 
 \* Measured locally; see [Performance](#performance) section.  
@@ -170,7 +170,7 @@ Streaming responses are filtered chunk-by-chunk on the SSE `delta.content` field
 
 ### Audit log
 
-Every request writes one JSONL line:
+When enabled, every request writes one JSONL line:
 
 ```json
 {
@@ -308,6 +308,9 @@ paraphrasing, or obfuscation. It is designed for:
 
 It is **not** designed to defeat adversarial users who are actively trying to circumvent the filter.
 For threat models that include motivated attackers, combine nanoguard with additional controls.
+
+Streaming output filtering is currently chunk-local. Matches split across SSE chunk boundaries may
+require buffered scanning in a future release.
 
 ---
 
