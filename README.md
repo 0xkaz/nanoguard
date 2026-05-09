@@ -163,7 +163,17 @@ Default blocked patterns (fully configurable):
 ignore previous instructions · disregard your instructions · jailbreak · dan mode · you are now
 ```
 
-PII rules can also run before forwarding. With `input.pii.action = "mask"`, common patterns such as emails, SSNs, credit-card-shaped numbers, and long API-token-shaped strings are redacted before the request is sent to the backend. `reject` blocks the request; `log` records an alert and forwards it unchanged.
+#### PII redaction before forwarding
+
+When `input.pii.enabled = true`, requests are scanned for common PII patterns (email, US SSN, credit-card-shaped numbers, long API-token-shaped strings). The behavior depends on `input.pii.action`:
+
+| Action | Behavior |
+|---|---|
+| `mask` (default) | Replace each match in `messages[].content` with a labeled placeholder (`[EMAIL]`, `[SSN]`, `[CARD]`, `[TOKEN]`) **before forwarding to the LLM**. Both string content and `parts[].text` arrays (vision/multipart format) are handled. The LLM receives the redacted prompt; the original is never sent. |
+| `reject` | Block the request entirely if any PII is detected. |
+| `log` | Forward unchanged but record an ALERT log line. |
+
+Redaction currently applies to `/v1/chat/completions`. The Anthropic-compatible `/v1/messages` endpoint does not yet apply redaction.
 
 #### Obfuscation handling
 

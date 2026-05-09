@@ -6,6 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -13,6 +15,7 @@ use tracing::{info, warn};
 use crate::{
     audit::{AuditEntry, Verdict},
     budget::store::{BudgetCheck, SpendRecord},
+    config::PiiAction,
     matcher::InputVerdict,
     AppState,
 };
@@ -20,7 +23,7 @@ use crate::{
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     let t0 = std::time::Instant::now();
     let request_id = crate::audit::new_request_id();
@@ -36,7 +39,10 @@ pub async fn chat_completions(
 
     // Input Guardrails
     if state.config.input.enabled {
-        match state.matchers.check_input(&user_text) {
+        match state
+            .matchers
+            .check_input_with_shadow(&user_text, state.config.input.shadow)
+        {
             InputVerdict::Blocked(word) => {
                 warn!("BLOCK input: {:?}", word);
                 write_audit(
@@ -58,6 +64,36 @@ pub async fn chat_completions(
                 info!("FLAG input: {}", info_str);
             }
             InputVerdict::Clean => {}
+        }
+    }
+
+    if state.config.input.pii.enabled {
+        match state.config.input.pii.action {
+            PiiAction::Reject if contains_pii(&user_text) => {
+                warn!("BLOCK input: PII detected");
+                write_audit(
+                    &state,
+                    &request_id,
+                    &api_key,
+                    &model,
+                    &user_text,
+                    Verdict::Block,
+                    Some("pii".to_string()),
+                    t0.elapsed().as_micros() as u64,
+                );
+                return blocked_response("PII detected");
+            }
+            PiiAction::Mask => {
+                if redact_messages_content(&mut body) {
+                    info!("MASK input: PII redacted before forwarding");
+                }
+            }
+            PiiAction::Log => {
+                if contains_pii(&user_text) {
+                    info!("ALERT input: PII detected");
+                }
+            }
+            PiiAction::Reject => {}
         }
     }
 
@@ -211,12 +247,9 @@ pub async fn chat_completions(
                 model: resp_model,
                 created_at: chrono::Utc::now(),
             };
-            let budget = budget.clone();
-            tokio::spawn(async move {
-                if let Err(e) = budget.record_spend(&record).await {
-                    tracing::warn!("budget record_spend error: {}", e);
-                }
-            });
+            if let Err(e) = budget.record_spend(&record).await {
+                tracing::warn!("budget record_spend error: {}", e);
+            }
         }
 
         write_audit(
@@ -304,6 +337,73 @@ fn filter_response_json(state: &AppState, mut resp: Value) -> Value {
     resp
 }
 
+fn contains_pii(text: &str) -> bool {
+    PII_PATTERNS.iter().any(|re| re.is_match(text))
+}
+
+fn redact_pii_text(text: &str) -> String {
+    let mut out = text.to_string();
+    for (re, replacement) in PII_REDACTORS.iter() {
+        out = re.replace_all(&out, *replacement).into_owned();
+    }
+    out
+}
+
+fn redact_messages_content(body: &mut Value) -> bool {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for msg in messages {
+        let Some(content) = msg.get_mut("content") else {
+            continue;
+        };
+        if let Some(text) = content.as_str() {
+            let redacted = redact_pii_text(text);
+            if redacted != text {
+                *content = Value::String(redacted);
+                changed = true;
+            }
+        } else if let Some(parts) = content.as_array_mut() {
+            for part in parts {
+                let Some(text_val) = part.get_mut("text") else {
+                    continue;
+                };
+                let Some(text) = text_val.as_str() else {
+                    continue;
+                };
+                let redacted = redact_pii_text(text);
+                if redacted != text {
+                    *text_val = Value::String(redacted);
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").expect("email regex")
+});
+static SSN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").expect("ssn regex"));
+static CREDIT_CARD_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b").expect("card regex"));
+static API_TOKEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b[A-Za-z0-9_\-]{32,}\b").expect("api token regex"));
+
+static PII_PATTERNS: Lazy<Vec<&'static Regex>> =
+    Lazy::new(|| vec![&EMAIL_RE, &SSN_RE, &CREDIT_CARD_RE, &API_TOKEN_RE]);
+static PII_REDACTORS: Lazy<Vec<(&'static Regex, &'static str)>> = Lazy::new(|| {
+    vec![
+        (&EMAIL_RE, "[EMAIL]"),
+        (&SSN_RE, "[SSN]"),
+        (&CREDIT_CARD_RE, "[CARD]"),
+        (&API_TOKEN_RE, "[TOKEN]"),
+    ]
+});
+
 fn blocked_response(reason: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -342,4 +442,45 @@ fn write_audit(
         latency_us,
     };
     log.write(&entry);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn redact_pii_text_masks_common_patterns() {
+        let redacted = redact_pii_text(
+            "email alice@example.com ssn 123-45-6789 card 4111 1111 1111 1111 token abcdefghijklmnopqrstuvwxyz123456",
+        );
+
+        assert!(redacted.contains("[EMAIL]"));
+        assert!(redacted.contains("[SSN]"));
+        assert!(redacted.contains("[CARD]"));
+        assert!(redacted.contains("[TOKEN]"));
+        assert!(!redacted.contains("alice@example.com"));
+        assert!(!redacted.contains("123-45-6789"));
+    }
+
+    #[test]
+    fn redact_messages_content_masks_string_and_part_text() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": "contact alice@example.com"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "ssn 123-45-6789"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                ]}
+            ]
+        });
+
+        assert!(redact_messages_content(&mut body));
+        assert_eq!(body["messages"][0]["content"], "contact [EMAIL]");
+        assert_eq!(body["messages"][1]["content"][0]["text"], "ssn [SSN]");
+        assert_eq!(
+            body["messages"][1]["content"][1]["image_url"]["url"],
+            "https://example.com/a.png"
+        );
+    }
 }
