@@ -52,6 +52,34 @@ impl<F: Fn(&str) -> String> SseFilter<F> {
         Bytes::from(tail)
     }
 
+    /// Extract `usage` from a single SSE event's `data:` JSON, if present.
+    /// OpenAI emits usage on the final chunk when `stream_options.include_usage`
+    /// is set. The buffer is *not* consumed; this is a read-only inspector.
+    pub fn try_extract_usage(raw: &[u8]) -> Option<(u64, u64, String)> {
+        let text = std::str::from_utf8(raw).ok()?;
+        if !text.contains("data:") || text.contains("[DONE]") {
+            return None;
+        }
+        for line in text.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let payload = line.strip_prefix("data:")?.trim_start();
+            if payload == "[DONE]" || payload.is_empty() {
+                continue;
+            }
+            let val: Value = serde_json::from_str(payload).ok()?;
+            let usage = val.get("usage")?;
+            let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64())?;
+            let completion = usage.get("completion_tokens").and_then(|v| v.as_u64())?;
+            let model = val
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            return Some((prompt, completion, model));
+        }
+        None
+    }
+
     fn process_event(&self, raw: &[u8]) -> Vec<u8> {
         // Each event is one or more lines. Locate the (single) `data:` line
         // and try to JSON-parse + transform it. If anything looks unusual,
@@ -269,5 +297,25 @@ mod tests {
         let out = f.push(b"data: {\"object\":\"chat.completion.chunk\"}\n\n");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"object\":\"chat.completion.chunk\""));
+    }
+
+    #[test]
+    fn extract_usage_from_final_chunk() {
+        let chunk = b"data: {\"id\":\"x\",\"choices\":[],\"model\":\"gpt-4o-mini\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"total_tokens\":46}}\n\n";
+        let usage = SseFilter::<fn(&str) -> String>::try_extract_usage(chunk).unwrap();
+        assert_eq!(usage, (12, 34, "gpt-4o-mini".to_string()));
+    }
+
+    #[test]
+    fn extract_usage_returns_none_when_absent() {
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        assert!(SseFilter::<fn(&str) -> String>::try_extract_usage(chunk).is_none());
+    }
+
+    #[test]
+    fn extract_usage_returns_none_for_done() {
+        assert!(
+            SseFilter::<fn(&str) -> String>::try_extract_usage(b"data: [DONE]\n\n").is_none()
+        );
     }
 }

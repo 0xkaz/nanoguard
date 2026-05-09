@@ -308,7 +308,7 @@ hash_only = true
 
 Budget tracking uses the OpenAI `user` field as the budget key identifier, falling back to `default` when `user` is omitted. Usage is recorded from non-streaming backend responses that include OpenAI-compatible `usage.prompt_tokens` and `usage.completion_tokens`.
 
-Streaming responses are currently forwarded without token usage accounting because token totals are usually only available after stream completion and provider formats differ.
+Streaming responses also record token usage when the client sets OpenAI's `stream_options: {"include_usage": true}` — the final chunk carries `usage`, which nanoguard captures and forwards to the budget store after the stream completes. Backends or clients that omit the option will continue to stream without spend accounting.
 
 ---
 

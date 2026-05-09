@@ -148,15 +148,23 @@ pub async fn chat_completions(
 
         let output_enabled = state.config.output.enabled;
         let matchers = Arc::clone(&state.matchers);
+        let budget_for_stream = state.budget.clone();
+        let api_key_for_stream = api_key.clone();
 
         // Buffer SSE bytes across chunk boundaries, splitting on the blank-line
         // event terminator before applying the output filter to each event's
         // `delta.content`. This handles backends that pack multiple events into
         // one TCP chunk or split a single event across chunks.
+        //
+        // The stream also opportunistically extracts a `usage` field from any
+        // event that carries one (OpenAI emits usage on the final chunk when
+        // `stream_options.include_usage` is set). The last observed usage wins,
+        // and is recorded against the budget after the stream completes.
         let mut filter = sse::SseFilter::new(move |s: &str| matchers.filter_output(s));
         let event_stream = body_stream.map_err(std::io::Error::other);
         let filtered = async_stream::stream! {
             futures_util::pin_mut!(event_stream);
+            let mut last_usage: Option<(u64, u64, String)> = None;
             while let Some(chunk) = event_stream.next().await {
                 let chunk = match chunk {
                     Ok(c) => c,
@@ -165,6 +173,9 @@ pub async fn chat_completions(
                         return;
                     }
                 };
+                if let Some(u) = sse::SseFilter::<fn(&str) -> String>::try_extract_usage(&chunk) {
+                    last_usage = Some(u);
+                }
                 if !output_enabled {
                     yield Ok(chunk);
                     continue;
@@ -177,6 +188,21 @@ pub async fn chat_completions(
             let tail = filter.flush();
             if !tail.is_empty() {
                 yield Ok(tail);
+            }
+            // Record streaming spend if usage was observed and a budget is wired up.
+            if let (Some(budget), Some((prompt, completion, resp_model))) =
+                (budget_for_stream.as_ref(), last_usage)
+            {
+                let record = SpendRecord {
+                    api_key: api_key_for_stream,
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    model: resp_model,
+                    created_at: chrono::Utc::now(),
+                };
+                if let Err(e) = budget.record_spend(&record).await {
+                    tracing::warn!("budget record_spend (streaming) error: {}", e);
+                }
             }
         };
 
