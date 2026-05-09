@@ -88,12 +88,58 @@ pub async fn chat_completions(
         .unwrap_or(false);
 
     if is_stream {
-        // Streaming: pass through (output filter on streaming is Phase 2)
         let headers = backend_resp.headers().clone();
         let body_stream = backend_resp.bytes_stream();
         use axum::body::Body;
-        use futures_util::TryStreamExt;
-        let body = Body::from_stream(body_stream.map_err(std::io::Error::other));
+        use futures_util::{StreamExt, TryStreamExt};
+
+        let output_enabled = state.config.output.enabled;
+        let matchers = Arc::clone(&state.matchers);
+
+        // Apply output filter to each SSE chunk's content field.
+        // Each chunk is a `data: {...}\n\n` line. We parse the JSON delta and
+        // filter the `choices[].delta.content` string in-place.
+        let filtered = body_stream
+            .map_err(std::io::Error::other)
+            .map(move |chunk| {
+                let chunk = chunk?;
+                if !output_enabled {
+                    return Ok::<_, std::io::Error>(chunk);
+                }
+                // Fast path: skip non-data lines and [DONE]
+                let text = match std::str::from_utf8(&chunk) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(chunk),
+                };
+                if !text.starts_with("data:") || text.contains("[DONE]") {
+                    return Ok(chunk);
+                }
+                let json_str = text.trim_start_matches("data:").trim();
+                let mut val: Value = match serde_json::from_str(json_str) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(chunk),
+                };
+                // Filter delta.content in each choice
+                if let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                    for choice in choices.iter_mut() {
+                        if let Some(content) = choice
+                            .get_mut("delta")
+                            .and_then(|d| d.get_mut("content"))
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string())
+                        {
+                            let filtered = matchers.filter_output(&content);
+                            if let Some(delta) = choice.get_mut("delta") {
+                                delta["content"] = Value::String(filtered);
+                            }
+                        }
+                    }
+                }
+                let out = format!("data: {}\n\n", val);
+                Ok(bytes::Bytes::from(out))
+            });
+
+        let body = Body::from_stream(filtered);
         let mut resp = Response::builder().status(status.as_u16());
         for (k, v) in &headers {
             resp = resp.header(k, v);

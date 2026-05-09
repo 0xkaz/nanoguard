@@ -4,7 +4,7 @@ use crate::{backend, budget, config, matcher};
 
 pub struct AppState {
     pub config: config::Config,
-    pub matchers: matcher::Matchers,
+    pub matchers: Arc<matcher::Matchers>,
     pub backend: backend::Backend,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,

@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let matchers = matcher::Matchers::build(&cfg.input.keyword)?;
+    let matchers = Arc::new(matcher::Matchers::build(&cfg.input.keyword)?);
     let backend = backend::Backend::new(cfg.backend.clone());
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
 
