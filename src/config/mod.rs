@@ -117,6 +117,8 @@ pub enum PiiAction {
 pub struct BudgetConfig {
     pub enabled: bool,
     pub db_path: String,
+    /// Bearer token required for /v1/admin/* endpoints. None = admin API disabled.
+    pub admin_api_key: Option<String>,
 }
 
 impl Default for BudgetConfig {
@@ -124,6 +126,7 @@ impl Default for BudgetConfig {
         Self {
             enabled: false,
             db_path: "nanoguard.db".to_string(),
+            admin_api_key: None,
         }
     }
 }
@@ -164,7 +167,10 @@ impl Config {
                 },
                 input: InputConfig::default(),
                 output: OutputConfig::default(),
-                budget: BudgetConfig::default(),
+                budget: BudgetConfig {
+                    admin_api_key: std::env::var("ADMIN_API_KEY").ok(),
+                    ..BudgetConfig::default()
+                },
             })
         }
     }

@@ -42,3 +42,4 @@ action = "mask"
 [budget]
 enabled = false          # set true to enable token budget tracking
 db_path = "nanoguard.db"
+# admin_api_key = "your-secret-key"  # enables /v1/admin/budget/* endpoints

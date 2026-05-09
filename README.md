@@ -104,6 +104,9 @@ NANOGUARD_CONFIG=myconfig.toml make run
 | `POST /v1/chat/completions` | OpenAI-compatible chat — proxied through guardrails |
 | `GET /v1/models` | List models from backend |
 | `GET /health` | Health check |
+| `GET /v1/admin/budget/:api_key` | Get token usage and limit (requires admin key) |
+| `PUT /v1/admin/budget/:api_key` | Set token limit `{"limit": 100000}` (requires admin key) |
+| `DELETE /v1/admin/budget/:api_key/reset` | Reset usage counter (requires admin key) |
 
 ## Guardrails
 
@@ -170,6 +173,7 @@ enabled = true
 | `BACKEND_API_KEY` | — | API key (also reads `OPENAI_API_KEY`) |
 | `BACKEND_MODEL` | — | Default model name |
 | `RUST_LOG` | `info` | Log level |
+| `ADMIN_API_KEY` | — | Enables `/v1/admin/budget/*` endpoints with Bearer auth |
 
 ## Build
 
