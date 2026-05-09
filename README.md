@@ -59,7 +59,7 @@ For the majority of enterprise policy requirements — prompt injection patterns
 
 ### Why iword-rs as the filter core
 
-Most keyword filters are O(N × M): one scan per pattern. [iword-rs](https://github.com/0xkaz/iword-rs) uses a rolling hash scan — a single O(N) pass over the text regardless of how many patterns are loaded. 10,000 rules cost the same scan time as 10.
+Most keyword filters are O(N × M): one scan per pattern. [iword-rs](https://github.com/0xkaz/iword-rs) uses a sliding-window double rolling hash with binary search lookup — a single O(N) pass where scan time scales with text length, not pattern count. Preprocessing is lightweight (hash table, no automaton construction), which keeps startup cost and memory low — well suited to the typical guardrails use case of tens to a few hundred patterns.
 
 A 2,700-character prompt scans in ~950 µs. A blocked request exits in ~7 µs. The same engine handles keyword blocks, PII alerts, and regex patterns through one interface.
 
@@ -149,7 +149,7 @@ make run
 
 ### Input (before sending to LLM)
 
-Single O(N) pass via [iword-rs](https://github.com/0xkaz/iword-rs). Blocked requests never reach the backend.
+Single O(N) pass via [iword-rs](https://github.com/0xkaz/iword-rs) (sliding-window rolling hash). Blocked requests never reach the backend.
 
 | Result | Action |
 |--------|--------|
