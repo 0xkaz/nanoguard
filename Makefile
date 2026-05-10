@@ -1,4 +1,4 @@
-.PHONY: all build dev test e2e check lint fmt clean run run-openai ollama-start \
+.PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit ci push release-patch release-minor release-major
 
@@ -16,8 +16,16 @@ dev:
 test:
 	cargo test
 
-# E2E test — requires nanoguard running on localhost:8080
+# E2E test — boots a mock backend + a release nanoguard binary, then runs
+# the buffered SSE / Vault round-trip / shadow-mode / per-entity-action
+# scenarios. Self-contained: no servers need to be running first.
 e2e:
+	./tools/e2e.sh
+
+# Live e2e against an already-running nanoguard on :8080. Used for ad-hoc
+# checks against `make run` and for the budget/admin API tests that require
+# an ADMIN_API_KEY to be set on both sides.
+e2e-live:
 	./e2e_test.sh
 
 # lint = clippy + fmt check (CI と同じ判定)
