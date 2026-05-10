@@ -4,13 +4,15 @@
 
 Rust-native LLM guardrails proxy.
 Filters prompts and responses at μs speed using aho-corasick (default)
-or iword-rs (legacy), without GPU, without cloud, without Python.
+or iword-rs (legacy), with optional regex, JSON Schema, and YAML
+policy bundles, without GPU, without cloud, without Python.
 
 ## Absolute Rules
 
 ### 1. nanoguard does NOT call LLMs for filtering decisions
-All filtering is rule-based (iword-rs + regex).
-LLM-based filtering is an opt-in feature only, never the default.
+All filtering is rule-based: aho-corasick / regex / JSON Schema, plus
+declarative YAML policy bundles. LLM-based filtering is an opt-in
+feature only, never the default.
 
 ### 2. Single binary
 No runtime dependencies beyond the binary itself.
@@ -28,14 +30,16 @@ It only blocks/masks/logs. It never changes the meaning of a message.
 
 | Module | Responsibility |
 |---|---|
-| `src/proxy/` | HTTP routing, SSE streaming filter, PII redactor |
+| `src/proxy/` | HTTP routing, SSE streaming filter (`sse.rs`), PII redactor (`redact.rs`), Anthropic adapter (`anthropic.rs`) |
 | `src/matcher/` | Keyword matching engines (aho-corasick / iword-rs), normalization |
+| `src/guard/` | Higher-level guard pipeline: vault, deanonymize, sse_deanon, spotlight, schema, tool_gate, sse_tool_gate |
+| `src/policy/` | YAML policy bundle loader, validation, dispatch into matcher / redactor, audit metadata index |
 | `src/backend/` | LLM provider clients (Ollama, OpenAI, Anthropic) |
 | `src/budget/` | Token budget tracking (`BudgetStore` trait + SQLite impl) |
-| `src/audit/` | JSONL audit log with SHA-256 hash-only mode |
+| `src/audit/` | JSONL audit log with SHA-256 hash-only mode and policy metadata enrichment |
 | `src/admin/` | `/v1/admin/budget/*` Bearer-authed admin API |
 | `src/config/` | TOML config loading and defaults |
-| `src/guard/` | Reserved for Phase 3 Vault / Anonymize / Deanonymize |
+| `src/bin/nanoguard-eval.rs` | Recognizer evaluation harness (P/R/F1 against a labeled corpus) |
 
 ## Build
 
@@ -49,12 +53,12 @@ make check    # clippy + fmt check
 ## Performance Targets
 
 - Proxy overhead: < 5μs (hot path, no guardrails)
-- Input Guardrails: < 50μs (iword-rs keyword match)
-- Memory: < 10MB baseline
+- Input Guardrails: < 50μs (aho-corasick scan + normalize, default engine)
+- Memory: < 10MB baseline (rule-based core, no ML pack)
 
 ## Dependency Policy
 
-Allowed: axum, tokio, reqwest, rusqlite, rustls, serde, toml, aho-corasick, regex, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing
+Allowed: axum, tokio, reqwest, rusqlite, rustls, serde, serde_yaml, toml, aho-corasick, regex, jsonschema, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing
 Prohibited: openssl, pyo3, langchain, any LLM SDK in the core filter path
 
 ## Testing

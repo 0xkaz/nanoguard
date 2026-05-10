@@ -136,7 +136,7 @@ make run
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | OpenAI-compatible chat |
-| `POST /v1/messages` | Anthropic-compatible chat (text only; tool_use / vision / streaming not yet supported) |
+| `POST /v1/messages` | Anthropic-compatible chat (text + `tool_use`; vision and streaming not yet supported) |
 | `GET /v1/models` | Proxy to backend model list |
 | `GET /health` | Health check |
 | `GET /v1/admin/budget/:api_key` | Token usage + limit (requires admin key) |
