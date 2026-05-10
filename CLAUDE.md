@@ -146,15 +146,40 @@ Agents are expected to drive feature work end-to-end on a feature branch and sto
 - **Commits on a feature branch**: allowed and expected. Use the standard `feat:` / `fix:` / `chore:` / `docs:` prefix.
 - **`git push` on a feature branch** (`feat/*`, `fix/*`, `chore/*`, `docs/*`, `release/*`): allowed without explicit user instruction. Run `make preflight` first; do not push a branch that fails preflight locally unless you have a specific reason to surface the failure on CI.
 - **`make pr` after a clean push**: allowed without explicit instruction.
-- **`make release-tag`**: only after the user has confirmed the release PR has merged. Agents must not infer "merged" from CI status; merge is a human decision.
-- **`gh pr merge` / merging via UI**: never. Merge is always a user action.
+- **`make release-tag`**: only after the user has confirmed the release PR has merged. Agents must not infer "merged" from CI status; release tagging waits on a human go-ahead.
+- **`gh pr merge`**: allowed under tight conditions, see "Self-merge contract" below.
+
+### Self-merge contract
+
+An agent may merge a PR with `gh pr merge --squash` ONLY when ALL of these hold:
+
+1. The PR was opened by the agent in the **current session** (not by the user, not by a previous agent run, not by another collaborator).
+2. **All required CI status checks** report `SUCCESS`. Pending, failure, or skipped checks block the merge.
+3. `gh pr view --json mergeable` reports `MERGEABLE` (no conflicts, no stale base).
+4. A final consistency pass holds: the diff matches the PR description, the code matches what tests cover, and `CHANGELOG.md` / `docs/` reflect any user-facing change. The agent reads the diff before merging — not just the CI badge.
+5. The user has not said "wait for review" or "I'll merge it" in the same session.
+
+If any condition fails, stop, hand the PR back with a one-line status (e.g. `PR #N: 2/3 checks green, security audit pending`), and let the user decide.
+
+Self-merge is **forbidden** for:
+
+- PRs the agent did not open in the current session
+- Release PRs (`release: vX.Y.Z`) — those are the user's flag for the tagging step
+- PRs that touch security-sensitive surface: `src/audit/`, anything in the auth path, dependency upgrades that aren't already covered by a green `cargo audit` run
+- PRs targeting any base branch other than `main`
+
+Default merge method is **squash**. Match the repo's existing PR-history pattern (PR #1 and #2 both used squash). After a merge, the agent does **not** auto-pull main; the next session step explicitly switches to `main` and pulls before branching off again.
+
+### Reporting after a merge
+
+When a self-merge succeeds, report it in one to three sentences: PR number, what merged, what the next step is (often "branching off main for the next PR" or "waiting for the user to invoke `make release-tag`"). No celebration, no emoji, just the state transition.
 
 ### Things to never do
 
 - Push directly to `main`. The branch is ruleset-protected and the push will fail anyway, but attempting it pollutes the local state and the CI surface. Always go through a PR.
 - Force-push to `main`, or to any shared branch someone else has based work on. Force-push to your own feature branch (e.g. after a rebase) is fine before review starts; once a reviewer is looking at it, prefer additional commits and a final squash on merge.
 - Skip hooks (`--no-verify`) or signing (`--no-gpg-sign`) without an explicit go-ahead.
-- Merge a PR. Hand it back to the user with a one-line "ready" report and a link to the CI status.
+- Merge a PR that doesn't satisfy every condition in the "Self-merge contract" above. When in doubt, hand it back with a one-line status report.
 
 ## Documentation Policy
 

@@ -23,9 +23,15 @@ Install once per machine:
 cargo install cargo-audit
 ```
 
-### Changed — agent autonomy on push/PR
+### Changed — agent autonomy on push/PR/merge
 
-The previous rule said "agents must not run `git commit` or `git push` without the user explicitly asking." That made every feature-branch handoff a manual round-trip. New rule: agents commit and push on feature branches autonomously, run `make pr` autonomously after a clean push, but never merge a PR and never run `make release-tag` without the user confirming the merge happened. Direct pushes to `main` remain disallowed (and are blocked by the ruleset anyway).
+The previous rule said "agents must not run `git commit` or `git push` without the user explicitly asking." That made every feature-branch handoff a manual round-trip. The new rule has three tiers:
+
+- **Commit + push on feature branches + `make pr`**: allowed without explicit instruction, after `make preflight` passes.
+- **`gh pr merge` (self-merge)**: allowed under tight conditions — only PRs the agent opened in the current session, only with all required CI checks green, only after a diff-vs-description consistency check, and never for release PRs or security-sensitive scope. The full contract lives in `CLAUDE.md > Branch Policy > Self-merge contract`. Default merge method is squash.
+- **`make release-tag`**: still gated on the user explicitly confirming the release PR has merged. CI status alone is not a green light for tagging.
+
+Direct pushes to `main` remain disallowed (and are blocked by the ruleset anyway).
 
 ### Docs
 
