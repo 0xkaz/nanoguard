@@ -1,0 +1,80 @@
+# nanoguard default policy bundle (v0.7.0+)
+#
+# Loaded via nanoguard.toml:
+#
+#   [policies]
+#   bundle_path = "policies/default.yaml"
+#
+# Rules in this file are merged into the inline keyword and PII
+# redactor configuration at startup. Each match in the audit log
+# carries the rule's id, category, severity, and any compliance
+# tags.
+
+version: 1
+
+metadata:
+  name: nanoguard default
+  vendor: nanoguard
+  created: "2026-05-10"
+  updated: "2026-05-10"
+
+rules:
+  # ── Prompt injection / jailbreak ─────────────────────────────────────────
+  - id: PI-001
+    category: prompt_injection
+    severity: high
+    pattern: ignore previous instructions
+    action: block
+    message: "direct instruction-override attempt"
+
+  - id: PI-002
+    category: prompt_injection
+    severity: high
+    pattern: disregard your instructions
+    action: block
+
+  - id: PI-003
+    category: prompt_injection
+    severity: high
+    pattern: jailbreak
+    action: block
+
+  - id: PI-004
+    category: prompt_injection
+    severity: high
+    pattern: dan mode
+    action: block
+
+  # ── Off-topic / policy ───────────────────────────────────────────────────
+  - id: OFF-001
+    category: off_topic
+    severity: low
+    pattern: bitcoin
+    action: flag
+
+  # ── PII (regex; entity name → placeholder) ───────────────────────────────
+  - id: PII-001
+    category: pii
+    severity: medium
+    pattern: '/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/'
+    action: redact
+    placeholder: EMAIL
+    compliance: ["GDPR", "HIPAA"]
+
+  - id: PII-002
+    category: pii
+    severity: high
+    pattern: '/\b\d{3}-\d{2}-\d{4}\b/'
+    action: redact
+    placeholder: SSN
+    compliance: ["HIPAA", "PCI-DSS"]
+
+  # ── Cloud secrets ────────────────────────────────────────────────────────
+  - id: SEC-001
+    category: secrets
+    severity: critical
+    pattern: '/AKIA[0-9A-Z]{16}/'
+    action: redact
+    placeholder: AWS_ACCESS_KEY_ID
+    compliance: ["SOC2"]
+    message: "AWS access key in prompt"

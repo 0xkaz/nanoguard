@@ -210,22 +210,23 @@ pub async fn chat_completions(
         // When reversible PII redaction is on, a DeanonymizeStream wraps the
         // output filter so placeholders that straddle SSE chunk boundaries are
         // still resolved against the per-request Vault.
-        let deanon_stream: Option<Arc<std::sync::Mutex<crate::guard::sse_deanon::DeanonymizeStream>>> =
-            if reversible {
-                let entries = vault_for_stream.lock().unwrap().entries();
-                if entries.is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(std::sync::Mutex::new(
-                        crate::guard::sse_deanon::DeanonymizeStream::new(
-                            entries,
-                            deanonymize::strategy_from_name(&deanon_strategy_name),
-                        ),
-                    )))
-                }
-            } else {
+        let deanon_stream: Option<
+            Arc<std::sync::Mutex<crate::guard::sse_deanon::DeanonymizeStream>>,
+        > = if reversible {
+            let entries = vault_for_stream.lock().unwrap().entries();
+            if entries.is_empty() {
                 None
-            };
+            } else {
+                Some(Arc::new(std::sync::Mutex::new(
+                    crate::guard::sse_deanon::DeanonymizeStream::new(
+                        entries,
+                        deanonymize::strategy_from_name(&deanon_strategy_name),
+                    ),
+                )))
+            }
+        } else {
+            None
+        };
         let deanon_for_closure = deanon_stream.clone();
         let mut filter = sse::SseFilter::new(move |s: &str| {
             let after_filter = matchers.filter_output(s);
@@ -468,7 +469,9 @@ pub async fn chat_completions(
                     // Wrapper (markdown fence / prose) was stripped — emit the
                     // cleaned JSON to the client so downstream code doesn't
                     // need to repeat the cleanup.
-                    if let Some(choices) = filtered.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                    if let Some(choices) =
+                        filtered.get_mut("choices").and_then(|c| c.as_array_mut())
+                    {
                         if let Some(first) = choices.first_mut() {
                             if let Some(msg) = first.get_mut("message") {
                                 msg["content"] = Value::String(extracted.to_string());
@@ -522,8 +525,7 @@ pub(crate) fn apply_tool_gate(resp: &mut Value, gate: &crate::guard::tool_gate::
         let Some(msg) = choice.get_mut("message") else {
             continue;
         };
-        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
-        else {
+        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) else {
             continue;
         };
         let mut denials: Vec<Value> = Vec::new();
@@ -654,6 +656,26 @@ fn write_audit(
 ) {
     let Some(log) = &state.audit else { return };
     let prompt_hash = log.hash_prompt(prompt);
+    // Look up the matched rule in the policy index, if any. The shadow_block
+    // prefix is stripped first so demoted rules still surface their metadata.
+    let mut rule_id: Option<String> = None;
+    let mut category: Option<String> = None;
+    let mut severity: Option<String> = None;
+    let mut compliance: Vec<String> = Vec::new();
+    if let (Some(idx), Some(matched)) = (state.policy.as_ref(), matched_rule.as_ref()) {
+        let key = matched.strip_prefix("shadow_block:").unwrap_or(matched);
+        if let Some(meta) = idx.lookup_literal(key) {
+            rule_id = Some(meta.id.clone());
+            category = Some(meta.category.clone());
+            severity = Some(meta.severity.clone());
+            compliance = meta.compliance.clone();
+        } else if let Some(meta) = idx.lookup_placeholder(key) {
+            rule_id = Some(meta.id.clone());
+            category = Some(meta.category.clone());
+            severity = Some(meta.severity.clone());
+            compliance = meta.compliance.clone();
+        }
+    }
     let entry = AuditEntry {
         request_id: request_id.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -662,8 +684,11 @@ fn write_audit(
         prompt_hash,
         verdict,
         matched_rule,
+        rule_id,
+        category,
+        severity,
+        compliance,
         latency_us,
     };
     log.write(&entry);
 }
-

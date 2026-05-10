@@ -28,7 +28,10 @@ pub enum ViolationAction {
 }
 
 impl ViolationAction {
-    pub fn from_str(s: &str) -> Self {
+    /// Parse a violation action by name. Renamed from `from_str` so it does
+    /// not collide with the `std::str::FromStr` trait method (which we do
+    /// not implement because the trait requires returning a Result).
+    pub fn parse_name(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "reject" => Self::Reject,
             "repair" => Self::Repair,
@@ -56,8 +59,9 @@ pub struct SchemaValidator {
 pub struct ValidationOutcome {
     pub passed: bool,
     pub errors: Vec<String>,
-    /// Set when the validator extracted JSON from a wrapper (e.g. a markdown
-    /// ```json fenced block) so the proxy can re-emit the cleaned payload.
+    /// Set when the validator extracted JSON from a wrapper (for example a
+    /// markdown fenced block tagged `json`) so the proxy can re-emit the
+    /// cleaned payload.
     pub extracted: Option<Value>,
 }
 
@@ -137,9 +141,9 @@ pub fn load_rules(specs: &[RuleSpec]) -> Result<Vec<SchemaRule>> {
         let validator = jsonschema::draft202012::new(&schema_json)
             .with_context(|| format!("compiling schema {}", spec.schema_path))?;
         let model_pattern = match &spec.model_pattern {
-            Some(p) if !p.is_empty() => Some(
-                Regex::new(p).with_context(|| format!("compiling model pattern {p}"))?,
-            ),
+            Some(p) if !p.is_empty() => {
+                Some(Regex::new(p).with_context(|| format!("compiling model pattern {p}"))?)
+            }
             _ => None,
         };
         out.push(SchemaRule {
@@ -174,10 +178,7 @@ fn extract_json_blob(raw: &str) -> String {
     // Markdown fence form: optional language tag, then the body.
     if let Some(rest) = trimmed.strip_prefix("```") {
         // Skip the "json" or "JSON" tag if present, plus the newline.
-        let body_start = rest
-            .find('\n')
-            .map(|n| n + 1)
-            .unwrap_or(0);
+        let body_start = rest.find('\n').map(|n| n + 1).unwrap_or(0);
         let body = &rest[body_start..];
         if let Some(end) = body.rfind("```") {
             return body[..end].trim().to_string();
@@ -186,8 +187,8 @@ fn extract_json_blob(raw: &str) -> String {
 
     // Look for the first { or [ and the last matching closing bracket. This
     // handles "Here is your JSON: { ... } Anything else?" cases.
-    let open_idx = trimmed.find(|c| c == '{' || c == '[');
-    let close_idx = trimmed.rfind(|c| c == '}' || c == ']');
+    let open_idx = trimmed.find(['{', '[']);
+    let close_idx = trimmed.rfind(['}', ']']);
     if let (Some(start), Some(end)) = (open_idx, close_idx) {
         if start < end {
             return trimmed[start..=end].to_string();
@@ -235,9 +236,7 @@ mod tests {
 
     #[test]
     fn fails_on_wrong_type() {
-        let rule = build_validator(
-            r#"{"type":"object","properties":{"age":{"type":"integer"}}}"#,
-        );
+        let rule = build_validator(r#"{"type":"object","properties":{"age":{"type":"integer"}}}"#);
         let v = serde_json::json!({"age": "not a number"});
         let out = SchemaValidator::validate_value(&rule, &v);
         assert!(!out.passed);

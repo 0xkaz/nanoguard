@@ -24,7 +24,10 @@ pub enum SpotlightMethod {
 }
 
 impl SpotlightMethod {
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a method name. Renamed from `from_str` to avoid clashing with
+    /// the `std::str::FromStr` trait method (whose signature requires
+    /// `Result`, not `Option`).
+    pub fn parse_name(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "delimiting" | "delimiter" => Some(Self::Delimiting),
             "datamarking" | "datamark" => Some(Self::Datamarking),
@@ -120,15 +123,20 @@ pub fn apply(body: &mut Value, cfg: &SpotlightConfig) -> bool {
 
 fn transform_content(text: &str, cfg: &SpotlightConfig) -> String {
     match cfg.method {
-        SpotlightMethod::Delimiting => format!(
-            "{}\n{}\n{}",
-            cfg.delimiter_open, text, cfg.delimiter_close
-        ),
+        SpotlightMethod::Delimiting => {
+            format!("{}\n{}\n{}", cfg.delimiter_open, text, cfg.delimiter_close)
+        }
         SpotlightMethod::Datamarking => {
             // Replace ASCII whitespace with the datamark character. We avoid
             // touching newlines so the model still sees paragraph structure.
             text.chars()
-                .map(|c| if c == ' ' || c == '\t' { cfg.datamark_char } else { c })
+                .map(|c| {
+                    if c == ' ' || c == '\t' {
+                        cfg.datamark_char
+                    } else {
+                        c
+                    }
+                })
                 .collect()
         }
         SpotlightMethod::Encoding => {
@@ -169,7 +177,7 @@ fn inject_system_rider(messages: &mut Vec<Value>, rider: &str) {
 // for this one transform). Standard alphabet, no padding optional toggles.
 fn base64_encode(input: &[u8]) -> String {
     const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= input.len() {
         let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);

@@ -60,7 +60,7 @@ enum MatchMode {
 }
 
 impl MatchMode {
-    fn from_str(s: &str) -> Self {
+    fn parse_name(s: &str) -> Self {
         match s {
             "strict" => Self::Strict,
             _ => Self::Lenient,
@@ -78,16 +78,28 @@ struct EntityCounts {
 impl EntityCounts {
     fn precision(&self) -> f64 {
         let denom = self.tp + self.fp;
-        if denom == 0 { 0.0 } else { self.tp as f64 / denom as f64 }
+        if denom == 0 {
+            0.0
+        } else {
+            self.tp as f64 / denom as f64
+        }
     }
     fn recall(&self) -> f64 {
         let denom = self.tp + self.fn_count;
-        if denom == 0 { 0.0 } else { self.tp as f64 / denom as f64 }
+        if denom == 0 {
+            0.0
+        } else {
+            self.tp as f64 / denom as f64
+        }
     }
     fn f1(&self) -> f64 {
         let p = self.precision();
         let r = self.recall();
-        if p + r == 0.0 { 0.0 } else { 2.0 * p * r / (p + r) }
+        if p + r == 0.0 {
+            0.0
+        } else {
+            2.0 * p * r / (p + r)
+        }
     }
 }
 
@@ -137,7 +149,10 @@ fn parse_args() -> Result<Args> {
                     .into();
             }
             "--dict" => {
-                args.dicts.push(iter.next().ok_or_else(|| anyhow!("--dict requires a path"))?);
+                args.dicts.push(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--dict requires a path"))?,
+                );
             }
             "--json" => {
                 args.json_out = Some(
@@ -147,7 +162,7 @@ fn parse_args() -> Result<Args> {
                 );
             }
             "--match" => {
-                args.match_mode = MatchMode::from_str(
+                args.match_mode = MatchMode::parse_name(
                     &iter
                         .next()
                         .ok_or_else(|| anyhow!("--match requires strict|lenient"))?,
@@ -217,8 +232,8 @@ fn load_corpus(path: &PathBuf) -> Result<Vec<Record>> {
         if line.trim().is_empty() {
             continue;
         }
-        let rec: Record = serde_json::from_str(&line)
-            .with_context(|| format!("parsing JSONL line {}", i + 1))?;
+        let rec: Record =
+            serde_json::from_str(&line).with_context(|| format!("parsing JSONL line {}", i + 1))?;
         out.push(rec);
     }
     Ok(out)
@@ -264,10 +279,7 @@ fn main() -> Result<()> {
                 if !gold_matched[gi] && matches_overlap(d, g, args.match_mode) {
                     detected_matched[di] = true;
                     gold_matched[gi] = true;
-                    by_entity
-                        .entry(g.entity.clone())
-                        .or_default()
-                        .tp += 1;
+                    by_entity.entry(g.entity.clone()).or_default().tp += 1;
                     totals.tp += 1;
                     break;
                 }
@@ -291,17 +303,10 @@ fn main() -> Result<()> {
         }
         for (gi, g) in rec.annotations.iter().enumerate() {
             if !gold_matched[gi] {
-                by_entity
-                    .entry(g.entity.clone())
-                    .or_default()
-                    .fn_count += 1;
+                by_entity.entry(g.entity.clone()).or_default().fn_count += 1;
                 totals.fn_count += 1;
                 if fns.len() < args.max_examples {
-                    let expected_text = rec
-                        .text
-                        .get(g.start..g.end)
-                        .unwrap_or("?")
-                        .to_string();
+                    let expected_text = rec.text.get(g.start..g.end).unwrap_or("?").to_string();
                     fns.push(MissExample {
                         id: rec.id.clone(),
                         text: rec.text.clone(),
@@ -332,8 +337,8 @@ fn main() -> Result<()> {
 
     if let Some(out) = &args.json_out {
         let serialized = serde_json::to_string_pretty(&report)?;
-        let mut f = File::create(out)
-            .with_context(|| format!("creating report at {}", out.display()))?;
+        let mut f =
+            File::create(out).with_context(|| format!("creating report at {}", out.display()))?;
         f.write_all(serialized.as_bytes())?;
         eprintln!("\nJSON report written to {}", out.display());
     }
@@ -409,10 +414,7 @@ fn print_report(r: &Report) {
             let id = ex.id.as_deref().unwrap_or("?");
             println!(
                 "  [{id}] missed {} ({}..{}): {:?}",
-                ex.missed_entity,
-                ex.start,
-                ex.end,
-                ex.expected_text
+                ex.missed_entity, ex.start, ex.end, ex.expected_text
             );
         }
     }

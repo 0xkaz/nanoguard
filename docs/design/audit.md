@@ -1,4 +1,4 @@
-> **Status:** shipped (commit 82d65f3, 2026-05-10)
+> **Status:** shipped (v0.7.0, 2026-05-10)
 
 # Audit Log
 
@@ -22,6 +22,20 @@ When audit logging is enabled, each entry records:
 - verdict
 - matched rule
 - latency in microseconds
+
+When the matched rule comes from a YAML policy bundle (see
+[policy-engine.md](./policy-engine.md)), the entry also carries:
+
+- `rule_id` (e.g. `PI-001`)
+- `category` (e.g. `prompt_injection`)
+- `severity` (e.g. `high`)
+- `compliance` (array of regulatory tags)
+
+These four fields are emitted only when populated, so audit entries from
+deployments without a policy bundle keep the original shape. The
+`shadow_block:` prefix on a demoted match is stripped before the policy
+index is consulted, so shadow-mode entries also carry their rule
+metadata.
 
 The log does not need to retain raw prompt text to be useful.
 

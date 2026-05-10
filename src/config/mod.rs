@@ -17,6 +17,17 @@ pub struct Config {
     pub audit: AuditConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub policies: PoliciesConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PoliciesConfig {
+    /// Optional path to a YAML policy bundle. Empty string = disabled.
+    /// When set, the rules in the bundle are merged into the existing
+    /// inline keyword and PII redactor rules at startup.
+    #[serde(default)]
+    pub bundle_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -410,6 +421,7 @@ impl Config {
                 },
                 audit: AuditConfig::default(),
                 tools: ToolsConfig::default(),
+                policies: PoliciesConfig::default(),
             })
         }
     }

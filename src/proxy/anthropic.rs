@@ -70,6 +70,23 @@ pub async fn messages(
     State(state): State<Arc<AppState>>,
     Json(mut req): Json<AnthropicRequest>,
 ) -> Response {
+    // Streaming is not yet supported on /v1/messages. Refuse early with a
+    // 400 rather than half-handling the SSE response from the backend
+    // (which would surface as an opaque 502 to the caller).
+    if req.stream {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "nanoguard: /v1/messages does not yet support stream=true; see README"
+                }
+            })),
+        )
+            .into_response();
+    }
+
     // Collect all message text for scanning
     let user_text = req
         .messages
@@ -253,8 +270,7 @@ pub async fn messages(
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let outcome =
-                crate::guard::schema::SchemaValidator::validate_response_text(&rule, raw);
+            let outcome = crate::guard::schema::SchemaValidator::validate_response_text(&rule, raw);
             if !outcome.passed {
                 use crate::guard::schema::ViolationAction;
                 warn!(

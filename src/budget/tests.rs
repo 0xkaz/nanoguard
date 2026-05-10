@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::budget::store::{BudgetCheck, SpendRecord};
     use crate::budget::{BudgetStore, SqliteBudgetStore};

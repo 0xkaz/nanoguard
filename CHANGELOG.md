@@ -2,6 +2,83 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — feat/policy-engine
+
+Policy Engine v1, plus several integration fixes uncovered while stress-testing the e2e suite.
+
+### Fixed
+
+- `SseFilter::try_extract_usage` was bailing on any chunk that contained the literal `[DONE]`, which means streaming responses that pack the `usage` event and the `[DONE]` terminator into one TCP read silently dropped their usage. Walk every `data:` line and only treat a JSON parse with `usage` as a hit. Streaming budget accounting now actually records spend (e2e scenario 17 confirms).
+- `SseFilter::try_extract_usage` previously returned `None` the first time it hit a non-`data:` line because of an unwrap chain on `?`. Replaced with `let-else` so unrelated lines are skipped instead of aborting the scan.
+- `/v1/messages` previously accepted `stream: true` and tried to JSON-parse the SSE response body, surfacing as an opaque 502. It now refuses early with HTTP 400 and a clear error, matching the README's "streaming not yet supported" note (e2e scenario 19).
+- rustdoc warning on `ValidationOutcome::extracted` (a stray code-fence in the doc comment) — reworded to avoid the inline fence.
+
+### Added — Policy Engine
+
+Policy Engine v1: declarative YAML rule bundles with stable rule ids, categories, severities, and compliance tags. Audit log entries gain `rule_id` / `category` / `severity` / `compliance` when a match comes from a policy.
+
+### Added — Policy Engine
+
+- **YAML bundle loader** in `src/policy/`. A bundle is a versioned list of rules, each with a stable `id`, a `category`, a `severity`, an action (`block` / `alert` / `flag` / `redact`), and optional `compliance` tags. Patterns are either literal phrases or regex (`/.../`).
+- **Merge into existing matchers** at startup: literal-keyword rules append to `KeywordConfig.inline_block` / `inline_alert` / `inline_flag` based on action; regex `redact` rules contribute entity-named patterns to the redactor. The matcher / redactor hot path is untouched.
+- **`PolicyRuleIndex`** — a lookup table from matched literal text or regex body to rule metadata. Built once at startup and stored on `AppState`.
+
+### Added — Audit log enrichment
+
+- `AuditEntry` gains four optional fields: `rule_id`, `category`, `severity`, and `compliance`. They are omitted from the JSON when absent (backward compatible).
+- The audit writer consults `PolicyRuleIndex` whenever there's a `matched_rule`, including matches demoted by shadow mode (the `shadow_block:` prefix is stripped before lookup).
+
+### Configuration
+
+```toml
+[policies]
+bundle_path = "policies/default.yaml"
+```
+
+```yaml
+# policies/default.yaml
+version: 1
+metadata:
+  name: nanoguard default
+  updated: "2026-05-10"
+
+rules:
+  - id: PI-001
+    category: prompt_injection
+    severity: high
+    pattern: ignore previous instructions
+    action: block
+
+  - id: PII-001
+    category: pii
+    severity: medium
+    pattern: '/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/'
+    action: redact
+    placeholder: EMAIL
+    compliance: ["GDPR", "HIPAA"]
+```
+
+### Tests
+
+- 140 unit tests in total. New: 11 in `src/policy/` (parsing, validation, dispatch, lookups), 2 in `src/proxy/sse.rs` (usage extraction with `[DONE]` packed in the same chunk).
+- e2e suite extended to **19 scenarios / 41 assertions**. New / strengthened scenarios:
+  - **13**: strengthened from a single PII round-trip into three sub-scenarios — 13a re-checks redaction round-trip with tools enabled, 13b verifies the Anthropic adapter actually converts upstream `tool_calls` into `content[].type == "tool_use"` blocks (the conversion path that scenario 12 does not exercise), and 13c verifies a denied tool call is removed from the response and surfaced as a `nanoguard_denied_tools` block.
+  - **15**: policy bundle audit enrichment — verifies that an audit entry from a policy match carries `rule_id` / `category` / `severity`.
+  - **16**: streaming tool gate deny path — confirms `tool_call_denied` event is emitted and the stream terminates with `[DONE]` when a denied call is assembled from deltas.
+  - **17**: streaming budget accounting — confirms `stream_options.include_usage` chunks reach the budget store (queried via `/v1/admin/budget/:api_key`).
+  - **18**: schema reject mode — confirms `on_violation = "reject"` returns 4xx instead of just logging.
+  - **19**: Anthropic streaming refusal — confirms `stream: true` on `/v1/messages` is refused cleanly with a 400 instead of half-handled.
+- `policies/default.yaml` ships with the repo so deployments can copy and edit it.
+
+### Out of scope for this release
+
+- Hot reload / signed bundles (Phase 5.4 follow-ups).
+- Migrating Spotlight / Tool Gate / Schema configurations into the policy file (still TOML).
+- Multi-bundle stacking and per-tenant override hierarchies.
+- A literal pattern with `redact` / `reject` / `log` action — for those, declare a regex pattern with a placeholder.
+
+These are tracked in `_POLICY_ENGINE.md` and the docs/design/policy-engine.md "Limitations" section.
+
 ## [0.6.0] — 2026-05-10
 
 Three follow-ups that finish the Phase 4 trio (Spotlighting + Schema + Tool Gate) on every supported endpoint, plus a recognizer evaluation harness for tuning dictionary packs.

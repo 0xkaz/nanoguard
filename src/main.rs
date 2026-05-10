@@ -10,7 +10,7 @@ use nanoguard::{admin, audit, backend, budget, config, matcher, proxy, AppState}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = config::Config::from_env_or_default()?;
+    let mut cfg = config::Config::from_env_or_default()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -19,16 +19,35 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Load policy bundle (YAML) and merge its rules into the existing
+    // keyword config + redactor inline patterns. Tracked separately so the
+    // audit layer can attach rule_id / category / severity to matches.
+    let policy_index =
+        if let Some(path) = cfg.policies.bundle_path.as_ref().filter(|p| !p.is_empty()) {
+            use nanoguard::policy::{merge_into_keyword_config, Policy, PolicyRuleIndex};
+            let policy = Policy::from_path(path)?;
+            tracing::info!(
+                "policy bundle: loaded {} rule(s) from {} (name={:?})",
+                policy.rule_count(),
+                path,
+                policy.metadata.name
+            );
+            merge_into_keyword_config(&policy, &mut cfg.input.keyword);
+            Some(Arc::new(PolicyRuleIndex::from_policy(&policy)))
+        } else {
+            tracing::info!("policy bundle: not configured");
+            None
+        };
+
     let matchers = Arc::new(matcher::Matchers::build(&cfg.input.keyword)?);
     tracing::info!("matcher engine: {}", matchers.engine_name());
     // Reversible redaction needs indexed placeholders. Auto-promote the bare
     // style so users don't have to remember to flip both knobs.
     let style = {
-        let configured = proxy::redact::PlaceholderStyle::from_str(&cfg.input.pii.placeholder_style);
+        let configured =
+            proxy::redact::PlaceholderStyle::parse_name(&cfg.input.pii.placeholder_style);
         if cfg.input.pii.reversible && configured == proxy::redact::PlaceholderStyle::Bare {
-            tracing::info!(
-                "redactor: reversible=true forces placeholder_style=indexed (was bare)"
-            );
+            tracing::info!("redactor: reversible=true forces placeholder_style=indexed (was bare)");
             proxy::redact::PlaceholderStyle::Indexed
         } else {
             configured
@@ -54,7 +73,7 @@ async fn main() -> Result<()> {
     );
     let spotlight = if cfg.input.spotlight.enabled {
         use nanoguard::guard::spotlight::{default_rider, SpotlightConfig, SpotlightMethod};
-        let method = SpotlightMethod::from_str(&cfg.input.spotlight.method)
+        let method = SpotlightMethod::parse_name(&cfg.input.spotlight.method)
             .unwrap_or(SpotlightMethod::Datamarking);
         let datamark_char = cfg
             .input
@@ -103,7 +122,7 @@ async fn main() -> Result<()> {
             })
             .collect();
         let rules = load_rules(&specs)?;
-        let action = ViolationAction::from_str(&cfg.output.schema.on_violation);
+        let action = ViolationAction::parse_name(&cfg.output.schema.on_violation);
         tracing::info!(
             "output schema: enabled ({} rule(s), on_violation={:?})",
             rules.len(),
@@ -180,6 +199,7 @@ async fn main() -> Result<()> {
         spotlight,
         schema,
         tool_gate,
+        policy: policy_index,
         backend,
         http_client,
         budget,

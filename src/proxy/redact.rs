@@ -27,7 +27,10 @@ pub enum PlaceholderStyle {
 }
 
 impl PlaceholderStyle {
-    pub fn from_str(s: &str) -> Self {
+    /// Parse a style name. Renamed from `from_str` to avoid clashing with
+    /// the `std::str::FromStr` trait (whose signature returns Result; we
+    /// fall back to `Bare` instead of erroring).
+    pub fn parse_name(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "indexed" => PlaceholderStyle::Indexed,
             "llm_guard" | "llmguard" => PlaceholderStyle::LlmGuard,
@@ -95,7 +98,11 @@ impl Redactor {
     }
 
     /// Like `contains_pii` but restricted to a set of entity names.
-    pub fn contains_pii_in(&self, text: &str, entities: &std::collections::HashSet<String>) -> bool {
+    pub fn contains_pii_in(
+        &self,
+        text: &str,
+        entities: &std::collections::HashSet<String>,
+    ) -> bool {
         self.rules
             .iter()
             .any(|r| entities.contains(&r.entity) && r.regex.is_match(text))
@@ -528,7 +535,10 @@ mod tests {
     #[test]
     fn redacts_email_with_entity_label() {
         let r = redactor();
-        assert_eq!(r.redact_text("contact alice@example.com"), "contact [EMAIL]");
+        assert_eq!(
+            r.redact_text("contact alice@example.com"),
+            "contact [EMAIL]"
+        );
     }
 
     #[test]
@@ -584,21 +594,13 @@ mod tests {
     }
 
     fn indexed_redactor() -> Redactor {
-        Redactor::build_with_style(
-            &default_inline_patterns(),
-            &[],
-            PlaceholderStyle::Indexed,
-        )
-        .unwrap()
+        Redactor::build_with_style(&default_inline_patterns(), &[], PlaceholderStyle::Indexed)
+            .unwrap()
     }
 
     fn llm_guard_redactor() -> Redactor {
-        Redactor::build_with_style(
-            &default_inline_patterns(),
-            &[],
-            PlaceholderStyle::LlmGuard,
-        )
-        .unwrap()
+        Redactor::build_with_style(&default_inline_patterns(), &[], PlaceholderStyle::LlmGuard)
+            .unwrap()
     }
 
     #[test]
@@ -641,7 +643,10 @@ mod tests {
         set.insert("EMAIL".to_string());
         let out = r.redact_text_in("ssn 123-45-6789 email alice@x.com", &set);
         assert!(out.contains("[EMAIL]"));
-        assert!(out.contains("123-45-6789"), "SSN must NOT be redacted: `{out}`");
+        assert!(
+            out.contains("123-45-6789"),
+            "SSN must NOT be redacted: `{out}`"
+        );
     }
 
     #[test]
@@ -677,15 +682,8 @@ mod tests {
     #[test]
     fn loads_user_dict_file_with_entity_names() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "nanoguard-redact-{}.txt",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            "# user dict\n/\\bSEC-\\d{6}\\b/\tINTERNAL_TICKET\n",
-        )
-        .unwrap();
+        let path = dir.join(format!("nanoguard-redact-{}.txt", std::process::id()));
+        std::fs::write(&path, "# user dict\n/\\bSEC-\\d{6}\\b/\tINTERNAL_TICKET\n").unwrap();
 
         let r = Redactor::build(&[], &[path.to_string_lossy().into_owned()]).unwrap();
         assert_eq!(

@@ -112,20 +112,14 @@ impl StreamingToolGate {
                     .and_then(|tc| tc.as_array())
                 {
                     for delta_tc in delta_calls {
-                        let idx = delta_tc
-                            .get("index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
+                        let idx = delta_tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                         let entry = self.partials.entry(idx).or_default();
                         entry.merge_delta(delta_tc);
                     }
                 }
                 // finish_reason == "tool_calls" → the model is done emitting
                 // tool calls; evaluate everything we accumulated.
-                if let Some(finish) = choice
-                    .get("finish_reason")
-                    .and_then(|f| f.as_str())
-                {
+                if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
                     if finish == "tool_calls" {
                         return self.evaluate_collected();
                     }

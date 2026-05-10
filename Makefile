@@ -1,6 +1,7 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
-        bench coverage miri audit ci push release-patch release-minor release-major
+        bench coverage miri audit ci push release-patch release-minor release-major \
+        pr pr-web preflight
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -153,3 +154,45 @@ release-major:
 
 push:
 	./tools/push.sh
+
+# ── PR helpers (require `gh` CLI) ────────────────────────────────────────────
+# `make pr` opens a PR for the current branch, prefilling title / body from
+# the most recent commit. Use `make pr-web` to also open the GitHub UI in a
+# browser for final review.
+
+pr:
+	@command -v gh >/dev/null 2>&1 || { echo "error: \`gh\` CLI not found"; exit 1; }
+	@branch=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$branch" = "main" ]; then \
+	    echo "error: refusing to open a PR from main; check out a feature branch first"; \
+	    exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	    echo "error: working tree has uncommitted changes"; git status --short; exit 1; \
+	fi; \
+	if ! git ls-remote --exit-code origin "$$branch" >/dev/null 2>&1; then \
+	    echo "pushing branch $$branch to origin first..."; \
+	    git push -u origin "$$branch"; \
+	fi; \
+	gh pr create --base main --fill
+
+pr-web: pr
+	@gh pr view --web
+
+# ── Preflight (run before make pr) ──────────────────────────────────────────
+# Mirrors the CI lint, test, audit, and e2e jobs so a feature branch fails
+# locally instead of red-statusing a PR. Required by CLAUDE.md > Branch Policy.
+
+preflight:
+	@echo "→ cargo fmt --check"
+	cargo fmt --check
+	@echo "→ cargo clippy --all-targets -- -D warnings"
+	cargo clippy --all-targets -- -D warnings
+	@echo "→ cargo test"
+	cargo test --quiet
+	@echo "→ cargo audit"
+	@command -v cargo-audit >/dev/null 2>&1 || { echo "warning: cargo-audit not installed; install with: cargo install cargo-audit"; }
+	@command -v cargo-audit >/dev/null 2>&1 && cargo audit || true
+	@echo "→ tools/e2e.sh"
+	./tools/e2e.sh
+	@echo "✓ preflight passed"

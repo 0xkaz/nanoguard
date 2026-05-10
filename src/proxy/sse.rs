@@ -52,24 +52,38 @@ impl<F: Fn(&str) -> String> SseFilter<F> {
         Bytes::from(tail)
     }
 
-    /// Extract `usage` from a single SSE event's `data:` JSON, if present.
+    /// Extract `usage` from any `data:` JSON line in the buffer, if present.
     /// OpenAI emits usage on the final chunk when `stream_options.include_usage`
     /// is set. The buffer is *not* consumed; this is a read-only inspector.
+    ///
+    /// Walks every `data:` line, skipping `[DONE]` and lines that don't carry
+    /// a usage field, so it works whether the upstream packs `usage` and
+    /// `[DONE]` into the same TCP chunk or splits them.
     pub fn try_extract_usage(raw: &[u8]) -> Option<(u64, u64, String)> {
         let text = std::str::from_utf8(raw).ok()?;
-        if !text.contains("data:") || text.contains("[DONE]") {
+        if !text.contains("data:") {
             return None;
         }
         for line in text.split('\n') {
             let line = line.strip_suffix('\r').unwrap_or(line);
-            let payload = line.strip_prefix("data:")?.trim_start();
+            let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
+                continue;
+            };
             if payload == "[DONE]" || payload.is_empty() {
                 continue;
             }
-            let val: Value = serde_json::from_str(payload).ok()?;
-            let usage = val.get("usage")?;
-            let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64())?;
-            let completion = usage.get("completion_tokens").and_then(|v| v.as_u64())?;
+            let Ok(val) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            let Some(usage) = val.get("usage") else {
+                continue;
+            };
+            let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) else {
+                continue;
+            };
+            let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) else {
+                continue;
+            };
             let model = val
                 .get("model")
                 .and_then(|v| v.as_str())
@@ -218,7 +232,8 @@ mod tests {
     #[test]
     fn filters_matched_content() {
         let mut f = SseFilter::new(star_filter);
-        let out = f.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"your ssn is here\"}}]}\n\n");
+        let out =
+            f.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"your ssn is here\"}}]}\n\n");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("your *** is here"));
         assert!(!s.contains("ssn"));
@@ -268,9 +283,7 @@ mod tests {
     #[test]
     fn crlf_line_endings_supported() {
         let mut f = SseFilter::new(star_filter);
-        let out = f.push(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"ssn here\"}}]}\r\n\r\n",
-        );
+        let out = f.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"ssn here\"}}]}\r\n\r\n");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("*** here"), "got `{s}`");
     }
@@ -314,8 +327,24 @@ mod tests {
 
     #[test]
     fn extract_usage_returns_none_for_done() {
-        assert!(
-            SseFilter::<fn(&str) -> String>::try_extract_usage(b"data: [DONE]\n\n").is_none()
-        );
+        assert!(SseFilter::<fn(&str) -> String>::try_extract_usage(b"data: [DONE]\n\n").is_none());
+    }
+
+    #[test]
+    fn extract_usage_when_packed_with_done_in_one_chunk() {
+        // OpenAI / mock backends sometimes pack the usage chunk and the
+        // [DONE] terminator into a single TCP read. The inspector must
+        // still find the usage line, not bail on the [DONE] sibling.
+        let chunk = b"data: {\"id\":\"x\",\"choices\":[],\"model\":\"gpt-4o-mini\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"total_tokens\":46}}\n\ndata: [DONE]\n\n";
+        let usage = SseFilter::<fn(&str) -> String>::try_extract_usage(chunk).unwrap();
+        assert_eq!(usage, (12, 34, "gpt-4o-mini".to_string()));
+    }
+
+    #[test]
+    fn extract_usage_skips_content_chunks_in_packed_buffer() {
+        // delta.content event followed by usage event in the same buffer.
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\n";
+        let usage = SseFilter::<fn(&str) -> String>::try_extract_usage(chunk).unwrap();
+        assert_eq!(usage, (5, 7, "unknown".to_string()));
     }
 }
