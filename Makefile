@@ -1,7 +1,7 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit ci push release-patch release-minor release-major \
-        pr pr-web
+        pr pr-web preflight
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -178,3 +178,21 @@ pr:
 
 pr-web: pr
 	@gh pr view --web
+
+# ── Preflight (run before make pr) ──────────────────────────────────────────
+# Mirrors the CI lint, test, audit, and e2e jobs so a feature branch fails
+# locally instead of red-statusing a PR. Required by CLAUDE.md > Branch Policy.
+
+preflight:
+	@echo "→ cargo fmt --check"
+	cargo fmt --check
+	@echo "→ cargo clippy --all-targets -- -D warnings"
+	cargo clippy --all-targets -- -D warnings
+	@echo "→ cargo test"
+	cargo test --quiet
+	@echo "→ cargo audit"
+	@command -v cargo-audit >/dev/null 2>&1 || { echo "warning: cargo-audit not installed; install with: cargo install cargo-audit"; }
+	@command -v cargo-audit >/dev/null 2>&1 && cargo audit || true
+	@echo "→ tools/e2e.sh"
+	./tools/e2e.sh
+	@echo "✓ preflight passed"

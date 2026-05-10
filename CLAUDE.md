@@ -103,9 +103,14 @@ Use kebab-case after the prefix.
    git checkout -b feat/<topic>
    ```
 2. Commit incrementally. Keep `cargo test` and `tools/e2e.sh` green at every commit you push, not just at PR time.
-3. Open the PR (`make pr` or `gh pr create --base main --fill --web`). Title follows the same `feat:` / `fix:` / `chore:` / `docs:` prefix; body explains *why*, not what.
-4. Merge style: prefer **squash** for feature branches with messy history, **rebase** when the per-commit history is meaningful.
-5. Release happens from `main` after the merge: `make release-minor` (or `release-patch` / `release-major`).
+3. **Before `make pr` (or `git push` of a branch you intend to PR), run `make preflight`.** This walks the same checks the CI runs — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo audit`, and `tools/e2e.sh` — so you catch lint and audit failures locally instead of after CI has already opened a red status check on the PR. `cargo test` alone is not enough; CI's lint job has caught real issues that `cargo test` did not (e.g. `should_implement_trait`, `module_inception`, `manual_div_ceil`).
+4. Open the PR (`make pr` or `gh pr create --base main --fill --web`). Title follows the same `feat:` / `fix:` / `chore:` / `docs:` prefix; body explains *why*, not what.
+5. Merge style: prefer **squash** for feature branches with messy history, **rebase** when the per-commit history is meaningful.
+6. Release happens from `main` after the merge: `make release-minor` (or `release-patch` / `release-major`).
+
+### Why CI parity matters
+
+A PR with a red lint check forces a second push, a second CI run, and (worst case) a re-review. The lint job runs against `cargo clippy --all-targets -- -D warnings`, which surfaces a stricter set than `cargo test`: future-incompat lints, `should_implement_trait`, `manual_div_ceil`, `module_inception`, and so on. Adopt the habit of running `make preflight` once before pushing a feature branch the first time, and once again before flipping the PR to ready-for-review. The release scripts run preflight automatically; manual flows do not, which is why this rule exists.
 
 ### Things to never do
 
