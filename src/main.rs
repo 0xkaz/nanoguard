@@ -10,7 +10,7 @@ use nanoguard::{admin, audit, backend, budget, config, matcher, proxy, AppState}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = config::Config::from_env_or_default()?;
+    let mut cfg = config::Config::from_env_or_default()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -18,6 +18,30 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new(&cfg.nanoguard.log_level)),
         )
         .init();
+
+    // Load policy bundle (YAML) and merge its rules into the existing
+    // keyword config + redactor inline patterns. Tracked separately so the
+    // audit layer can attach rule_id / category / severity to matches.
+    let policy_index = if let Some(path) = cfg
+        .policies
+        .bundle_path
+        .as_ref()
+        .filter(|p| !p.is_empty())
+    {
+        use nanoguard::policy::{merge_into_keyword_config, Policy, PolicyRuleIndex};
+        let policy = Policy::from_path(path)?;
+        tracing::info!(
+            "policy bundle: loaded {} rule(s) from {} (name={:?})",
+            policy.rule_count(),
+            path,
+            policy.metadata.name
+        );
+        merge_into_keyword_config(&policy, &mut cfg.input.keyword);
+        Some(Arc::new(PolicyRuleIndex::from_policy(&policy)))
+    } else {
+        tracing::info!("policy bundle: not configured");
+        None
+    };
 
     let matchers = Arc::new(matcher::Matchers::build(&cfg.input.keyword)?);
     tracing::info!("matcher engine: {}", matchers.engine_name());
@@ -180,6 +204,7 @@ async fn main() -> Result<()> {
         spotlight,
         schema,
         tool_gate,
+        policy: policy_index,
         backend,
         http_client,
         budget,

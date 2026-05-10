@@ -2,6 +2,66 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — feat/policy-engine
+
+Policy Engine v1: declarative YAML rule bundles with stable rule ids, categories, severities, and compliance tags. Audit log entries gain `rule_id` / `category` / `severity` / `compliance` when a match comes from a policy.
+
+### Added — Policy Engine
+
+- **YAML bundle loader** in `src/policy/`. A bundle is a versioned list of rules, each with a stable `id`, a `category`, a `severity`, an action (`block` / `alert` / `flag` / `redact`), and optional `compliance` tags. Patterns are either literal phrases or regex (`/.../`).
+- **Merge into existing matchers** at startup: literal-keyword rules append to `KeywordConfig.inline_block` / `inline_alert` / `inline_flag` based on action; regex `redact` rules contribute entity-named patterns to the redactor. The matcher / redactor hot path is untouched.
+- **`PolicyRuleIndex`** — a lookup table from matched literal text or regex body to rule metadata. Built once at startup and stored on `AppState`.
+
+### Added — Audit log enrichment
+
+- `AuditEntry` gains four optional fields: `rule_id`, `category`, `severity`, and `compliance`. They are omitted from the JSON when absent (backward compatible).
+- The audit writer consults `PolicyRuleIndex` whenever there's a `matched_rule`, including matches demoted by shadow mode (the `shadow_block:` prefix is stripped before lookup).
+
+### Configuration
+
+```toml
+[policies]
+bundle_path = "policies/default.yaml"
+```
+
+```yaml
+# policies/default.yaml
+version: 1
+metadata:
+  name: nanoguard default
+  updated: "2026-05-10"
+
+rules:
+  - id: PI-001
+    category: prompt_injection
+    severity: high
+    pattern: ignore previous instructions
+    action: block
+
+  - id: PII-001
+    category: pii
+    severity: medium
+    pattern: '/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/'
+    action: redact
+    placeholder: EMAIL
+    compliance: ["GDPR", "HIPAA"]
+```
+
+### Tests
+
+- 11 unit tests in `src/policy/`: parsing, validation (version / duplicates / redact-without-placeholder), regex/literal detection, severity defaults, dispatch into KeywordConfig and redactor patterns, and `PolicyRuleIndex` lookups.
+- e2e scenario 15 (32 assertions across 15 scenarios total) verifies that an audit entry from a policy match carries `rule_id` / `category` / `severity`.
+- A `policies/default.yaml` ships with the repo so deployments can copy and edit it.
+
+### Out of scope for this release
+
+- Hot reload / signed bundles (Phase 5.4 follow-ups).
+- Migrating Spotlight / Tool Gate / Schema configurations into the policy file (still TOML).
+- Multi-bundle stacking and per-tenant override hierarchies.
+- A literal pattern with `redact` / `reject` / `log` action — for those, declare a regex pattern with a placeholder.
+
+These are tracked in `_POLICY_ENGINE.md` and the docs/design/policy-engine.md "Limitations" section.
+
 ## [0.6.0] — 2026-05-10
 
 Three follow-ups that finish the Phase 4 trio (Spotlighting + Schema + Tool Gate) on every supported endpoint, plus a recognizer evaluation harness for tuning dictionary packs.

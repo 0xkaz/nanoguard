@@ -25,6 +25,19 @@ pub struct AuditEntry {
     pub prompt_hash: String,
     pub verdict: Verdict,
     pub matched_rule: Option<String>,
+    /// Policy rule id when the match was driven by a Policy bundle (e.g.
+    /// "PI-001"). Always omitted from JSON when None for backward compat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Policy category (e.g. "prompt_injection", "pii", "off_topic").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Policy severity (e.g. "low" | "medium" | "high" | "critical").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Compliance frameworks attached to the matched rule.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub compliance: Vec<String>,
     pub latency_us: u64,
 }
 

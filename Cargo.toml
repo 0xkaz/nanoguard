@@ -42,6 +42,7 @@ async-trait = "0.1"
 sha2 = "0.10"
 unicode-normalization = "0.1"
 jsonschema = { version = "0.30", default-features = false }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

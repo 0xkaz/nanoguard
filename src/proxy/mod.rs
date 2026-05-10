@@ -654,6 +654,28 @@ fn write_audit(
 ) {
     let Some(log) = &state.audit else { return };
     let prompt_hash = log.hash_prompt(prompt);
+    // Look up the matched rule in the policy index, if any. The shadow_block
+    // prefix is stripped first so demoted rules still surface their metadata.
+    let mut rule_id: Option<String> = None;
+    let mut category: Option<String> = None;
+    let mut severity: Option<String> = None;
+    let mut compliance: Vec<String> = Vec::new();
+    if let (Some(idx), Some(matched)) = (state.policy.as_ref(), matched_rule.as_ref()) {
+        let key = matched
+            .strip_prefix("shadow_block:")
+            .unwrap_or(matched);
+        if let Some(meta) = idx.lookup_literal(key) {
+            rule_id = Some(meta.id.clone());
+            category = Some(meta.category.clone());
+            severity = Some(meta.severity.clone());
+            compliance = meta.compliance.clone();
+        } else if let Some(meta) = idx.lookup_placeholder(key) {
+            rule_id = Some(meta.id.clone());
+            category = Some(meta.category.clone());
+            severity = Some(meta.severity.clone());
+            compliance = meta.compliance.clone();
+        }
+    }
     let entry = AuditEntry {
         request_id: request_id.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -662,6 +684,10 @@ fn write_audit(
         prompt_hash,
         verdict,
         matched_rule,
+        rule_id,
+        category,
+        severity,
+        compliance,
         latency_us,
     };
     log.write(&entry);

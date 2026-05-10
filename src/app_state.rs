@@ -14,6 +14,9 @@ pub struct AppState {
     pub schema: Option<Arc<crate::guard::schema::SchemaValidator>>,
     /// Tool gate for inspecting LLM-emitted tool calls; None when disabled.
     pub tool_gate: Option<Arc<crate::guard::tool_gate::ToolGate>>,
+    /// Policy rule index — used by the audit layer to enrich match records
+    /// with rule_id / category / severity. None when no policy bundle.
+    pub policy: Option<Arc<crate::policy::PolicyRuleIndex>>,
     pub backend: backend::Backend,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,
