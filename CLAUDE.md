@@ -139,11 +139,22 @@ Never tag inside `tools/release.sh`. Never push tags before the release PR has m
 
 A PR with a red lint check forces a second push, a second CI run, and (worst case) a re-review. The lint job runs against `cargo clippy --all-targets -- -D warnings`, which surfaces a stricter set than `cargo test`: future-incompat lints, `should_implement_trait`, `manual_div_ceil`, `module_inception`, and so on. Adopt the habit of running `make preflight` once before pushing a feature branch the first time, and once again before flipping the PR to ready-for-review. The release scripts run preflight automatically; manual flows do not, which is why this rule exists.
 
+### Agent autonomy: commits, pushes, and PRs
+
+Agents are expected to drive feature work end-to-end on a feature branch and stop just short of merging. Specifically:
+
+- **Commits on a feature branch**: allowed and expected. Use the standard `feat:` / `fix:` / `chore:` / `docs:` prefix.
+- **`git push` on a feature branch** (`feat/*`, `fix/*`, `chore/*`, `docs/*`, `release/*`): allowed without explicit user instruction. Run `make preflight` first; do not push a branch that fails preflight locally unless you have a specific reason to surface the failure on CI.
+- **`make pr` after a clean push**: allowed without explicit instruction.
+- **`make release-tag`**: only after the user has confirmed the release PR has merged. Agents must not infer "merged" from CI status; merge is a human decision.
+- **`gh pr merge` / merging via UI**: never. Merge is always a user action.
+
 ### Things to never do
 
-- Force-push to `main` (or to any branch someone else has based work on).
+- Push directly to `main`. The branch is ruleset-protected and the push will fail anyway, but attempting it pollutes the local state and the CI surface. Always go through a PR.
+- Force-push to `main`, or to any shared branch someone else has based work on. Force-push to your own feature branch (e.g. after a rebase) is fine before review starts; once a reviewer is looking at it, prefer additional commits and a final squash on merge.
 - Skip hooks (`--no-verify`) or signing (`--no-gpg-sign`) without an explicit go-ahead.
-- Run `git commit` or `git push` from an automated agent without the user asking. Agents prepare branches, write commits as drafts in their commit message buffer, and stop short of `push` unless the user explicitly says push.
+- Merge a PR. Hand it back to the user with a one-line "ready" report and a link to the CI status.
 
 ## Documentation Policy
 

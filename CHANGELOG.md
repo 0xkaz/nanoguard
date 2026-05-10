@@ -23,9 +23,13 @@ Install once per machine:
 cargo install cargo-audit
 ```
 
+### Changed — agent autonomy on push/PR
+
+The previous rule said "agents must not run `git commit` or `git push` without the user explicitly asking." That made every feature-branch handoff a manual round-trip. New rule: agents commit and push on feature branches autonomously, run `make pr` autonomously after a clean push, but never merge a PR and never run `make release-tag` without the user confirming the merge happened. Direct pushes to `main` remain disallowed (and are blocked by the ruleset anyway).
+
 ### Docs
 
-- `CLAUDE.md > Branch Policy` gains a "Release flow" subsection describing the two-step PR-driven release.
+- `CLAUDE.md > Branch Policy` gains a "Release flow" subsection describing the two-step PR-driven release, and an "Agent autonomy" subsection codifying the new push/PR rule.
 - `tools/README.md` rewritten to match the new flow (release.sh = step 1, release-tag.sh = step 2).
 
 ## [0.7.0] — 2026-05-11
