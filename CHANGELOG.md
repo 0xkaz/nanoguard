@@ -4,6 +4,17 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased] — feat/policy-engine
 
+Policy Engine v1, plus several integration fixes uncovered while stress-testing the e2e suite.
+
+### Fixed
+
+- `SseFilter::try_extract_usage` was bailing on any chunk that contained the literal `[DONE]`, which means streaming responses that pack the `usage` event and the `[DONE]` terminator into one TCP read silently dropped their usage. Walk every `data:` line and only treat a JSON parse with `usage` as a hit. Streaming budget accounting now actually records spend (e2e scenario 17 confirms).
+- `SseFilter::try_extract_usage` previously returned `None` the first time it hit a non-`data:` line because of an unwrap chain on `?`. Replaced with `let-else` so unrelated lines are skipped instead of aborting the scan.
+- `/v1/messages` previously accepted `stream: true` and tried to JSON-parse the SSE response body, surfacing as an opaque 502. It now refuses early with HTTP 400 and a clear error, matching the README's "streaming not yet supported" note (e2e scenario 19).
+- rustdoc warning on `ValidationOutcome::extracted` (a stray code-fence in the doc comment) — reworded to avoid the inline fence.
+
+### Added — Policy Engine
+
 Policy Engine v1: declarative YAML rule bundles with stable rule ids, categories, severities, and compliance tags. Audit log entries gain `rule_id` / `category` / `severity` / `compliance` when a match comes from a policy.
 
 ### Added — Policy Engine
@@ -49,9 +60,14 @@ rules:
 
 ### Tests
 
-- 11 unit tests in `src/policy/`: parsing, validation (version / duplicates / redact-without-placeholder), regex/literal detection, severity defaults, dispatch into KeywordConfig and redactor patterns, and `PolicyRuleIndex` lookups.
-- e2e scenario 15 (32 assertions across 15 scenarios total) verifies that an audit entry from a policy match carries `rule_id` / `category` / `severity`.
-- A `policies/default.yaml` ships with the repo so deployments can copy and edit it.
+- 140 unit tests in total. New: 11 in `src/policy/` (parsing, validation, dispatch, lookups), 2 in `src/proxy/sse.rs` (usage extraction with `[DONE]` packed in the same chunk).
+- e2e suite extended to **19 scenarios / 37 assertions**. New scenarios:
+  - **15**: policy bundle audit enrichment — verifies that an audit entry from a policy match carries `rule_id` / `category` / `severity`.
+  - **16**: streaming tool gate deny path — confirms `tool_call_denied` event is emitted and the stream terminates with `[DONE]` when a denied call is assembled from deltas.
+  - **17**: streaming budget accounting — confirms `stream_options.include_usage` chunks reach the budget store (queried via `/v1/admin/budget/:api_key`).
+  - **18**: schema reject mode — confirms `on_violation = "reject"` returns 4xx instead of just logging.
+  - **19**: Anthropic streaming refusal — confirms `stream: true` on `/v1/messages` is refused cleanly with a 400 instead of half-handled.
+- `policies/default.yaml` ships with the repo so deployments can copy and edit it.
 
 ### Out of scope for this release
 

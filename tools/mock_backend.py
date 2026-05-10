@@ -49,7 +49,10 @@ class MockHandler(BaseHTTPRequestHandler):
         # Hook: if the user message starts with "TOOL:", interpret the rest
         # as a JSON `tool_calls` array and emit it as the assistant's reply.
         # Used by tool-gate e2e tests to deterministically simulate an LLM
-        # that decided to call a tool.
+        # that decided to call a tool. Works in both streaming and
+        # non-streaming modes; in streaming mode the tool_calls are emitted
+        # as a sequence of partial deltas keyed by index, then a final
+        # finish_reason chunk.
         tool_calls = None
         if user_msg.startswith("TOOL:"):
             try:
@@ -60,7 +63,10 @@ class MockHandler(BaseHTTPRequestHandler):
         echo = f"You said: {user_msg}"
 
         if req.get("stream"):
-            self.handle_stream(req, echo)
+            if tool_calls is not None:
+                self.handle_stream_tool_calls(req, tool_calls)
+            else:
+                self.handle_stream(req, echo)
         else:
             self.handle_unary(req, echo, tool_calls)
 
@@ -89,6 +95,100 @@ class MockHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_stream_tool_calls(self, req, tool_calls):
+        """Emit tool_calls as partial deltas, then a finish_reason terminator.
+
+        This exercises the streaming Tool Gate accumulator: the function
+        name arrives in one delta, the arguments arrive split across two,
+        and `finish_reason: "tool_calls"` triggers evaluation.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        for idx, tc in enumerate(tool_calls):
+            func = tc.get("function", {})
+            name = func.get("name", "unknown")
+            args = func.get("arguments", "{}")
+            tc_id = tc.get("id", f"call_{idx}")
+
+            # Delta 1: name + id only.
+            payload = {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "model": req.get("model", "mock-model"),
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": idx,
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {"name": name},
+                    }]},
+                }],
+            }
+            self._emit_sse(payload)
+
+            # Deltas 2+: arguments split into two halves.
+            mid = max(1, len(args) // 2)
+            for chunk in (args[:mid], args[mid:]):
+                if not chunk:
+                    continue
+                payload = {
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion.chunk",
+                    "model": req.get("model", "mock-model"),
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": [{
+                            "index": idx,
+                            "function": {"arguments": chunk},
+                        }]},
+                    }],
+                }
+                self._emit_sse(payload)
+
+        # Finish reason → triggers the streaming Tool Gate evaluation.
+        finish_payload = {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "model": req.get("model", "mock-model"),
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        }
+        self._emit_sse(finish_payload)
+
+        # Optional usage chunk.
+        opts = req.get("stream_options") or {}
+        if opts.get("include_usage"):
+            usage_payload = {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "model": req.get("model", "mock-model"),
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 10,
+                    "total_tokens": 20,
+                },
+            }
+            self._emit_sse(usage_payload)
+
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except BrokenPipeError:
+            pass
+
+    def _emit_sse(self, payload):
+        line = f"data: {json.dumps(payload)}\n\n".encode()
+        try:
+            self.wfile.write(line)
+            self.wfile.flush()
+        except BrokenPipeError:
+            pass
+        time.sleep(0.01)
 
     def handle_stream(self, req, echo):
         self.send_response(200)
