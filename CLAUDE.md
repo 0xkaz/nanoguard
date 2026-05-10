@@ -106,17 +106,80 @@ Use kebab-case after the prefix.
 3. **Before `make pr` (or `git push` of a branch you intend to PR), run `make preflight`.** This walks the same checks the CI runs — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo audit`, and `tools/e2e.sh` — so you catch lint and audit failures locally instead of after CI has already opened a red status check on the PR. `cargo test` alone is not enough; CI's lint job has caught real issues that `cargo test` did not (e.g. `should_implement_trait`, `module_inception`, `manual_div_ceil`).
 4. Open the PR (`make pr` or `gh pr create --base main --fill --web`). Title follows the same `feat:` / `fix:` / `chore:` / `docs:` prefix; body explains *why*, not what.
 5. Merge style: prefer **squash** for feature branches with messy history, **rebase** when the per-commit history is meaningful.
-6. Release happens from `main` after the merge: `make release-minor` (or `release-patch` / `release-major`).
+6. Release goes through its own PR (see "Release flow" below).
+
+### Release flow
+
+`main` is protected by a ruleset that rejects direct pushes from v0.7.0 onward, so a release is itself a PR.
+
+```bash
+# from up-to-date main
+make release-minor      # patch / minor / major / "<X.Y.Z>" all work
+```
+
+`tools/release.sh` will:
+
+1. Run `make preflight` (fmt / clippy / test / audit / e2e).
+2. `cargo set-version <new>` to bump `Cargo.toml` + `Cargo.lock`.
+3. Promote the existing `## [Unreleased]` block in `CHANGELOG.md` to `## [<new>] — <date>`, or prepend a stub if there isn't one. The script pauses so you can fill in the section before it commits.
+4. Commit on a fresh `release/v<new>` branch (never on `main`).
+5. Push the branch and open a PR via `gh pr create`.
+
+Once that PR passes CI and is merged on `main`:
+
+```bash
+make release-tag        # delegates to tools/release-tag.sh
+```
+
+`tools/release-tag.sh` switches to `main`, fast-forward-pulls, validates that `Cargo.toml` and `CHANGELOG.md` carry the expected version, then creates and pushes the `v<new>` annotated tag against the merge commit. Tagging is **separate from the release commit** so the tag tracks the merge SHA, which is what GitHub Releases and `git describe` consumers expect — even when the PR is squashed by the merge button.
+
+Never tag inside `tools/release.sh`. Never push tags before the release PR has merged.
 
 ### Why CI parity matters
 
 A PR with a red lint check forces a second push, a second CI run, and (worst case) a re-review. The lint job runs against `cargo clippy --all-targets -- -D warnings`, which surfaces a stricter set than `cargo test`: future-incompat lints, `should_implement_trait`, `manual_div_ceil`, `module_inception`, and so on. Adopt the habit of running `make preflight` once before pushing a feature branch the first time, and once again before flipping the PR to ready-for-review. The release scripts run preflight automatically; manual flows do not, which is why this rule exists.
 
+### Agent autonomy: commits, pushes, and PRs
+
+Agents are expected to drive feature work end-to-end on a feature branch and stop just short of merging. Specifically:
+
+- **Commits on a feature branch**: allowed and expected. Use the standard `feat:` / `fix:` / `chore:` / `docs:` prefix.
+- **`git push` on a feature branch** (`feat/*`, `fix/*`, `chore/*`, `docs/*`, `release/*`): allowed without explicit user instruction. Run `make preflight` first; do not push a branch that fails preflight locally unless you have a specific reason to surface the failure on CI.
+- **`make pr` after a clean push**: allowed without explicit instruction.
+- **`make release-tag`**: only after the user has confirmed the release PR has merged. Agents must not infer "merged" from CI status; release tagging waits on a human go-ahead.
+- **`gh pr merge`**: allowed under tight conditions, see "Self-merge contract" below.
+
+### Self-merge contract
+
+An agent may merge a PR with `gh pr merge --squash` ONLY when ALL of these hold:
+
+1. The PR was opened by the agent in the **current session** (not by the user, not by a previous agent run, not by another collaborator).
+2. **All required CI status checks** report `SUCCESS`. Pending, failure, or skipped checks block the merge.
+3. `gh pr view --json mergeable` reports `MERGEABLE` (no conflicts, no stale base).
+4. A final consistency pass holds: the diff matches the PR description, the code matches what tests cover, and `CHANGELOG.md` / `docs/` reflect any user-facing change. The agent reads the diff before merging — not just the CI badge.
+5. The user has not said "wait for review" or "I'll merge it" in the same session.
+
+If any condition fails, stop, hand the PR back with a one-line status (e.g. `PR #N: 2/3 checks green, security audit pending`), and let the user decide.
+
+Self-merge is **forbidden** for:
+
+- PRs the agent did not open in the current session
+- Release PRs (`release: vX.Y.Z`) — those are the user's flag for the tagging step
+- PRs that touch security-sensitive surface: `src/audit/`, anything in the auth path, dependency upgrades that aren't already covered by a green `cargo audit` run
+- PRs targeting any base branch other than `main`
+
+Default merge method is **squash**. Match the repo's existing PR-history pattern (PR #1 and #2 both used squash). After a merge, the agent does **not** auto-pull main; the next session step explicitly switches to `main` and pulls before branching off again.
+
+### Reporting after a merge
+
+When a self-merge succeeds, report it in one to three sentences: PR number, what merged, what the next step is (often "branching off main for the next PR" or "waiting for the user to invoke `make release-tag`"). No celebration, no emoji, just the state transition.
+
 ### Things to never do
 
-- Force-push to `main` (or to any branch someone else has based work on).
+- Push directly to `main`. The branch is ruleset-protected and the push will fail anyway, but attempting it pollutes the local state and the CI surface. Always go through a PR.
+- Force-push to `main`, or to any shared branch someone else has based work on. Force-push to your own feature branch (e.g. after a rebase) is fine before review starts; once a reviewer is looking at it, prefer additional commits and a final squash on merge.
 - Skip hooks (`--no-verify`) or signing (`--no-gpg-sign`) without an explicit go-ahead.
-- Run `git commit` or `git push` from an automated agent without the user asking. Agents prepare branches, write commits as drafts in their commit message buffer, and stop short of `push` unless the user explicitly says push.
+- Merge a PR that doesn't satisfy every condition in the "Self-merge contract" above. When in doubt, hand it back with a one-line status report.
 
 ## Documentation Policy
 

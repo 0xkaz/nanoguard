@@ -2,6 +2,42 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — release flow is PR-driven
+
+`main` is protected by a ruleset (set up immediately after v0.7.0) that rejects direct pushes. The previous `tools/release.sh` committed straight to `main` and tripped the rule on every release. The flow is now two scripts:
+
+- **`tools/release.sh`** runs `make preflight`, bumps `Cargo.toml` + `Cargo.lock` via `cargo set-version`, promotes `CHANGELOG.md`'s `## [Unreleased]` block to a dated `## [<new>]` section (or prepends a stub if there isn't one), commits on a fresh `release/v<new>` branch, pushes the branch, and opens a PR through `gh pr create`. It never commits to `main` and never tags.
+- **`tools/release-tag.sh`** is a separate step. After the release PR has merged, it switches to `main`, fast-forward-pulls, validates that `Cargo.toml` and `CHANGELOG.md` agree on the version, then creates and pushes the `v<new>` annotated tag against the merge commit. Splitting tagging out of the bump step keeps the tag aligned with the merge SHA — even when the PR is squashed.
+
+Both scripts are surfaced through Make: `make release-{patch,minor,major}` for step 1, `make release-tag` for step 2.
+
+### Changed — `make preflight` now requires `cargo-audit`
+
+Previously preflight printed a warning and skipped `cargo audit` when the binary wasn't installed. CI's `security audit` job runs it unconditionally, so skipping it locally meant advisories could surface only after a PR was opened. Preflight now exits with an actionable install hint instead.
+
+Install once per machine:
+
+```bash
+cargo install cargo-audit
+```
+
+### Changed — agent autonomy on push/PR/merge
+
+The previous rule said "agents must not run `git commit` or `git push` without the user explicitly asking." That made every feature-branch handoff a manual round-trip. The new rule has three tiers:
+
+- **Commit + push on feature branches + `make pr`**: allowed without explicit instruction, after `make preflight` passes.
+- **`gh pr merge` (self-merge)**: allowed under tight conditions — only PRs the agent opened in the current session, only with all required CI checks green, only after a diff-vs-description consistency check, and never for release PRs or security-sensitive scope. The full contract lives in `CLAUDE.md > Branch Policy > Self-merge contract`. Default merge method is squash.
+- **`make release-tag`**: still gated on the user explicitly confirming the release PR has merged. CI status alone is not a green light for tagging.
+
+Direct pushes to `main` remain disallowed (and are blocked by the ruleset anyway).
+
+### Docs
+
+- `CLAUDE.md > Branch Policy` gains a "Release flow" subsection describing the two-step PR-driven release, and an "Agent autonomy" subsection codifying the new push/PR rule.
+- `tools/README.md` rewritten to match the new flow (release.sh = step 1, release-tag.sh = step 2).
+
 ## [0.7.0] — 2026-05-11
 
 Policy Engine v1, plus several integration fixes uncovered while stress-testing the e2e suite.
