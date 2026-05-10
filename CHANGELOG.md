@@ -2,6 +2,45 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-10
+
+Indirect prompt injection defense via Spotlighting. Untrusted message content (RAG chunks delivered in `tool` / `function` role messages) is wrapped or transformed so the LLM treats it as data rather than instructions.
+
+### Added — Spotlighting
+
+- **Three transforms** in `src/guard/spotlight.rs`:
+  - `datamarking` (default): replace ASCII whitespace inside untrusted content with a marker character (`^`), making the region visually distinguishable as preprocessed data.
+  - `delimiting`: wrap content with configurable open/close markers (`<<UNTRUSTED>>`...`<</UNTRUSTED>>` by default).
+  - `encoding`: base64-encode content. Strongest isolation, lowest response quality — opt-in.
+- **Automatic system rider** explaining the convention to the model is appended to the existing system message (or prepended as a fresh system message if none exists). Without the rider the wrapping is security theater.
+- **`untrusted_roles` is configurable** — defaults to `["tool"]`, can be extended to `["tool", "function"]` etc.
+- **Order in the input pipeline**: spotlighting runs *after* PII redaction, so placeholders are already in place and are not mangled by datamarking. Spotlighting touches only roles in `untrusted_roles`; user / system / assistant content passes through.
+
+### Configuration
+
+```toml
+[input.spotlight]
+enabled = false                # opt-in
+method = "datamarking"         # "datamarking" | "delimiting" | "encoding"
+untrusted_roles = ["tool"]
+delimiter_open = "<<UNTRUSTED>>"
+delimiter_close = "<</UNTRUSTED>>"
+datamark_char = "^"
+# system_rider = "..."         # override the default rider per method
+```
+
+### Tests
+
+- 9 unit tests covering each transform, rider injection (existing system / new system), parts-array text, and custom untrusted-role lists.
+- e2e scenario 10 in `tools/e2e.sh` validates that `tool` role content is datamarked, the rider is injected, and the user message is left untouched.
+- Total: 101 lib tests + 22 e2e assertions across 10 scenarios.
+
+### Notes
+
+- Spotlighting is purely a request-side preprocessor. It does not affect the response path or streaming.
+- Anthropic `/v1/messages` does *not* yet apply spotlighting (its tool-result message shape differs and warrants a separate pass).
+- See `_SPOTLIGHT.md` for design notes and `_SPOTLIGHT_RAG_C.md` for the RAG chunk pipeline that this enables next.
+
 ## [0.3.0] — 2026-05-10
 
 This release turns nanoguard from a keyword/regex proxy into a full PII-aware AI security gateway with reversible redaction, streaming-aware filtering, and per-entity policy controls. All additions are backward compatible — existing `nanoguard.toml` configs continue to work unchanged.

@@ -257,6 +257,25 @@ Responses are filtered before reaching your app. Sensitive words are replaced wi
 
 Streaming SSE responses are buffered across chunk boundaries and split on the SSE event terminator before each event's `delta.content` is filtered. This handles backends that pack multiple events into a single TCP chunk or split a single event across chunks. Non-data lines (`event:`, comments, `[DONE]`) pass through unchanged.
 
+### Spotlighting (indirect injection defense)
+
+Spotlighting marks untrusted content — typically RAG chunks delivered in `tool` or `function` role messages — so the LLM is reminded to treat it as data, not instructions. nanoguard ships three transforms:
+
+- `datamarking` (default): replaces whitespace inside untrusted content with a marker character (e.g. `^`) so the region is visually obvious as preprocessed data.
+- `delimiting`: wraps content with `<<UNTRUSTED>>`...`<</UNTRUSTED>>` markers.
+- `encoding`: base64-encodes the content (strongest isolation, lowest answer quality — opt-in).
+
+A system rider is automatically injected so the model knows what the markers mean. Without the rider the wrapping is security theater.
+
+```toml
+[input.spotlight]
+enabled = true
+method = "datamarking"           # "datamarking" | "delimiting" | "encoding"
+untrusted_roles = ["tool"]
+```
+
+User and system messages are left untouched; only the listed roles are transformed. Spotlighting runs after PII redaction, so reversible-redaction placeholders are already in place when datamarking applies.
+
 ### Shadow mode
 
 Set `[input] shadow = true` to scan and audit every request without actually blocking. A request that *would* have been blocked passes through to the backend, but the audit log records the verdict as `flag` with the matched rule prefixed `shadow_block:`. Useful when rolling out a new rule set in production — you can confirm the false-positive rate before enforcing.

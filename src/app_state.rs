@@ -8,6 +8,8 @@ pub struct AppState {
     pub redactor: Arc<proxy::redact::Redactor>,
     /// Pre-computed entity buckets per per-entity action override.
     pub pii_actions: Arc<proxy::redact::ActionPartition>,
+    /// Pre-computed spotlight config; None when spotlight is disabled.
+    pub spotlight: Option<Arc<crate::guard::spotlight::SpotlightConfig>>,
     pub backend: backend::Backend,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,

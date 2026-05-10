@@ -52,6 +52,62 @@ pub struct InputConfig {
     pub keyword: KeywordConfig,
     #[serde(default)]
     pub pii: PiiConfig,
+    /// Spotlighting: tag retrieved/tool content so the LLM treats it as data,
+    /// not as instructions. Defends against indirect prompt injection.
+    #[serde(default)]
+    pub spotlight: SpotlightConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SpotlightConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// "delimiting" | "datamarking" | "encoding". Default "datamarking".
+    #[serde(default = "default_spotlight_method")]
+    pub method: String,
+    /// Roles whose content is treated as untrusted. Default: ["tool"].
+    #[serde(default = "default_untrusted_roles")]
+    pub untrusted_roles: Vec<String>,
+    #[serde(default = "default_delim_open")]
+    pub delimiter_open: String,
+    #[serde(default = "default_delim_close")]
+    pub delimiter_close: String,
+    #[serde(default = "default_datamark")]
+    pub datamark_char: String,
+    /// System rider injected to teach the model the convention. Empty string
+    /// to disable the rider entirely (not recommended).
+    #[serde(default)]
+    pub system_rider: Option<String>,
+}
+
+fn default_spotlight_method() -> String {
+    "datamarking".to_string()
+}
+fn default_untrusted_roles() -> Vec<String> {
+    vec!["tool".to_string()]
+}
+fn default_delim_open() -> String {
+    "<<UNTRUSTED>>".to_string()
+}
+fn default_delim_close() -> String {
+    "<</UNTRUSTED>>".to_string()
+}
+fn default_datamark() -> String {
+    "^".to_string()
+}
+
+impl Default for SpotlightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            method: default_spotlight_method(),
+            untrusted_roles: default_untrusted_roles(),
+            delimiter_open: default_delim_open(),
+            delimiter_close: default_delim_close(),
+            datamark_char: default_datamark(),
+            system_rider: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

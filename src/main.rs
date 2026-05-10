@@ -52,6 +52,41 @@ async fn main() -> Result<()> {
         pii_actions.reject.len(),
         pii_actions.log.len(),
     );
+    let spotlight = if cfg.input.spotlight.enabled {
+        use nanoguard::guard::spotlight::{default_rider, SpotlightConfig, SpotlightMethod};
+        let method = SpotlightMethod::from_str(&cfg.input.spotlight.method)
+            .unwrap_or(SpotlightMethod::Datamarking);
+        let datamark_char = cfg
+            .input
+            .spotlight
+            .datamark_char
+            .chars()
+            .next()
+            .unwrap_or('^');
+        let rider = cfg
+            .input
+            .spotlight
+            .system_rider
+            .clone()
+            .unwrap_or_else(|| default_rider(method, datamark_char));
+        let cfg_built = SpotlightConfig {
+            method,
+            untrusted_roles: cfg.input.spotlight.untrusted_roles.clone(),
+            delimiter_open: cfg.input.spotlight.delimiter_open.clone(),
+            delimiter_close: cfg.input.spotlight.delimiter_close.clone(),
+            datamark_char,
+            system_rider: rider,
+        };
+        tracing::info!(
+            "spotlight: enabled (method={:?}, untrusted_roles={:?})",
+            cfg_built.method,
+            cfg_built.untrusted_roles
+        );
+        Some(Arc::new(cfg_built))
+    } else {
+        tracing::info!("spotlight: disabled");
+        None
+    };
     let backend = backend::Backend::new(cfg.backend.clone());
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
 
@@ -80,6 +115,7 @@ async fn main() -> Result<()> {
         matchers,
         redactor,
         pii_actions,
+        spotlight,
         backend,
         http_client,
         budget,

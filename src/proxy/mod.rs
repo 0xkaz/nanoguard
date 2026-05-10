@@ -131,6 +131,15 @@ pub async fn chat_completions(
         }
     }
 
+    // Spotlighting: tag untrusted (tool/function) message content so the LLM
+    // treats it as data. Runs *after* PII redaction so the placeholders are
+    // already in place when datamarking applies.
+    if let Some(sl) = state.spotlight.as_ref() {
+        if crate::guard::spotlight::apply(&mut body, sl) {
+            info!("SPOTLIGHT applied to untrusted-role messages");
+        }
+    }
+
     // Budget check (before forwarding to LLM)
     if let Some(budget) = &state.budget {
         match budget.check(&api_key).await {
