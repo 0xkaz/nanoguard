@@ -8,7 +8,7 @@ Local development and release helpers. Not shipped in the binary.
 |---|---|
 | `mock_backend.py` | Minimal OpenAI-compatible echo backend used by `e2e.sh`. |
 | `e2e.toml` | nanoguard config used by `e2e.sh` (binds to `:18080`, points at the mock backend on `:11500`, enables reversible PII redaction). |
-| `e2e.sh` | End-to-end smoke test. Boots the mock backend and the release binary, runs 19 scenarios (37 assertions). Covers health, prompt-injection block, PII redaction (mask + reversible round-trip), AWS-key reject, Anthropic redaction, indexed placeholders, streaming SSE filter + deanonymize, shadow mode, spotlighting, output schema (log + reject), tool gate (allow/deny + Anthropic), recognizer eval, policy bundle audit enrichment, streaming tool gate deny, streaming budget usage, and the Anthropic stream=true refusal path. Used by `release.sh` and CI. |
+| `e2e.sh` | End-to-end smoke test. Boots the mock backend and the release binary, runs 19 scenarios (41 assertions). Covers health, prompt-injection block, PII redaction (mask + reversible round-trip), AWS-key reject, Anthropic redaction, Anthropic `tool_use` round-trip, denied-tool surfacing as `nanoguard_denied_tools` block, indexed placeholders, streaming SSE filter + deanonymize, shadow mode, spotlighting, output schema (log + reject), tool gate (allow/deny on chat_completions), recognizer eval, policy bundle audit enrichment, streaming tool gate deny, streaming budget usage, and the Anthropic stream=true refusal path. Used by `release.sh` and CI. |
 | `release.sh` | Bump version → run tests + e2e → commit → tag → push. |
 | `push.sh` | Push `main` and any unreleased tags reachable from `HEAD` to `origin`. Used standalone or as the trailing step of `release.sh`. |
 

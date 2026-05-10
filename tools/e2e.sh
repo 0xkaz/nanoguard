@@ -341,17 +341,46 @@ RESP=$(curl -s "$NG_URL/v1/chat/completions" \
 ALLOWED=$(echo "$RESP" | jq -r '.choices[0].message.tool_calls[0].function.name // ""')
 assert_eq "12c. allowed tool call passes through" "$ALLOWED" "search_kb"
 
-# --- 13. Anthropic /v1/messages with tool gate -----------------------------
-info "scenario 13: Anthropic tool_use through tool gate"
-# Reuse the running tool-gate nanoguard from scenario 12 (deny=delete_*).
-# Mock backend echoes plain text in /v1/messages, so we just verify that
-# /v1/messages doesn't error when tools is enabled and that PII redaction
-# round-trips (sanity check that scenario 12's restart didn't break /v1/messages).
+# --- 13. Anthropic /v1/messages tool_use round-trip + tool gate ------------
+# Three things are exercised here, not just one:
+#   13a: PII redaction round-trip on /v1/messages still works with tools
+#        enabled (regression guard against scenario 12's restart).
+#   13b: when the upstream returns OpenAI tool_calls, the Anthropic adapter
+#        actually converts them into `content[].type == "tool_use"` blocks
+#        — this is the conversion path in src/proxy/anthropic.rs that
+#        scenario 12 (chat_completions) does not exercise.
+#   13c: a denied tool_call is removed from the Anthropic response and
+#        surfaced as a `nanoguard_denied_tools` block, so tool gate
+#        decisions reach the Anthropic shape too.
+
+info "scenario 13a: Anthropic redaction round-trip with tools enabled"
 RESP=$(curl -s "$NG_URL/v1/messages" \
     -H "Content-Type: application/json" \
     -d '{"model":"test","max_tokens":256,"messages":[{"role":"user","content":"my email is dave@example.com"}]}')
 TEXT=$(echo "$RESP" | jq -r '.content[0].text // ""')
-assert_contains "13. Anthropic redaction still round-trips with tool gate enabled" "$TEXT" "dave@example.com"
+assert_contains "13a. Anthropic redaction still round-trips with tool gate enabled" "$TEXT" "dave@example.com"
+
+info "scenario 13b: Anthropic adapter converts tool_calls → tool_use blocks"
+ALLOW_TOOL='[{"id":"call_kb","type":"function","function":{"name":"search_kb","arguments":"{\"q\":\"rust\"}"}}]'
+RESP=$(curl -s "$NG_URL/v1/messages" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg user "TOOL:$ALLOW_TOOL" \
+        '{model:"test", max_tokens:64, messages:[{role:"user", content:$user}]}')")
+TOOL_USE_NAME=$(echo "$RESP" | jq -r '[.content[] | select(.type=="tool_use")][0].name // ""')
+STOP=$(echo "$RESP" | jq -r '.stop_reason // ""')
+assert_eq  "13b-i.  tool_use block name is search_kb" "$TOOL_USE_NAME" "search_kb"
+assert_eq  "13b-ii. stop_reason is tool_use"          "$STOP"          "tool_use"
+
+info "scenario 13c: denied tool_call surfaces as nanoguard_denied_tools block"
+DENY_TOOL='[{"id":"call_del","type":"function","function":{"name":"delete_record","arguments":"{\"id\":1}"}}]'
+RESP=$(curl -s "$NG_URL/v1/messages" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg user "TOOL:$DENY_TOOL" \
+        '{model:"test", max_tokens:64, messages:[{role:"user", content:$user}]}')")
+DENIED_NAME=$(echo "$RESP" | jq -r '[.content[] | select(.type=="nanoguard_denied_tools")][0].details[0].name // ""')
+ANY_TOOL_USE=$(echo "$RESP" | jq -r '[.content[] | select(.type=="tool_use")] | length')
+assert_eq "13c-i.  denied tool_use absent (length 0)"             "$ANY_TOOL_USE" "0"
+assert_eq "13c-ii. nanoguard_denied_tools surfaces denied name"   "$DENIED_NAME"  "delete_record"
 
 # --- 14. nanoguard-eval recognizer harness ---------------------------------
 info "scenario 14: nanoguard-eval against tiny corpus"

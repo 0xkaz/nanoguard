@@ -61,7 +61,8 @@ rules:
 ### Tests
 
 - 140 unit tests in total. New: 11 in `src/policy/` (parsing, validation, dispatch, lookups), 2 in `src/proxy/sse.rs` (usage extraction with `[DONE]` packed in the same chunk).
-- e2e suite extended to **19 scenarios / 37 assertions**. New scenarios:
+- e2e suite extended to **19 scenarios / 41 assertions**. New / strengthened scenarios:
+  - **13**: strengthened from a single PII round-trip into three sub-scenarios — 13a re-checks redaction round-trip with tools enabled, 13b verifies the Anthropic adapter actually converts upstream `tool_calls` into `content[].type == "tool_use"` blocks (the conversion path that scenario 12 does not exercise), and 13c verifies a denied tool call is removed from the response and surfaced as a `nanoguard_denied_tools` block.
   - **15**: policy bundle audit enrichment — verifies that an audit entry from a policy match carries `rule_id` / `category` / `severity`.
   - **16**: streaming tool gate deny path — confirms `tool_call_denied` event is emitted and the stream terminates with `[DONE]` when a denied call is assembled from deltas.
   - **17**: streaming budget accounting — confirms `stream_options.include_usage` chunks reach the budget store (queried via `/v1/admin/budget/:api_key`).
