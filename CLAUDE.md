@@ -75,9 +75,39 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 ## Branch Policy
 
-- `main` must always build
-- Branch prefixes: `fix/`, `feat/`, `chore/`
-- Do not run `git commit` or `git push`; leave that to the user
+`main` must always build. Versions through `v0.6.0` were cut from main directly; from `v0.7.0` onward, non-trivial work happens on a feature branch and lands on `main` through a PR.
+
+### When to branch
+
+- **Branch** for any change that takes more than ~30 minutes, touches more than 2–3 modules, introduces a new feature, or has any chance of leaving `main` half-broken. Policy Engine, new guard modules, schema/tool-gate-class additions all qualify.
+- **Direct commit on `main`** is acceptable only for: README typo fixes, comment-only changes, single-file documentation updates, dependency bumps that pass `cargo test` cleanly. When in doubt, branch.
+
+### Naming
+
+- `feat/<topic>` — new functionality (e.g. `feat/policy-engine`)
+- `fix/<topic>` — bug fix
+- `chore/<topic>` — tooling, dependency, infrastructure
+- `docs/<topic>` — documentation-only changes that warrant a PR (cross-doc rewrites, etc.)
+
+Use kebab-case after the prefix.
+
+### PR flow
+
+1. Branch from up-to-date `main`:
+   ```bash
+   git checkout main && git pull origin main
+   git checkout -b feat/<topic>
+   ```
+2. Commit incrementally. Keep `cargo test` and `tools/e2e.sh` green at every commit you push, not just at PR time.
+3. Open the PR (`make pr` or `gh pr create --base main --fill --web`). Title follows the same `feat:` / `fix:` / `chore:` / `docs:` prefix; body explains *why*, not what.
+4. Merge style: prefer **squash** for feature branches with messy history, **rebase** when the per-commit history is meaningful.
+5. Release happens from `main` after the merge: `make release-minor` (or `release-patch` / `release-major`).
+
+### Things to never do
+
+- Force-push to `main` (or to any branch someone else has based work on).
+- Skip hooks (`--no-verify`) or signing (`--no-gpg-sign`) without an explicit go-ahead.
+- Run `git commit` or `git push` from an automated agent without the user asking. Agents prepare branches, write commits as drafts in their commit message buffer, and stop short of `push` unless the user explicitly says push.
 
 ## Documentation Policy
 
