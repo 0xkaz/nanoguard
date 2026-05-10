@@ -2,9 +2,9 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] — 2026-05-10
+## [0.5.0] — 2026-05-10
 
-Three new defenses arrive together: Spotlighting (indirect prompt injection), output JSON Schema validation, and a Tool Gate that inspects every LLM-emitted tool call before the application executes it. All are off by default (existing configs are unaffected) and slot into the existing `src/guard/` pipeline as separate, single-responsibility modules.
+JSON Schema validation on responses + a Tool Gate that inspects every LLM-emitted tool call before the application executes it. Plus tooling: `tools/release.sh` / `tools/push.sh`, an end-to-end suite that boots a mock backend internally, and a documentation policy in CLAUDE.md.
 
 ### Added — JSON Schema validation (output)
 
@@ -22,24 +22,16 @@ Three new defenses arrive together: Spotlighting (indirect prompt injection), ou
 - **Three decisions** flow back to the proxy: `Allow`, `Deny { reason }`, `Sanitize { redacted_args }`. Denied tool calls are removed from `tool_calls` and surfaced under `message.nanoguard_denied_tools` so the client can react.
 - **Streaming pass-through**: tool gate currently runs only on non-streaming responses. Streaming tool-call detection (delta accumulation + `finish_reason: "tool_calls"` evaluation) is a follow-up.
 
-### Added — Spotlighting (indirect prompt injection defense)
+### Added — Tooling
 
-- Three transforms in `src/guard/spotlight.rs`:
-  - `datamarking` (default): replace ASCII whitespace inside untrusted content with `^`.
-  - `delimiting`: wrap with `<<UNTRUSTED>>` ... `<</UNTRUSTED>>`.
-  - `encoding`: base64-encode (strongest isolation, lowest answer quality).
-- A method-specific system rider is automatically injected (or appended to an existing system message) so the model knows what the markers mean.
-- `untrusted_roles` is configurable; defaults to `["tool"]`. User / system / assistant content is never touched.
-- Pipeline order: `matcher → PII redact / Vault → spotlight → backend forward`. Spotlighting runs after PII redaction so placeholders are already in place.
+- **`tools/release.sh`** automates `cargo set-version` (cargo-edit) → `cargo test` → `tools/e2e.sh` → commit → tag → optional push, with `patch` / `minor` / `major` / explicit-version arguments and `--no-push` / `--skip-e2e` / `--dry-run` flags.
+- **`tools/push.sh`** publishes `main` and any locally-existing tags reachable from `HEAD` that are not yet on origin. Refuses with a dirty working tree.
+- **`Makefile`** gains `release-patch` / `release-minor` / `release-major` / `push` targets.
+- **`make e2e`** now drives `tools/e2e.sh`, which boots the mock backend and a release nanoguard binary internally — no servers need to be running first. The previous pre-running-server flow is preserved as `make e2e-live`.
 
 ### Configuration additions
 
 ```toml
-[input.spotlight]
-enabled = false
-method = "datamarking"          # "datamarking" | "delimiting" | "encoding"
-untrusted_roles = ["tool"]
-
 [output.schema]
 enabled = false
 on_violation = "log"            # "reject" | "log" | "repair"
@@ -62,18 +54,27 @@ tool_name = "send_email"
 schema_path = "schemas/send_email.json"
 ```
 
+### Documentation
+
+- **CLAUDE.md** gains a Documentation Policy section requiring every file under `docs/design/` and `docs/research/` to start with a status marker (`shipped` / `partial` / `proposed` / `deprecated`), and a code-doc sync contract.
+- **CLAUDE.md** dependency list refreshed to match the actual Cargo.toml; module table reflects current `src/` layout (proxy, matcher, budget, audit, admin, config, guard reserved for higher-level pipeline components).
+
 ### Tests
 
-- 30 new unit tests across `src/guard/spotlight.rs` (9), `src/guard/schema.rs` (9), `src/guard/tool_gate.rs` (12).
-- e2e scenarios extended from 19 to 26 assertions across 12 scenarios. New: spotlight datamarking + rider injection (10), output schema log-only violation (11), tool gate deny / sanitize / allow round-trip (12).
-- e2e scaffolding (`tools/mock_backend.py`) gained a `TOOL:` hook so the mock can deterministically emit tool_calls; `tools/e2e.sh` now uses `jq -n` to build request bodies safely (avoids shell quoting bugs).
+- 21 new unit tests: `src/guard/schema.rs` (9), `src/guard/tool_gate.rs` (12).
+- e2e suite extended from 22 to 26 assertions across 12 scenarios. New: output schema log-only violation (11), tool gate deny / allow / sanitize round-trip (12).
+- `tools/mock_backend.py` gained a `TOOL:` hook so a test can deterministically request that the mock emit a specific `tool_calls` payload.
+- `tools/e2e.sh` now uses `jq -n` to construct request bodies, which fixes a shell-quoting bug that bit scenario 12 during development.
 
 ### Notes
 
-- All three features are opt-in and do not change behavior of existing deployments.
-- Spotlighting is request-side only; it does not affect the response path.
-- Tool Gate runs after Vault deanonymize, so PII placeholders set on input have already been resolved by the time arguments are scanned. Future work may move the scan earlier so secrets that the LLM hallucinates into arguments are caught before deanonymize completes.
-- Anthropic `/v1/messages` does not yet apply Spotlighting or Tool Gate (their tool-result message shapes warrant a separate pass).
+- All new features are opt-in. Existing deployments (`reversible = false`, `tools.enabled = false`, `output.schema.enabled = false`) are unaffected.
+- Tool Gate runs after Vault deanonymize, so PII placeholders set on input have already been resolved by the time tool arguments are scanned. A future iteration may move the scan earlier to also catch secrets the LLM hallucinates into arguments before deanonymize completes.
+- Anthropic `/v1/messages` does not yet route through Tool Gate (its tool-result shape warrants a separate pass).
+
+## [0.4.0] — 2026-05-10
+
+Indirect prompt injection defense via Spotlighting. Untrusted message content (RAG chunks delivered in `tool` / `function` role messages) is wrapped or transformed so the LLM treats it as data rather than instructions.
 
 ### Added — Spotlighting
 
