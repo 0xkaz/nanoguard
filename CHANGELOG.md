@@ -2,6 +2,32 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — release flow is PR-driven
+
+`main` is protected by a ruleset (set up immediately after v0.7.0) that rejects direct pushes. The previous `tools/release.sh` committed straight to `main` and tripped the rule on every release. The flow is now two scripts:
+
+- **`tools/release.sh`** runs `make preflight`, bumps `Cargo.toml` + `Cargo.lock` via `cargo set-version`, promotes `CHANGELOG.md`'s `## [Unreleased]` block to a dated `## [<new>]` section (or prepends a stub if there isn't one), commits on a fresh `release/v<new>` branch, pushes the branch, and opens a PR through `gh pr create`. It never commits to `main` and never tags.
+- **`tools/release-tag.sh`** is a separate step. After the release PR has merged, it switches to `main`, fast-forward-pulls, validates that `Cargo.toml` and `CHANGELOG.md` agree on the version, then creates and pushes the `v<new>` annotated tag against the merge commit. Splitting tagging out of the bump step keeps the tag aligned with the merge SHA — even when the PR is squashed.
+
+Both scripts are surfaced through Make: `make release-{patch,minor,major}` for step 1, `make release-tag` for step 2.
+
+### Changed — `make preflight` now requires `cargo-audit`
+
+Previously preflight printed a warning and skipped `cargo audit` when the binary wasn't installed. CI's `security audit` job runs it unconditionally, so skipping it locally meant advisories could surface only after a PR was opened. Preflight now exits with an actionable install hint instead.
+
+Install once per machine:
+
+```bash
+cargo install cargo-audit
+```
+
+### Docs
+
+- `CLAUDE.md > Branch Policy` gains a "Release flow" subsection describing the two-step PR-driven release.
+- `tools/README.md` rewritten to match the new flow (release.sh = step 1, release-tag.sh = step 2).
+
 ## [0.7.0] — 2026-05-11
 
 Policy Engine v1, plus several integration fixes uncovered while stress-testing the e2e suite.

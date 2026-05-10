@@ -1,7 +1,7 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit ci push release-patch release-minor release-major \
-        pr pr-web preflight
+        release-tag pr pr-web preflight
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -155,6 +155,11 @@ release-major:
 push:
 	./tools/push.sh
 
+# Tag the latest main as the current Cargo.toml version. Run AFTER a
+# release PR (created by `make release-{patch,minor,major}`) has merged.
+release-tag:
+	./tools/release-tag.sh
+
 # ── PR helpers (require `gh` CLI) ────────────────────────────────────────────
 # `make pr` opens a PR for the current branch, prefilling title / body from
 # the most recent commit. Use `make pr-web` to also open the GitHub UI in a
@@ -191,8 +196,18 @@ preflight:
 	@echo "→ cargo test"
 	cargo test --quiet
 	@echo "→ cargo audit"
-	@command -v cargo-audit >/dev/null 2>&1 || { echo "warning: cargo-audit not installed; install with: cargo install cargo-audit"; }
-	@command -v cargo-audit >/dev/null 2>&1 && cargo audit || true
+	@command -v cargo-audit >/dev/null 2>&1 || { \
+	    echo ""; \
+	    echo "error: cargo-audit not installed."; \
+	    echo "       install once with:"; \
+	    echo "           cargo install cargo-audit"; \
+	    echo ""; \
+	    echo "       cargo-audit is required by preflight because the CI"; \
+	    echo "       'security audit' job runs it; failures here surface"; \
+	    echo "       advisories before they break a PR."; \
+	    exit 1; \
+	}
+	cargo audit
 	@echo "→ tools/e2e.sh"
 	./tools/e2e.sh
 	@echo "✓ preflight passed"

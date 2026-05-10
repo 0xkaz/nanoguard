@@ -106,7 +106,34 @@ Use kebab-case after the prefix.
 3. **Before `make pr` (or `git push` of a branch you intend to PR), run `make preflight`.** This walks the same checks the CI runs — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo audit`, and `tools/e2e.sh` — so you catch lint and audit failures locally instead of after CI has already opened a red status check on the PR. `cargo test` alone is not enough; CI's lint job has caught real issues that `cargo test` did not (e.g. `should_implement_trait`, `module_inception`, `manual_div_ceil`).
 4. Open the PR (`make pr` or `gh pr create --base main --fill --web`). Title follows the same `feat:` / `fix:` / `chore:` / `docs:` prefix; body explains *why*, not what.
 5. Merge style: prefer **squash** for feature branches with messy history, **rebase** when the per-commit history is meaningful.
-6. Release happens from `main` after the merge: `make release-minor` (or `release-patch` / `release-major`).
+6. Release goes through its own PR (see "Release flow" below).
+
+### Release flow
+
+`main` is protected by a ruleset that rejects direct pushes from v0.7.0 onward, so a release is itself a PR.
+
+```bash
+# from up-to-date main
+make release-minor      # patch / minor / major / "<X.Y.Z>" all work
+```
+
+`tools/release.sh` will:
+
+1. Run `make preflight` (fmt / clippy / test / audit / e2e).
+2. `cargo set-version <new>` to bump `Cargo.toml` + `Cargo.lock`.
+3. Promote the existing `## [Unreleased]` block in `CHANGELOG.md` to `## [<new>] — <date>`, or prepend a stub if there isn't one. The script pauses so you can fill in the section before it commits.
+4. Commit on a fresh `release/v<new>` branch (never on `main`).
+5. Push the branch and open a PR via `gh pr create`.
+
+Once that PR passes CI and is merged on `main`:
+
+```bash
+make release-tag        # delegates to tools/release-tag.sh
+```
+
+`tools/release-tag.sh` switches to `main`, fast-forward-pulls, validates that `Cargo.toml` and `CHANGELOG.md` carry the expected version, then creates and pushes the `v<new>` annotated tag against the merge commit. Tagging is **separate from the release commit** so the tag tracks the merge SHA, which is what GitHub Releases and `git describe` consumers expect — even when the PR is squashed by the merge button.
+
+Never tag inside `tools/release.sh`. Never push tags before the release PR has merged.
 
 ### Why CI parity matters
 

@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
-# Cut a new release: bump version, run tests + e2e, commit, tag, push.
+# Cut a new release through a PR.
 #
 # Usage:
-#   ./tools/release.sh patch        # 0.3.0 → 0.3.1
-#   ./tools/release.sh minor        # 0.3.0 → 0.4.0
-#   ./tools/release.sh major        # 0.3.0 → 1.0.0
-#   ./tools/release.sh 0.4.0-rc.1   # explicit version
+#   ./tools/release.sh patch        # 0.7.0 → 0.7.1
+#   ./tools/release.sh minor        # 0.7.0 → 0.8.0
+#   ./tools/release.sh major        # 0.7.0 → 1.0.0
+#   ./tools/release.sh 0.8.0-rc.1   # explicit version
 #
 # Flags:
-#   --no-push            stop after tagging (do `tools/push.sh` later)
-#   --skip-e2e           skip tools/e2e.sh (cargo test still runs)
-#   --skip-tests         skip cargo test AND e2e (useful for docs-only bumps)
+#   --skip-preflight     skip cargo fmt/clippy/test/audit/e2e (NOT recommended)
+#   --skip-pr            stop after creating the release branch (don't run gh)
 #   --dry-run            print the plan and exit without changing anything
 #
-# Preconditions: clean working tree, on `main`, all changes for this release
-# already committed. The script uses `cargo set-version` (cargo-edit) to bump
-# Cargo.toml + Cargo.lock, runs the test suite, prepends a CHANGELOG entry
-# stub, and lets you edit the CHANGELOG before committing.
+# Flow:
+#   1. preflight (fmt + clippy + test + audit + e2e)
+#   2. cargo set-version (bumps Cargo.toml + Cargo.lock)
+#   3. CHANGELOG.md: rename [Unreleased] → [<new>] or prepend a stub
+#   4. commit on a fresh release/v<new> branch (NOT main)
+#   5. push the branch and open a PR via `gh`
 #
-# Install cargo-edit if needed:
-#   cargo install cargo-edit
+# After the PR is merged on main, run `make release-tag` to create and
+# push the v<new> tag pointing at the merge commit.
+#
+# Background: from v0.7.0 onward, main is protected by a ruleset that
+# rejects direct pushes. The previous flow that committed straight to
+# main and then pushed the tag tripped that rule on every release. This
+# script switches to PR-driven releases so the same protection applies
+# to the version bump itself.
 
 set -euo pipefail
 
@@ -29,20 +36,18 @@ cd "$ROOT"
 # --- arg parsing -----------------------------------------------------------
 
 BUMP=""
-DO_PUSH=1
-RUN_E2E=1
-RUN_TESTS=1
+DO_PR=1
+SKIP_PREFLIGHT=0
 DRY_RUN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         patch|minor|major) BUMP="$1"; shift ;;
-        --no-push)   DO_PUSH=0; shift ;;
-        --skip-e2e)  RUN_E2E=0; shift ;;
-        --skip-tests) RUN_TESTS=0; RUN_E2E=0; shift ;;
-        --dry-run)   DRY_RUN=1; shift ;;
+        --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
+        --skip-pr)        DO_PR=0; shift ;;
+        --dry-run)        DRY_RUN=1; shift ;;
         -h|--help)
-            sed -n '2,17p' "$0" | sed 's/^# \?//'
+            sed -n '2,28p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         [0-9]*) BUMP="explicit:$1"; shift ;;
@@ -64,16 +69,23 @@ if ! cargo set-version --help > /dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v gh > /dev/null 2>&1 && [ "$DO_PR" -eq 1 ]; then
+    echo "error: \`gh\` CLI not found but --skip-pr was not given." >&2
+    echo "       install: https://cli.github.com  or pass --skip-pr" >&2
+    exit 1
+fi
+
 if [ -n "$(git status --porcelain)" ]; then
     echo "error: working tree has uncommitted changes:" >&2
     git status --short >&2
     exit 1
 fi
 
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-if [ "$BRANCH" != "main" ]; then
-    echo "warning: current branch is '$BRANCH', not 'main'"
-    read -r -p "release from '$BRANCH' anyway? [y/N] " ans
+START_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$START_BRANCH" != "main" ]; then
+    echo "warning: starting from '$START_BRANCH', not 'main'."
+    echo "  release branches are usually cut from main."
+    read -r -p "  proceed from '$START_BRANCH' anyway? [y/N] " ans
     case "$ans" in y|Y|yes|YES) ;; *) echo "aborted"; exit 0 ;; esac
 fi
 
@@ -89,7 +101,6 @@ if [[ "$BUMP" == explicit:* ]]; then
     NEW="${BUMP#explicit:}"
 else
     IFS='.' read -r MAJ MIN PAT <<<"$CURRENT"
-    # Strip pre-release suffix from PAT if any (e.g. "1-rc.1" → "1").
     PAT="${PAT%%-*}"
     case "$BUMP" in
         patch) NEW="$MAJ.$MIN.$((PAT + 1))" ;;
@@ -99,19 +110,24 @@ else
 fi
 
 TAG="v$NEW"
+RELEASE_BRANCH="release/$TAG"
 
-# Refuse if tag already exists (locally or on origin).
 git fetch --tags origin > /dev/null 2>&1 || true
 if git rev-parse --verify --quiet "$TAG" > /dev/null; then
     echo "error: tag $TAG already exists locally" >&2
     exit 1
 fi
+if git rev-parse --verify --quiet "refs/remotes/origin/$RELEASE_BRANCH" > /dev/null; then
+    echo "error: branch $RELEASE_BRANCH already exists on origin" >&2
+    echo "  delete it first with: git push origin :$RELEASE_BRANCH" >&2
+    exit 1
+fi
 
-echo "bump:    $CURRENT  →  $NEW   (tag: $TAG)"
-echo "branch:  $BRANCH"
-echo "tests:   $([ "$RUN_TESTS" -eq 1 ] && echo cargo test || echo skip)"
-echo "e2e:     $([ "$RUN_E2E" -eq 1 ] && echo tools/e2e.sh || echo skip)"
-echo "push:    $([ "$DO_PUSH" -eq 1 ] && echo "main + $TAG" || echo "skip (use tools/push.sh)")"
+echo "bump:    $CURRENT  →  $NEW"
+echo "tag:     $TAG (created later by \`make release-tag\` after PR merge)"
+echo "branch:  $START_BRANCH  →  $RELEASE_BRANCH"
+echo "preflight: $([ "$SKIP_PREFLIGHT" -eq 1 ] && echo skip || echo "fmt + clippy + test + audit + e2e")"
+echo "PR:      $([ "$DO_PR" -eq 1 ] && echo "gh pr create --base main" || echo "skip")"
 echo ""
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -122,19 +138,34 @@ fi
 read -r -p "proceed? [y/N] " ans
 case "$ans" in y|Y|yes|YES) ;; *) echo "aborted"; exit 0 ;; esac
 
-# --- 1. bump Cargo.toml + Cargo.lock --------------------------------------
+# --- 1. preflight ----------------------------------------------------------
 
-# `cargo set-version` updates Cargo.toml and refreshes Cargo.lock atomically.
+if [ "$SKIP_PREFLIGHT" -eq 0 ]; then
+    echo "→ preflight"
+    make preflight
+fi
+
+# --- 2. branch + bump + CHANGELOG -----------------------------------------
+
+echo "→ creating $RELEASE_BRANCH"
+git checkout -b "$RELEASE_BRANCH"
+
+echo "→ cargo set-version $NEW"
 cargo set-version "$NEW"
-
-# --- 2. CHANGELOG stub -----------------------------------------------------
 
 DATE="$(date +%Y-%m-%d)"
 if [ -f CHANGELOG.md ]; then
-    if ! grep -q "^## \[$NEW\]" CHANGELOG.md; then
+    if grep -q "^## \[$NEW\]" CHANGELOG.md; then
+        echo "→ CHANGELOG already has [$NEW] section, leaving as-is"
+    elif grep -q "^## \[Unreleased\]" CHANGELOG.md; then
+        # Promote the [Unreleased] section to [<new>] — date it today.
+        echo "→ promoting [Unreleased] → [$NEW] in CHANGELOG"
+        sed -i.bak "s/^## \[Unreleased\].*/## [$NEW] — $DATE/" CHANGELOG.md
+        rm CHANGELOG.md.bak
+    else
+        echo "→ prepending [$NEW] stub to CHANGELOG"
         TMP="$(mktemp)"
         {
-            # Keep top-of-file preamble (everything before the first version section).
             awk '
                 /^## \[/ { exit }
                 { print }
@@ -145,7 +176,6 @@ if [ -f CHANGELOG.md ]; then
 <!-- TODO: summarize this release. Delete this stub if intentionally empty. -->
 
 EOF
-            # Then the rest of the file (existing version sections).
             awk '
                 BEGIN { skipping = 1 }
                 /^## \[/ { skipping = 0 }
@@ -154,57 +184,53 @@ EOF
         } > "$TMP"
         mv "$TMP" CHANGELOG.md
         echo ""
-        echo "→ A stub for v$NEW has been prepended to CHANGELOG.md."
-        echo "  Edit it in another shell, then return here to continue."
+        echo "  Edit CHANGELOG.md in another shell to fill in v$NEW notes."
         read -r -p "  press ENTER when CHANGELOG.md is ready (or Ctrl+C to abort)..."
     fi
 fi
 
-# --- 3. tests --------------------------------------------------------------
-
-if [ "$RUN_TESTS" -eq 1 ]; then
-    echo "→ cargo test"
-    cargo test --quiet
-fi
-
-if [ "$RUN_E2E" -eq 1 ]; then
-    echo "→ cargo build --release (for e2e)"
-    cargo build --release --quiet
-    echo "→ tools/e2e.sh"
-    ./tools/e2e.sh
-fi
-
-# --- 4. commit + tag -------------------------------------------------------
+# --- 3. commit -------------------------------------------------------------
 
 git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "release: v$NEW
 
 See CHANGELOG.md for details."
 
-git tag -a "$TAG" -m "v$NEW
-
-See CHANGELOG.md for release notes."
-
 echo ""
-echo "✓ committed and tagged $TAG"
+echo "✓ release branch ready"
 echo "  $(git log --oneline -1)"
 
-# --- 5. push ---------------------------------------------------------------
+# --- 4. push + PR ----------------------------------------------------------
 
-if [ "$DO_PUSH" -eq 1 ]; then
+if [ "$DO_PR" -eq 1 ]; then
     echo ""
-    read -r -p "push main and $TAG to origin? [y/N] " ans
-    case "$ans" in
-        y|Y|yes|YES)
-            git push origin "$BRANCH"
-            git push origin "$TAG"
-            echo "✓ pushed"
-            ;;
-        *)
-            echo "skipped push. Run \`./tools/push.sh\` later."
-            ;;
+    read -r -p "push $RELEASE_BRANCH and open a PR? [Y/n] " ans
+    case "$ans" in n|N|no|NO)
+        echo ""
+        echo "skipped push. run later:"
+        echo "  git push -u origin $RELEASE_BRANCH"
+        echo "  gh pr create --base main --head $RELEASE_BRANCH --title 'release: v$NEW' --fill"
+        exit 0
+        ;;
     esac
+    git push -u origin "$RELEASE_BRANCH"
+    gh pr create \
+        --base main \
+        --head "$RELEASE_BRANCH" \
+        --title "release: v$NEW" \
+        --body "Cuts v$NEW from main. See CHANGELOG.md for the v$NEW section.
+
+After this PR is merged, run \`make release-tag\` from main to create and push the \`$TAG\` tag.
+
+Generated by \`tools/release.sh\`."
+    echo ""
+    echo "✓ PR opened. Next steps:"
+    echo "  1. wait for CI to go green"
+    echo "  2. merge the PR"
+    echo "  3. \`make release-tag\` to create and push $TAG"
 else
     echo ""
-    echo "skipped push (--no-push). Run \`./tools/push.sh\` when ready."
+    echo "skipped PR (--skip-pr). run later:"
+    echo "  git push -u origin $RELEASE_BRANCH"
+    echo "  gh pr create --base main --head $RELEASE_BRANCH"
 fi
