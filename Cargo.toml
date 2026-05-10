@@ -1,6 +1,6 @@
 [package]
 name = "nanoguard"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Nano-fast CPU-only offline-first LLM guardrails proxy"
 license = "MIT"
@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "nanoguard"
 path = "src/main.rs"
+
+[[bin]]
+name = "nanoguard-eval"
+path = "src/bin/nanoguard-eval.rs"
 
 [dependencies]
 axum = "0.7"

@@ -235,6 +235,12 @@ pub async fn chat_completions(
                 after_filter
             }
         });
+        // Streaming tool gate accumulator. None means the gate is disabled
+        // for this request; otherwise events are inspected as they pass.
+        let mut stream_gate = state
+            .tool_gate
+            .as_ref()
+            .map(|g| crate::guard::sse_tool_gate::StreamingToolGate::new(Arc::clone(g)));
         let event_stream = body_stream.map_err(std::io::Error::other);
         let filtered = async_stream::stream! {
             futures_util::pin_mut!(event_stream);
@@ -249,6 +255,43 @@ pub async fn chat_completions(
                 };
                 if let Some(u) = sse::SseFilter::<fn(&str) -> String>::try_extract_usage(&chunk) {
                     last_usage = Some(u);
+                }
+                // Streaming tool-call inspection. We re-parse each SSE event
+                // payload to feed the accumulator. On a Deny outcome the
+                // accumulator emits a synthetic `tool_call_denied` SSE event
+                // and we stop forwarding upstream chunks.
+                if let Some(gate) = stream_gate.as_mut() {
+                    if let Ok(text) = std::str::from_utf8(&chunk) {
+                        for raw_event in text.split("\n\n") {
+                            for line in raw_event.split('\n') {
+                                let line = line.strip_suffix('\r').unwrap_or(line);
+                                let payload = match line.strip_prefix("data:") {
+                                    Some(p) => p.trim_start(),
+                                    None => continue,
+                                };
+                                if payload == "[DONE]" || payload.is_empty() {
+                                    continue;
+                                }
+                                let Ok(val): Result<Value, _> = serde_json::from_str(payload)
+                                else {
+                                    continue;
+                                };
+                                if let crate::guard::sse_tool_gate::StreamGateOutcome::Deny {
+                                    reasons,
+                                } = gate.observe(&val)
+                                {
+                                    warn!(
+                                        "streaming tool gate denied {} call(s); ending stream",
+                                        reasons.len()
+                                    );
+                                    yield Ok(
+                                        crate::guard::sse_tool_gate::StreamingToolGate::deny_event(&reasons),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
                 if !output_enabled {
                     yield Ok(chunk);
@@ -470,7 +513,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
 /// `function.arguments` JSON string. If a denial happens, a synthetic
 /// `nanoguard_denied_tools` entry is added to message.metadata so the
 /// caller can see what was dropped.
-fn apply_tool_gate(resp: &mut Value, gate: &crate::guard::tool_gate::ToolGate) {
+pub(crate) fn apply_tool_gate(resp: &mut Value, gate: &crate::guard::tool_gate::ToolGate) {
     use crate::guard::tool_gate::ToolDecision;
     let Some(choices) = resp.get_mut("choices").and_then(|c| c.as_array_mut()) else {
         return;

@@ -8,5 +8,6 @@ pub mod deanonymize;
 pub mod schema;
 pub mod spotlight;
 pub mod sse_deanon;
+pub mod sse_tool_gate;
 pub mod tool_gate;
 pub mod vault;

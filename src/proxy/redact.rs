@@ -42,10 +42,18 @@ pub struct Redactor {
 }
 
 struct RedactRule {
-    #[allow(dead_code)] // used in upcoming per-entity action map
     entity: String,
     placeholder: String, // pre-formatted bare placeholder; ignored for indexed styles
     regex: Regex,
+}
+
+/// One regex match emitted by `Redactor::find_matches`.
+#[derive(Debug, Clone)]
+pub struct RedactMatch {
+    pub entity: String,
+    pub start: usize,
+    pub end: usize,
+    pub matched_text: String,
 }
 
 impl Redactor {
@@ -177,6 +185,24 @@ impl Redactor {
     /// All entity names known to this redactor.
     pub fn entity_names(&self) -> std::collections::HashSet<String> {
         self.rules.iter().map(|r| r.entity.clone()).collect()
+    }
+
+    /// Return every match in `text` with its entity name and offsets. Used
+    /// by the evaluation harness (`nanoguard-eval`) and downstream tooling
+    /// that wants to know *what* matched, not just whether anything did.
+    pub fn find_matches(&self, text: &str) -> Vec<RedactMatch> {
+        let mut out = Vec::new();
+        for rule in &self.rules {
+            for m in rule.regex.find_iter(text) {
+                out.push(RedactMatch {
+                    entity: rule.entity.clone(),
+                    start: m.start(),
+                    end: m.end(),
+                    matched_text: m.as_str().to_string(),
+                });
+            }
+        }
+        out
     }
 
     /// Redact `text` using a Vault, so each match is recorded as a

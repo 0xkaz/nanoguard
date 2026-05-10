@@ -2,6 +2,41 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-10
+
+Three follow-ups that finish the Phase 4 trio (Spotlighting + Schema + Tool Gate) on every supported endpoint, plus a recognizer evaluation harness for tuning dictionary packs.
+
+### Added — Anthropic parity
+
+- `/v1/messages` now routes responses through Tool Gate and Schema Validator. Denied tool calls drop out of the response; surviving calls become `{"type":"tool_use", ...}` blocks in the Anthropic content array. A `nanoguard_denied_tools` block is appended when anything was rejected.
+- `/v1/messages` now applies Spotlighting (datamarking / delimiting / encoding) to untrusted-role messages after the Anthropic→OpenAI normalization step, matching the behavior of `/v1/chat/completions`.
+- Schema rules can now target `/v1/messages` (in addition to `/v1/chat/completions`) via `[[output.schema.rules]] endpoint = "/v1/messages"`.
+
+### Added — Streaming Tool Gate
+
+- `src/guard/sse_tool_gate.rs` — new accumulator that walks `choices[].delta.tool_calls[]` events, reassembles partial tool calls keyed by index, and feeds the completed call to the existing `ToolGate` once `finish_reason: "tool_calls"` arrives.
+- On a Deny outcome the proxy emits a synthetic `data: {"error":{"type":"tool_call_denied", ...}}` event followed by `data: [DONE]`, terminating the stream so the client cannot execute a denied tool.
+- `Sanitize` is degraded to `Allow` in the streaming path: by the time the full arguments are visible, the delta chunks carrying those arguments have already been forwarded. Sanitize stays available on the non-streaming path. Documented in the module header.
+
+### Added — Recognizer evaluation harness (`nanoguard-eval`)
+
+- New binary `nanoguard-eval` (under `src/bin/nanoguard-eval.rs`) runs the request-side `Redactor` over a labeled JSONL corpus and reports per-entity Precision / Recall / F1 plus the totals.
+- Surfaces the top false positives (detected but not in the gold set) and top false negatives (missed annotations) for diagnostic use.
+- Two match modes: `strict` (exact start/end + entity match) and `lenient` (overlap; default).
+- Optional `--json <path>` writes a structured report for CI gating; the exit code is non-zero when at least one entity has F1=0 with annotations present.
+- New public API `Redactor::find_matches(text) -> Vec<RedactMatch>` exposes match positions + entity names, which the harness consumes and which downstream tooling (audit metadata, decision-id schemas) can also use.
+
+### Tests
+
+- 132 unit tests in total. New: 5 in `sse_tool_gate.rs` (delta accumulation across multi-event tool calls, deny event format, multi-tool responses, no-op events).
+- e2e suite extended from 26 to 29 assertions across 14 scenarios. New: scenario 13 verifies Anthropic redaction still works with the tool gate enabled; scenario 14 invokes `nanoguard-eval` against a tiny corpus.
+
+### Notes
+
+- Streaming sanitize remains a deliberate gap. A future iteration could buffer the entire tool-call delta sequence before forwarding any of it, at the cost of streaming latency.
+- The eval harness reads a flat JSONL corpus today. Entity-name aliasing (e.g. mapping Presidio's `EMAIL_ADDRESS` to nanoguard's `EMAIL`) is not yet implemented; corpora must use nanoguard entity names directly.
+- Tool Gate still does not cover Anthropic streaming responses; that is a follow-up once Anthropic streaming becomes a primary deployment path.
+
 ## [0.5.0] — 2026-05-10
 
 JSON Schema validation on responses + a Tool Gate that inspects every LLM-emitted tool call before the application executes it. Plus tooling: `tools/release.sh` / `tools/push.sh`, an end-to-end suite that boots a mock backend internally, and a documentation policy in CLAUDE.md.

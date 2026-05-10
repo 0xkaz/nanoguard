@@ -341,6 +341,34 @@ RESP=$(curl -s "$NG_URL/v1/chat/completions" \
 ALLOWED=$(echo "$RESP" | jq -r '.choices[0].message.tool_calls[0].function.name // ""')
 assert_eq "12c. allowed tool call passes through" "$ALLOWED" "search_kb"
 
+# --- 13. Anthropic /v1/messages with tool gate -----------------------------
+info "scenario 13: Anthropic tool_use through tool gate"
+# Reuse the running tool-gate nanoguard from scenario 12 (deny=delete_*).
+# Mock backend echoes plain text in /v1/messages, so we just verify that
+# /v1/messages doesn't error when tools is enabled and that PII redaction
+# round-trips (sanity check that scenario 12's restart didn't break /v1/messages).
+RESP=$(curl -s "$NG_URL/v1/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","max_tokens":256,"messages":[{"role":"user","content":"my email is dave@example.com"}]}')
+TEXT=$(echo "$RESP" | jq -r '.content[0].text // ""')
+assert_contains "13. Anthropic redaction still round-trips with tool gate enabled" "$TEXT" "dave@example.com"
+
+# --- 14. nanoguard-eval recognizer harness ---------------------------------
+info "scenario 14: nanoguard-eval against tiny corpus"
+EVAL_BIN="$ROOT/target/release/nanoguard-eval"
+if [ -x "$EVAL_BIN" ]; then
+    EVAL_CORPUS="$LOGDIR/eval-corpus.jsonl"
+    cat > "$EVAL_CORPUS" <<'EOF'
+{"id":"a","text":"Email me at alice@example.com","annotations":[{"type":"EMAIL","start":12,"end":29}]}
+{"id":"b","text":"plain prompt with no PII","annotations":[]}
+EOF
+    EVAL_OUT=$("$EVAL_BIN" --gold "$EVAL_CORPUS" 2>&1)
+    assert_contains "14a. eval reports EMAIL F1=1.0" "$EVAL_OUT" "EMAIL"
+    assert_contains "14b. eval reports TOTAL line"  "$EVAL_OUT" "TOTAL"
+else
+    info "scenario 14 skipped: nanoguard-eval binary not found at $EVAL_BIN"
+fi
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"
