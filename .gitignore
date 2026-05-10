@@ -1,5 +1,9 @@
 _*.md
 
+# Audit / runtime artifacts
+nanoguard-audit*.jsonl
+nanoguard*.db
+
 
 # Added by cargo
 

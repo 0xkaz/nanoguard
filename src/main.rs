@@ -87,6 +87,68 @@ async fn main() -> Result<()> {
         tracing::info!("spotlight: disabled");
         None
     };
+
+    let schema = if cfg.output.schema.enabled {
+        use nanoguard::guard::schema::{load_rules, RuleSpec, SchemaValidator, ViolationAction};
+        let specs: Vec<RuleSpec> = cfg
+            .output
+            .schema
+            .rules
+            .iter()
+            .map(|r| RuleSpec {
+                endpoint: r.endpoint.clone(),
+                model_pattern: r.model_pattern.clone(),
+                schema_path: r.schema_path.clone(),
+                name: r.name.clone(),
+            })
+            .collect();
+        let rules = load_rules(&specs)?;
+        let action = ViolationAction::from_str(&cfg.output.schema.on_violation);
+        tracing::info!(
+            "output schema: enabled ({} rule(s), on_violation={:?})",
+            rules.len(),
+            action
+        );
+        Some(Arc::new(SchemaValidator::new(rules, action)))
+    } else {
+        tracing::info!("output schema: disabled");
+        None
+    };
+
+    let tool_gate = if cfg.tools.enabled {
+        use nanoguard::guard::tool_gate::ToolGate;
+        use std::collections::{HashMap, HashSet};
+        let mut schemas = HashMap::new();
+        for spec in &cfg.tools.schemas {
+            let raw = std::fs::read_to_string(&spec.schema_path)?;
+            let schema_json: serde_json::Value = serde_json::from_str(&raw)?;
+            let validator = jsonschema::draft202012::new(&schema_json)?;
+            schemas.insert(spec.tool_name.clone(), validator);
+        }
+        let reject: HashSet<String> = cfg.tools.reject_entities.iter().cloned().collect();
+        let mask: HashSet<String> = cfg.tools.mask_entities.iter().cloned().collect();
+        let gate = ToolGate::new(
+            cfg.tools.allow.clone(),
+            cfg.tools.deny.clone(),
+            schemas,
+            redactor.clone(),
+            reject,
+            mask,
+        );
+        tracing::info!(
+            "tool gate: enabled (allow={:?}, deny={} pattern(s), schemas={}, reject_entities={}, mask_entities={})",
+            cfg.tools.allow,
+            cfg.tools.deny.len(),
+            cfg.tools.schemas.len(),
+            cfg.tools.reject_entities.len(),
+            cfg.tools.mask_entities.len(),
+        );
+        Some(Arc::new(gate))
+    } else {
+        tracing::info!("tool gate: disabled");
+        None
+    };
+
     let backend = backend::Backend::new(cfg.backend.clone());
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
 
@@ -116,6 +178,8 @@ async fn main() -> Result<()> {
         redactor,
         pii_actions,
         spotlight,
+        schema,
+        tool_gate,
         backend,
         http_client,
         budget,

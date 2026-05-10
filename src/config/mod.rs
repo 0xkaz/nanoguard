@@ -15,6 +15,8 @@ pub struct Config {
     pub budget: BudgetConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -116,6 +118,49 @@ pub struct OutputConfig {
     pub enabled: bool,
     #[serde(default)]
     pub pii: PiiConfig,
+    #[serde(default)]
+    pub schema: OutputSchemaConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputSchemaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// "reject" | "log" | "repair". Reserved values map to LogOnly until
+    /// implemented.
+    #[serde(default = "default_violation_action")]
+    pub on_violation: String,
+    /// One or more rules to apply per (endpoint, model) tuple.
+    #[serde(default)]
+    pub rules: Vec<OutputSchemaRule>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputSchemaRule {
+    pub endpoint: String,
+    /// Optional regex matched against the request `model` field. Empty / absent
+    /// means "any model".
+    #[serde(default)]
+    pub model_pattern: Option<String>,
+    /// Filesystem path to a JSON Schema file (Draft 2020-12).
+    pub schema_path: String,
+    /// Optional human-readable name for logs.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+fn default_violation_action() -> String {
+    "log".to_string()
+}
+
+impl Default for OutputSchemaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            on_violation: default_violation_action(),
+            rules: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -252,6 +297,34 @@ pub enum PiiAction {
     Log,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ToolsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional allow list. If set, only matching tools pass. Wildcards (`*`)
+    /// supported as prefix or suffix.
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Per-tool JSON Schema specs.
+    #[serde(default)]
+    pub schemas: Vec<ToolSchemaSpec>,
+    /// Reject tool calls whose argument JSON contains any of these entity
+    /// names (matched against the request-side Redactor's rules).
+    #[serde(default)]
+    pub reject_entities: Vec<String>,
+    /// Mask matching entities in tool arguments instead of rejecting.
+    #[serde(default)]
+    pub mask_entities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolSchemaSpec {
+    pub tool_name: String,
+    pub schema_path: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuditConfig {
     #[serde(default)]
@@ -336,6 +409,7 @@ impl Config {
                     ..BudgetConfig::default()
                 },
                 audit: AuditConfig::default(),
+                tools: ToolsConfig::default(),
             })
         }
     }

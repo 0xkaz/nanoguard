@@ -37,8 +37,8 @@ color() {
     if [ -t 1 ]; then printf "\033[%sm%s\033[0m" "$1" "$2"; else printf "%s" "$2"; fi
 }
 
-ok()   { color 32 "PASS"; printf "  %s\n" "$1"; PASS=$((PASS + 1)); }
-ng()   { color 31 "FAIL"; printf "  %s\n" "$1"; FAIL=$((FAIL + 1)); FAIL_NAMES+=("$1"); }
+ok()   { color 32 "PASS"; printf "  %s\n" "$1"; PASS=$((PASS + 1)) || true; }
+ng()   { color 31 "FAIL"; printf "  %s\n" "$1"; FAIL=$((FAIL + 1)) || true; FAIL_NAMES+=("$1"); }
 info() { color 36 "INFO"; printf "  %s\n" "$1"; }
 
 assert_contains() {
@@ -241,6 +241,105 @@ LAST_RECV=$(grep "received:" "$LOGDIR/mock.log" | tail -1)
 assert_contains "10a. tool-role content datamarked (whitespace → ^)" "$LAST_RECV" "attacker^says^do^bad^things"
 assert_contains "10b. system rider injected" "$LAST_RECV" "untrusted data only"
 assert_not_contains "10c. user message NOT datamarked" "$LAST_RECV" "Summarize^the^result"
+
+# --- 11. JSON Schema validation (output) -----------------------------------
+info "restarting nanoguard with output schema=true for scenario 11"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+# Minimal schema requiring a "name" string field — but mock backend echoes
+# a plain "You said: ..." string, which won't even parse as JSON. Use
+# on_violation = "log" so we just verify the violation is logged, not blocked.
+SCHEMA_FILE="$LOGDIR/user_card.json"
+cat > "$SCHEMA_FILE" <<'EOF'
+{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}
+EOF
+
+SCHEMA_TOML="$LOGDIR/e2e.schema.toml"
+{
+    cat "$TOML"
+    cat <<EOF
+
+[output.schema]
+enabled = true
+on_violation = "log"
+
+[[output.schema.rules]]
+endpoint = "/v1/chat/completions"
+schema_path = "$SCHEMA_FILE"
+name = "user_card"
+EOF
+} > "$SCHEMA_TOML"
+
+NANOGUARD_CONFIG="$SCHEMA_TOML" "$BIN" > "$LOGDIR/ng.schema.log" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"hi"}]}' > /dev/null
+sleep 0.2
+NG_LOG_TAIL=$(tail -50 "$LOGDIR/ng.schema.log")
+assert_contains "11. schema violation logged" "$NG_LOG_TAIL" "schema violation"
+
+# --- 12. Tool gate (deny by name) ------------------------------------------
+info "restarting nanoguard + mock backend with tool gate for scenario 12"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+# Mock backend must be restarted so the latest TOOL: hook is picked up
+# (tests written before this scenario may have started an older mock).
+kill "$MOCK_PID" 2>/dev/null || true
+wait "$MOCK_PID" 2>/dev/null || true
+python3 "$MOCK" "$MOCK_PORT" >> "$LOGDIR/mock.log" 2>&1 &
+MOCK_PID=$!
+sleep 0.3
+
+TOOL_TOML="$LOGDIR/e2e.tools.toml"
+{
+    cat "$TOML"
+    cat <<'EOF'
+
+[tools]
+enabled = true
+deny = ["delete_*"]
+reject_entities = ["AWS_ACCESS_KEY_ID"]
+EOF
+} > "$TOOL_TOML"
+
+NANOGUARD_CONFIG="$TOOL_TOML" "$BIN" > "$LOGDIR/ng.tools.log" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# Build the request body with jq so quoting is bullet-proof.
+build_tool_request() {
+    local tool_payload="$1"
+    jq -n --arg user "TOOL:$tool_payload" \
+        '{model: "test", messages: [{role: "user", content: $user}]}'
+}
+
+# Ask the mock to emit a tool call to delete_record. nanoguard should drop it.
+TOOL_CALL_PAYLOAD='[{"id":"call_1","type":"function","function":{"name":"delete_record","arguments":"{\"id\":1}"}}]'
+RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$(build_tool_request "$TOOL_CALL_PAYLOAD")")
+DENIED=$(echo "$RESP" | jq -r '.choices[0].message.nanoguard_denied_tools[0].name // ""')
+assert_eq "12a. denied tool name surfaced" "$DENIED" "delete_record"
+KEPT_LEN=$(echo "$RESP" | jq -r '.choices[0].message.tool_calls | length')
+assert_eq "12b. denied tool call removed from tool_calls" "$KEPT_LEN" "0"
+
+# Allowed tool should pass through.
+TOOL_CALL_PAYLOAD='[{"id":"call_2","type":"function","function":{"name":"search_kb","arguments":"{\"q\":\"rust\"}"}}]'
+RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$(build_tool_request "$TOOL_CALL_PAYLOAD")")
+ALLOWED=$(echo "$RESP" | jq -r '.choices[0].message.tool_calls[0].function.name // ""')
+assert_eq "12c. allowed tool call passes through" "$ALLOWED" "search_kb"
 
 # --- summary ---------------------------------------------------------------
 

@@ -5,6 +5,8 @@
 //! deanonymize strategies, session-scoped vaults.
 
 pub mod deanonymize;
+pub mod schema;
 pub mod spotlight;
 pub mod sse_deanon;
+pub mod tool_gate;
 pub mod vault;

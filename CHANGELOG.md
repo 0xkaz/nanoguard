@@ -4,7 +4,76 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [0.4.0] — 2026-05-10
 
-Indirect prompt injection defense via Spotlighting. Untrusted message content (RAG chunks delivered in `tool` / `function` role messages) is wrapped or transformed so the LLM treats it as data rather than instructions.
+Three new defenses arrive together: Spotlighting (indirect prompt injection), output JSON Schema validation, and a Tool Gate that inspects every LLM-emitted tool call before the application executes it. All are off by default (existing configs are unaffected) and slot into the existing `src/guard/` pipeline as separate, single-responsibility modules.
+
+### Added — JSON Schema validation (output)
+
+- **`SchemaValidator`** in `src/guard/schema.rs` compiles per-route / per-model JSON Schemas (Draft 2020-12 via the `jsonschema` crate) and validates the assistant's response against the picked rule.
+- **Wrapper stripping**: leading prose and markdown fences (` ```json ... ``` `) are removed before parsing so the validator sees plain JSON.
+- **Three violation actions**: `reject` (502 to client), `log` (audit only, default), `repair` (reserved name; falls back to log with a warning until a port of `json_repair` lands).
+- **Per-route rules**: `[[output.schema.rules]]` entries match `(endpoint, model_pattern, schema_path)` so different routes / models can require different shapes.
+
+### Added — Tool Gate
+
+- **`ToolGate`** in `src/guard/tool_gate.rs` evaluates every OpenAI `tool_calls[]` and Anthropic `tool_use` block emitted by the LLM. Three layered checks:
+  1. **Allow / deny by name** with `*` wildcard prefixes/suffixes. Allow list closes the world; deny list always wins.
+  2. **JSON Schema validation** of the tool's arguments using the same `jsonschema` crate as the output validator.
+  3. **PII / secret scan** on the argument JSON via the existing `Redactor`. Configured `reject_entities` deny the call; `mask_entities` route through `Sanitize { redacted_args }`.
+- **Three decisions** flow back to the proxy: `Allow`, `Deny { reason }`, `Sanitize { redacted_args }`. Denied tool calls are removed from `tool_calls` and surfaced under `message.nanoguard_denied_tools` so the client can react.
+- **Streaming pass-through**: tool gate currently runs only on non-streaming responses. Streaming tool-call detection (delta accumulation + `finish_reason: "tool_calls"` evaluation) is a follow-up.
+
+### Added — Spotlighting (indirect prompt injection defense)
+
+- Three transforms in `src/guard/spotlight.rs`:
+  - `datamarking` (default): replace ASCII whitespace inside untrusted content with `^`.
+  - `delimiting`: wrap with `<<UNTRUSTED>>` ... `<</UNTRUSTED>>`.
+  - `encoding`: base64-encode (strongest isolation, lowest answer quality).
+- A method-specific system rider is automatically injected (or appended to an existing system message) so the model knows what the markers mean.
+- `untrusted_roles` is configurable; defaults to `["tool"]`. User / system / assistant content is never touched.
+- Pipeline order: `matcher → PII redact / Vault → spotlight → backend forward`. Spotlighting runs after PII redaction so placeholders are already in place.
+
+### Configuration additions
+
+```toml
+[input.spotlight]
+enabled = false
+method = "datamarking"          # "datamarking" | "delimiting" | "encoding"
+untrusted_roles = ["tool"]
+
+[output.schema]
+enabled = false
+on_violation = "log"            # "reject" | "log" | "repair"
+
+[[output.schema.rules]]
+endpoint = "/v1/chat/completions"
+model_pattern = "gpt-4o.*"
+schema_path = "schemas/user_card.json"
+name = "user_card"
+
+[tools]
+enabled = false
+allow = ["search_*", "read_*"]
+deny  = ["delete_*", "shell_exec"]
+reject_entities = ["AWS_ACCESS_KEY_ID", "JWT"]
+mask_entities = ["EMAIL"]
+
+[[tools.schemas]]
+tool_name = "send_email"
+schema_path = "schemas/send_email.json"
+```
+
+### Tests
+
+- 30 new unit tests across `src/guard/spotlight.rs` (9), `src/guard/schema.rs` (9), `src/guard/tool_gate.rs` (12).
+- e2e scenarios extended from 19 to 26 assertions across 12 scenarios. New: spotlight datamarking + rider injection (10), output schema log-only violation (11), tool gate deny / sanitize / allow round-trip (12).
+- e2e scaffolding (`tools/mock_backend.py`) gained a `TOOL:` hook so the mock can deterministically emit tool_calls; `tools/e2e.sh` now uses `jq -n` to build request bodies safely (avoids shell quoting bugs).
+
+### Notes
+
+- All three features are opt-in and do not change behavior of existing deployments.
+- Spotlighting is request-side only; it does not affect the response path.
+- Tool Gate runs after Vault deanonymize, so PII placeholders set on input have already been resolved by the time arguments are scanned. Future work may move the scan earlier so secrets that the LLM hallucinates into arguments are caught before deanonymize completes.
+- Anthropic `/v1/messages` does not yet apply Spotlighting or Tool Gate (their tool-result message shapes warrant a separate pass).
 
 ### Added — Spotlighting
 

@@ -382,6 +382,60 @@ pub async fn chat_completions(
             }
         }
 
+        // Tool gate: inspect each tool_call, drop denied ones, replace
+        // sanitized arguments. Runs before schema validation so the schema
+        // sees the gated tool calls.
+        if let Some(gate) = state.tool_gate.as_ref() {
+            apply_tool_gate(&mut filtered, gate);
+        }
+
+        // JSON Schema validation against the assistant's response.
+        if let Some(validator) = state.schema.as_ref() {
+            if let Some(rule) = validator.pick("/v1/chat/completions", &model) {
+                let raw = filtered
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|cs| cs.first())
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let outcome =
+                    crate::guard::schema::SchemaValidator::validate_response_text(&rule, raw);
+                if !outcome.passed {
+                    use crate::guard::schema::ViolationAction;
+                    warn!(
+                        "schema violation against rule `{}`: {} error(s)",
+                        rule.name,
+                        outcome.errors.len()
+                    );
+                    match validator.on_violation() {
+                        ViolationAction::Reject => {
+                            return blocked_response(&format!(
+                                "response failed schema `{}`: {}",
+                                rule.name,
+                                outcome.errors.join("; ")
+                            ));
+                        }
+                        ViolationAction::LogOnly | ViolationAction::Repair => {
+                            // Repair is not implemented yet — fall through.
+                        }
+                    }
+                } else if let Some(extracted) = outcome.extracted {
+                    // Wrapper (markdown fence / prose) was stripped — emit the
+                    // cleaned JSON to the client so downstream code doesn't
+                    // need to repeat the cleanup.
+                    if let Some(choices) = filtered.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                        if let Some(first) = choices.first_mut() {
+                            if let Some(msg) = first.get_mut("message") {
+                                msg["content"] = Value::String(extracted.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         (
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
             Json(filtered),
@@ -410,6 +464,61 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Walk every choices[].message.tool_calls and run the tool gate. Denied
+/// tool calls are removed; sanitized arguments are written back into the
+/// `function.arguments` JSON string. If a denial happens, a synthetic
+/// `nanoguard_denied_tools` entry is added to message.metadata so the
+/// caller can see what was dropped.
+fn apply_tool_gate(resp: &mut Value, gate: &crate::guard::tool_gate::ToolGate) {
+    use crate::guard::tool_gate::ToolDecision;
+    let Some(choices) = resp.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for choice in choices {
+        let Some(msg) = choice.get_mut("message") else {
+            continue;
+        };
+        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
+        else {
+            continue;
+        };
+        let mut denials: Vec<Value> = Vec::new();
+        let mut kept: Vec<Value> = Vec::new();
+        for tc in tool_calls.drain(..) {
+            match gate.evaluate_openai_tool_call(&tc) {
+                ToolDecision::Allow => kept.push(tc),
+                ToolDecision::Sanitize { redacted_args } => {
+                    let mut new_tc = tc.clone();
+                    if let Some(func) = new_tc.get_mut("function") {
+                        if let Some(obj) = func.as_object_mut() {
+                            obj.insert(
+                                "arguments".to_string(),
+                                Value::String(redacted_args.to_string()),
+                            );
+                        }
+                    }
+                    info!("tool gate: sanitized arguments for tool call");
+                    kept.push(new_tc);
+                }
+                ToolDecision::Deny { reason } => {
+                    let name = tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    warn!("tool gate: denied `{name}` — {reason}");
+                    denials.push(json!({"name": name, "reason": reason}));
+                }
+            }
+        }
+        *tool_calls = kept;
+        if !denials.is_empty() {
+            msg["nanoguard_denied_tools"] = Value::Array(denials);
+        }
+    }
+}
 
 /// Walk every `choices[].message.content` field (OpenAI non-streaming shape)
 /// and apply a deanonymize strategy in place.

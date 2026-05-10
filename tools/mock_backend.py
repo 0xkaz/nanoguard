@@ -46,14 +46,30 @@ class MockHandler(BaseHTTPRequestHandler):
         sys.stderr.flush()
 
         user_msg = extract_user_text(req)
+        # Hook: if the user message starts with "TOOL:", interpret the rest
+        # as a JSON `tool_calls` array and emit it as the assistant's reply.
+        # Used by tool-gate e2e tests to deterministically simulate an LLM
+        # that decided to call a tool.
+        tool_calls = None
+        if user_msg.startswith("TOOL:"):
+            try:
+                tool_calls = json.loads(user_msg[len("TOOL:"):])
+            except Exception:
+                tool_calls = None
+
         echo = f"You said: {user_msg}"
 
         if req.get("stream"):
             self.handle_stream(req, echo)
         else:
-            self.handle_unary(req, echo)
+            self.handle_unary(req, echo, tool_calls)
 
-    def handle_unary(self, req, echo):
+    def handle_unary(self, req, echo, tool_calls=None):
+        message = {"role": "assistant", "content": echo}
+        if tool_calls is not None:
+            message["content"] = None
+            message["tool_calls"] = tool_calls
+        finish = "tool_calls" if tool_calls else "stop"
         resp = {
             "id": "chatcmpl-mock",
             "object": "chat.completion",
@@ -61,8 +77,8 @@ class MockHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": echo},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish,
                 }
             ],
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
