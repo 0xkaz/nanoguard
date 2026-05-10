@@ -270,8 +270,7 @@ pub async fn messages(
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let outcome =
-                crate::guard::schema::SchemaValidator::validate_response_text(&rule, raw);
+            let outcome = crate::guard::schema::SchemaValidator::validate_response_text(&rule, raw);
             if !outcome.passed {
                 use crate::guard::schema::ViolationAction;
                 warn!(

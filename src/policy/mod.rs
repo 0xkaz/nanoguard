@@ -100,10 +100,7 @@ impl Policy {
 
     fn validate(&self) -> Result<()> {
         if self.version != 1 {
-            anyhow::bail!(
-                "unsupported policy version {} (expected 1)",
-                self.version
-            );
+            anyhow::bail!("unsupported policy version {} (expected 1)", self.version);
         }
         let mut seen_ids = std::collections::HashSet::new();
         for rule in &self.rules {
@@ -345,7 +342,6 @@ rules:
         assert!(idx.lookup_literal("not in policy").is_none());
     }
 }
-
 
 #[cfg(test)]
 mod tests {

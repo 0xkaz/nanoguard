@@ -81,8 +81,7 @@ impl<F: Fn(&str) -> String> SseFilter<F> {
             let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) else {
                 continue;
             };
-            let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64())
-            else {
+            let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) else {
                 continue;
             };
             let model = val
@@ -233,7 +232,8 @@ mod tests {
     #[test]
     fn filters_matched_content() {
         let mut f = SseFilter::new(star_filter);
-        let out = f.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"your ssn is here\"}}]}\n\n");
+        let out =
+            f.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"your ssn is here\"}}]}\n\n");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("your *** is here"));
         assert!(!s.contains("ssn"));
@@ -283,9 +283,7 @@ mod tests {
     #[test]
     fn crlf_line_endings_supported() {
         let mut f = SseFilter::new(star_filter);
-        let out = f.push(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"ssn here\"}}]}\r\n\r\n",
-        );
+        let out = f.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"ssn here\"}}]}\r\n\r\n");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("*** here"), "got `{s}`");
     }
@@ -329,9 +327,7 @@ mod tests {
 
     #[test]
     fn extract_usage_returns_none_for_done() {
-        assert!(
-            SseFilter::<fn(&str) -> String>::try_extract_usage(b"data: [DONE]\n\n").is_none()
-        );
+        assert!(SseFilter::<fn(&str) -> String>::try_extract_usage(b"data: [DONE]\n\n").is_none());
     }
 
     #[test]

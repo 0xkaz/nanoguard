@@ -63,9 +63,7 @@ impl DeanonymizeStream {
                     if ch == ']' {
                         // Window closed. Try a vault lookup over the entire
                         // buffered placeholder.
-                        let restored = self
-                            .strategy
-                            .restore(&self.pending, &self.entries);
+                        let restored = self.strategy.restore(&self.pending, &self.entries);
                         emit.push_str(&restored);
                         self.pending.clear();
                         self.state = State::Normal;

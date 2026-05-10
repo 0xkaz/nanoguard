@@ -92,15 +92,19 @@ impl ToolGate {
     pub fn evaluate_openai_tool_call(&self, tc: &Value) -> ToolDecision {
         let func = match tc.get("function") {
             Some(f) => f,
-            None => return ToolDecision::Deny {
-                reason: "tool call missing function field".into(),
-            },
+            None => {
+                return ToolDecision::Deny {
+                    reason: "tool call missing function field".into(),
+                }
+            }
         };
         let name = match func.get("name").and_then(|n| n.as_str()) {
             Some(n) => n,
-            None => return ToolDecision::Deny {
-                reason: "tool call missing function.name".into(),
-            },
+            None => {
+                return ToolDecision::Deny {
+                    reason: "tool call missing function.name".into(),
+                }
+            }
         };
         // Arguments come as a JSON-encoded string (OpenAI quirk).
         let args_raw = func
@@ -117,12 +121,17 @@ impl ToolGate {
     pub fn evaluate_anthropic_tool_use(&self, tu: &Value) -> ToolDecision {
         let name = match tu.get("name").and_then(|n| n.as_str()) {
             Some(n) => n,
-            None => return ToolDecision::Deny {
-                reason: "tool_use missing name".into(),
-            },
+            None => {
+                return ToolDecision::Deny {
+                    reason: "tool_use missing name".into(),
+                }
+            }
         };
         // Input is already a parsed object on the wire.
-        let args_value = tu.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+        let args_value = tu
+            .get("input")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
         let args_raw = args_value.to_string();
         self.evaluate(name, &args_raw)
     }
@@ -173,9 +182,7 @@ impl ToolGate {
                 .contains_pii_in(args_json_str, &self.reject_entities)
         {
             return ToolDecision::Deny {
-                reason: format!(
-                    "tool `{name}` arguments contain rejected entity",
-                ),
+                reason: format!("tool `{name}` arguments contain rejected entity",),
             };
         }
         if !self.mask_entities.is_empty()
@@ -195,11 +202,7 @@ impl ToolGate {
     }
 }
 
-fn mask_strings_in_value(
-    value: &mut Value,
-    redactor: &Redactor,
-    entities: &HashSet<String>,
-) {
+fn mask_strings_in_value(value: &mut Value, redactor: &Redactor, entities: &HashSet<String>) {
     match value {
         Value::String(s) => {
             let masked = redactor.redact_text_in(s, entities);
@@ -225,18 +228,10 @@ mod tests {
     use crate::proxy::redact::{default_inline_patterns, PlaceholderStyle, Redactor};
     use serde_json::json;
 
-    fn build_gate(
-        allow: Option<Vec<&str>>,
-        deny: Vec<&str>,
-        reject: &[&str],
-    ) -> ToolGate {
+    fn build_gate(allow: Option<Vec<&str>>, deny: Vec<&str>, reject: &[&str]) -> ToolGate {
         let redactor = Arc::new(
-            Redactor::build_with_style(
-                &default_inline_patterns(),
-                &[],
-                PlaceholderStyle::Bare,
-            )
-            .unwrap(),
+            Redactor::build_with_style(&default_inline_patterns(), &[], PlaceholderStyle::Bare)
+                .unwrap(),
         );
         let reject_set: HashSet<String> = reject.iter().map(|s| s.to_string()).collect();
         ToolGate::new(
@@ -357,12 +352,8 @@ mod tests {
             jsonschema::draft202012::new(&schema).unwrap(),
         );
         let redactor = Arc::new(
-            Redactor::build_with_style(
-                &default_inline_patterns(),
-                &[],
-                PlaceholderStyle::Bare,
-            )
-            .unwrap(),
+            Redactor::build_with_style(&default_inline_patterns(), &[], PlaceholderStyle::Bare)
+                .unwrap(),
         );
         let gate = ToolGate::new(
             None,
@@ -400,23 +391,12 @@ mod tests {
     fn mask_entity_returns_sanitize_with_redacted_args() {
         // Build a gate where EMAIL is in mask set.
         let redactor = Arc::new(
-            Redactor::build_with_style(
-                &default_inline_patterns(),
-                &[],
-                PlaceholderStyle::Bare,
-            )
-            .unwrap(),
+            Redactor::build_with_style(&default_inline_patterns(), &[], PlaceholderStyle::Bare)
+                .unwrap(),
         );
         let mut mask = HashSet::new();
         mask.insert("EMAIL".to_string());
-        let gate = ToolGate::new(
-            None,
-            vec![],
-            HashMap::new(),
-            redactor,
-            HashSet::new(),
-            mask,
-        );
+        let gate = ToolGate::new(None, vec![], HashMap::new(), redactor, HashSet::new(), mask);
         let tc = openai_call(
             "log_activity",
             json!({"user": "alice@example.com", "action": "login"}),
