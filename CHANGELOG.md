@@ -4,6 +4,16 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — public design docs for v0.4 / v0.5 features
+
+Three new files under `docs/design/`, all status `shipped`, written so the existing implementations finally have a public design doc to point at:
+
+- **`docs/design/tool-gate.md`** — what Tool Gate inspects (name → schema → entity scan), the three decisions (Allow / Deny / Sanitize), endpoint coverage on `/v1/chat/completions` and `/v1/messages`, the streaming-Sanitize-degrades-to-Allow caveat, and pipeline placement before schema validation.
+- **`docs/design/spotlighting.md`** — the three transforms (Datamarking / Delimiting / Encoding), why the system rider is non-optional, why spotlighting runs after PII redaction so placeholders survive, and the explicit "this is not a proof, just a tilt" framing.
+- **`docs/design/json-schema.md`** — Draft 2020-12 validator, wrapper-stripping for prose / markdown fences, the three `on_violation` actions (with `Repair` reserved as a forward-compat stub), per-route + per-model rule selection, and the shared validator with Tool Gate.
+
+These were all in `_*.md` notes only; promoting them keeps `docs/` honest with what `src/guard/{tool_gate,spotlight,schema}.rs` already does.
+
 ### Changed — release flow is PR-driven
 
 `main` is protected by a ruleset (set up immediately after v0.7.0) that rejects direct pushes. The previous `tools/release.sh` committed straight to `main` and tripped the rule on every release. The flow is now two scripts:
