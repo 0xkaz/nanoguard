@@ -56,8 +56,9 @@ pub struct SchemaValidator {
 pub struct ValidationOutcome {
     pub passed: bool,
     pub errors: Vec<String>,
-    /// Set when the validator extracted JSON from a wrapper (e.g. a markdown
-    /// ```json fenced block) so the proxy can re-emit the cleaned payload.
+    /// Set when the validator extracted JSON from a wrapper (for example a
+    /// markdown fenced block tagged `json`) so the proxy can re-emit the
+    /// cleaned payload.
     pub extracted: Option<Value>,
 }
 
