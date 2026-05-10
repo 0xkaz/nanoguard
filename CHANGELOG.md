@@ -2,7 +2,7 @@
 
 All notable changes to nanoguard are documented in this file. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — feat/policy-engine
+## [0.7.0] — 2026-05-11
 
 Policy Engine v1, plus several integration fixes uncovered while stress-testing the e2e suite.
 

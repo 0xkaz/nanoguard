@@ -1,6 +1,6 @@
 [package]
 name = "nanoguard"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Nano-fast CPU-only offline-first LLM guardrails proxy"
 license = "MIT"
