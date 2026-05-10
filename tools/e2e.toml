@@ -1,0 +1,42 @@
+# nanoguard config used by tools/e2e.sh
+
+[nanoguard]
+listen = "127.0.0.1:18080"
+log_level = "info"
+
+[backend]
+provider = "openai"
+endpoint = "http://127.0.0.1:11500"
+
+[input]
+enabled = true
+shadow = false
+
+[input.keyword]
+engine = "aho-corasick"
+dict_paths = []
+inline_block = ["ignore previous instructions", "jailbreak"]
+inline_alert = ["password"]
+inline_flag  = ["bitcoin"]
+
+[input.pii]
+enabled = true
+action = "mask"
+placeholder_style = "indexed"
+reversible = true
+deanonymize_strategy = "exact"
+
+# Per-entity actions: AWS keys must be rejected, not masked.
+[input.pii.entities]
+AWS_ACCESS_KEY_ID = "reject"
+
+[output]
+enabled = true
+
+[budget]
+enabled = false
+db_path = "/tmp/nanoguard-e2e.db"
+
+[audit]
+enabled = false
+path = "/tmp/nanoguard-e2e-audit.jsonl"
