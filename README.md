@@ -212,6 +212,33 @@ PHONE             = "log"
 
 Entities not present in the redactor (e.g. typos) are silently ignored. Entity names are case-sensitive and match what the redactor emits in placeholders.
 
+#### Reversible redaction (Vault round-trip)
+
+When `reversible = true`, mask-class matches are recorded in a per-request Vault and restored from the LLM's response. The model never sees the originals; the client sees the original prompt context preserved in the answer.
+
+```toml
+[input.pii]
+enabled = true
+action  = "mask"
+reversible = true
+deanonymize_strategy = "exact"   # "exact" (default) | "case_insensitive"
+```
+
+Round-trip example:
+
+```
+client → nanoguard:  "My email is alice@example.com"
+nanoguard → LLM:     "My email is [EMAIL_1]"
+LLM → nanoguard:     "You said: My email is [EMAIL_1]"
+nanoguard → client:  "You said: My email is alice@example.com"
+```
+
+Vault scope is **per request** — placeholders set in one request are never visible to another. Session-scoped vaults (so turn 2 sees turn 1's `[EMAIL_1]`) are planned for a future opt-in feature.
+
+Streaming responses are deanonymized through a state machine that buffers from `[` to `]`, so a placeholder split across SSE chunks is restored correctly.
+
+`deanonymize_strategy = "fuzzy"` and `"combined"` are reserved names that currently fall back to `exact` with a warning.
+
 #### Obfuscation handling
 
 Input is normalized before scanning. Two transforms are on by default — they are essentially free for ASCII input (NFKC is skipped via a fast path) and only catch attacks that would otherwise slip through:

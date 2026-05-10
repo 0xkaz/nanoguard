@@ -13,7 +13,15 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::{matcher::InputVerdict, AppState};
+use crate::{
+    guard::{
+        deanonymize,
+        vault::{LocalVault, PlaceholderTemplate, Vault},
+    },
+    matcher::InputVerdict,
+    proxy::redact,
+    AppState,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct AnthropicRequest {
@@ -96,6 +104,13 @@ pub async fn messages(
         }
     }
 
+    // Per-request Vault for reversible redaction (cheap when unused).
+    let template = match state.redactor.style() {
+        redact::PlaceholderStyle::LlmGuard => PlaceholderTemplate::LlmGuard,
+        _ => PlaceholderTemplate::Indexed,
+    };
+    let mut vault = LocalVault::with_style(template);
+
     // PII redaction with per-entity action overrides.
     if state.config.input.pii.enabled {
         if !state.pii_actions.reject.is_empty()
@@ -118,10 +133,19 @@ pub async fn messages(
         }
         if !state.pii_actions.mask.is_empty() {
             let mut redacted_any = false;
+            let reversible = state.config.input.pii.reversible;
             for msg in req.messages.iter_mut() {
                 match &mut msg.content {
                     AnthropicContent::Text(s) => {
-                        let r = state.redactor.redact_text_in(s, &state.pii_actions.mask);
+                        let r = if reversible {
+                            state.redactor.redact_text_with_vault(
+                                s,
+                                &state.pii_actions.mask,
+                                &mut vault,
+                            )
+                        } else {
+                            state.redactor.redact_text_in(s, &state.pii_actions.mask)
+                        };
                         if &r != s {
                             *s = r;
                             redacted_any = true;
@@ -130,7 +154,15 @@ pub async fn messages(
                     AnthropicContent::Blocks(blocks) => {
                         for b in blocks {
                             if let Some(t) = b.text.as_mut() {
-                                let r = state.redactor.redact_text_in(t, &state.pii_actions.mask);
+                                let r = if reversible {
+                                    state.redactor.redact_text_with_vault(
+                                        t,
+                                        &state.pii_actions.mask,
+                                        &mut vault,
+                                    )
+                                } else {
+                                    state.redactor.redact_text_in(t, &state.pii_actions.mask)
+                                };
                                 if &r != t {
                                     *t = r;
                                     redacted_any = true;
@@ -207,6 +239,15 @@ pub async fn messages(
     // Output filter
     let content_text = if state.config.output.enabled {
         state.matchers.filter_output(&content_text)
+    } else {
+        content_text
+    };
+
+    // Reversible deanonymize from Vault entries.
+    let content_text = if state.config.input.pii.reversible && !vault.is_empty() {
+        let strategy =
+            deanonymize::strategy_from_name(&state.config.input.pii.deanonymize_strategy);
+        deanonymize::restore(strategy.as_ref(), &vault, &content_text)
     } else {
         content_text
     };

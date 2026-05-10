@@ -21,10 +21,23 @@ async fn main() -> Result<()> {
 
     let matchers = Arc::new(matcher::Matchers::build(&cfg.input.keyword)?);
     tracing::info!("matcher engine: {}", matchers.engine_name());
+    // Reversible redaction needs indexed placeholders. Auto-promote the bare
+    // style so users don't have to remember to flip both knobs.
+    let style = {
+        let configured = proxy::redact::PlaceholderStyle::from_str(&cfg.input.pii.placeholder_style);
+        if cfg.input.pii.reversible && configured == proxy::redact::PlaceholderStyle::Bare {
+            tracing::info!(
+                "redactor: reversible=true forces placeholder_style=indexed (was bare)"
+            );
+            proxy::redact::PlaceholderStyle::Indexed
+        } else {
+            configured
+        }
+    };
     let redactor = Arc::new(proxy::redact::Redactor::build_with_style(
         &proxy::redact::default_inline_patterns(),
         &cfg.input.pii.dict_paths,
-        proxy::redact::PlaceholderStyle::from_str(&cfg.input.pii.placeholder_style),
+        style,
     )?);
     let pii_actions = Arc::new(proxy::redact::partition_by_action(
         &redactor.entity_names(),

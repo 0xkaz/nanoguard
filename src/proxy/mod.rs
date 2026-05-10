@@ -15,6 +15,10 @@ use tracing::{info, warn};
 use crate::{
     audit::{AuditEntry, Verdict},
     budget::store::{BudgetCheck, SpendRecord},
+    guard::{
+        deanonymize,
+        vault::{LocalVault, Vault},
+    },
     matcher::InputVerdict,
     AppState,
 };
@@ -35,6 +39,18 @@ pub async fn chat_completions(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+
+    // Per-request Vault for reversible PII redaction. Built unconditionally
+    // (cheap — just a few empty hashmaps) so the rest of the handler can
+    // hand it through the streaming closure without conditional plumbing.
+    let vault = Arc::new(std::sync::Mutex::new({
+        use crate::guard::vault::PlaceholderTemplate;
+        let template = match state.redactor.style() {
+            redact::PlaceholderStyle::LlmGuard => PlaceholderTemplate::LlmGuard,
+            _ => PlaceholderTemplate::Indexed,
+        };
+        LocalVault::with_style(template)
+    }));
 
     // Input Guardrails
     if state.config.input.enabled {
@@ -86,13 +102,24 @@ pub async fn chat_completions(
             );
             return blocked_response("PII detected");
         }
-        // Mask-class entities are redacted in place.
-        if !state.pii_actions.mask.is_empty()
-            && state
-                .redactor
-                .redact_messages_in(&mut body, &state.pii_actions.mask)
-        {
-            info!("MASK input: PII redacted before forwarding");
+        // Mask-class entities are redacted in place. When reversible mode is
+        // on, route through the Vault so the output deanonymizer can restore
+        // originals after the LLM round-trip.
+        if !state.pii_actions.mask.is_empty() {
+            let masked = if state.config.input.pii.reversible {
+                state.redactor.redact_messages_with_vault(
+                    &mut body,
+                    &state.pii_actions.mask,
+                    &mut *vault.lock().unwrap(),
+                )
+            } else {
+                state
+                    .redactor
+                    .redact_messages_in(&mut body, &state.pii_actions.mask)
+            };
+            if masked {
+                info!("MASK input: PII redacted before forwarding");
+            }
         }
         // Log-class entities are recorded but pass through unchanged.
         if !state.pii_actions.log.is_empty()
@@ -157,6 +184,9 @@ pub async fn chat_completions(
         let matchers = Arc::clone(&state.matchers);
         let budget_for_stream = state.budget.clone();
         let api_key_for_stream = api_key.clone();
+        let reversible = state.config.input.pii.reversible;
+        let deanon_strategy_name = state.config.input.pii.deanonymize_strategy.clone();
+        let vault_for_stream = Arc::clone(&vault);
 
         // Buffer SSE bytes across chunk boundaries, splitting on the blank-line
         // event terminator before applying the output filter to each event's
@@ -167,7 +197,35 @@ pub async fn chat_completions(
         // event that carries one (OpenAI emits usage on the final chunk when
         // `stream_options.include_usage` is set). The last observed usage wins,
         // and is recorded against the budget after the stream completes.
-        let mut filter = sse::SseFilter::new(move |s: &str| matchers.filter_output(s));
+        //
+        // When reversible PII redaction is on, a DeanonymizeStream wraps the
+        // output filter so placeholders that straddle SSE chunk boundaries are
+        // still resolved against the per-request Vault.
+        let deanon_stream: Option<Arc<std::sync::Mutex<crate::guard::sse_deanon::DeanonymizeStream>>> =
+            if reversible {
+                let entries = vault_for_stream.lock().unwrap().entries();
+                if entries.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(std::sync::Mutex::new(
+                        crate::guard::sse_deanon::DeanonymizeStream::new(
+                            entries,
+                            deanonymize::strategy_from_name(&deanon_strategy_name),
+                        ),
+                    )))
+                }
+            } else {
+                None
+            };
+        let deanon_for_closure = deanon_stream.clone();
+        let mut filter = sse::SseFilter::new(move |s: &str| {
+            let after_filter = matchers.filter_output(s);
+            if let Some(d) = &deanon_for_closure {
+                d.lock().unwrap().push(&after_filter)
+            } else {
+                after_filter
+            }
+        });
         let event_stream = body_stream.map_err(std::io::Error::other);
         let filtered = async_stream::stream! {
             futures_util::pin_mut!(event_stream);
@@ -195,6 +253,20 @@ pub async fn chat_completions(
             let tail = filter.flush();
             if !tail.is_empty() {
                 yield Ok(tail);
+            }
+            // Drain any half-buffered placeholder text from the deanon stream.
+            // In practice this is empty for completed responses; if non-empty
+            // it indicates an unclosed `[` in the LLM output, which we log
+            // for diagnostics and discard rather than leaking partial bytes
+            // back into the SSE channel.
+            if let Some(d) = &deanon_stream {
+                let leftover = d.lock().unwrap().flush();
+                if !leftover.is_empty() {
+                    tracing::debug!(
+                        "deanon stream had {} bytes pending at end-of-stream",
+                        leftover.len()
+                    );
+                }
             }
             // Record streaming spend if usage was observed and a budget is wired up.
             if let (Some(budget), Some((prompt, completion, resp_model))) =
@@ -284,11 +356,22 @@ pub async fn chat_completions(
             t0.elapsed().as_micros() as u64,
         );
 
-        let filtered = if state.config.output.enabled {
+        let mut filtered = if state.config.output.enabled {
             filter_response_json(&state, resp_json)
         } else {
             resp_json
         };
+
+        // Reversible deanonymize: replace placeholders in the response with
+        // the original values stored in the per-request Vault.
+        if state.config.input.pii.reversible {
+            let entries = vault.lock().unwrap().entries();
+            if !entries.is_empty() {
+                let strategy =
+                    deanonymize::strategy_from_name(&state.config.input.pii.deanonymize_strategy);
+                deanon_response_json(&mut filtered, strategy.as_ref(), &entries);
+            }
+        }
 
         (
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
@@ -318,6 +401,31 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Walk every `choices[].message.content` field (OpenAI non-streaming shape)
+/// and apply a deanonymize strategy in place.
+fn deanon_response_json(
+    resp: &mut Value,
+    strategy: &dyn deanonymize::MatchingStrategy,
+    entries: &[(String, String)],
+) {
+    let Some(choices) = resp.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for choice in choices {
+        if let Some(content) = choice
+            .get_mut("message")
+            .and_then(|m| m.get_mut("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+        {
+            let restored = strategy.restore(&content, entries);
+            if let Some(msg) = choice.get_mut("message") {
+                msg["content"] = Value::String(restored);
+            }
+        }
+    }
+}
 
 fn extract_api_key(body: &Value) -> String {
     // Use "user" field as api_key identifier if present, else "default"

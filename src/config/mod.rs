@@ -153,6 +153,21 @@ pub struct PiiConfig {
     /// not listed here use the global `action`.
     #[serde(default)]
     pub entities: std::collections::HashMap<String, PiiAction>,
+    /// Reversible redaction: when true, mask-class matches are recorded in a
+    /// per-request Vault and restored from the LLM response, so the model
+    /// never sees the originals but the client gets unmasked output.
+    /// Implies an indexed placeholder style for safe round-trips.
+    #[serde(default)]
+    pub reversible: bool,
+    /// Deanonymize matching strategy when `reversible = true`. One of
+    /// "exact" (default) / "case_insensitive". "fuzzy" / "combined" are
+    /// reserved for future implementation and currently fall back to exact.
+    #[serde(default = "default_deanon_strategy")]
+    pub deanonymize_strategy: String,
+}
+
+fn default_deanon_strategy() -> String {
+    "exact".to_string()
 }
 
 fn default_placeholder_style() -> String {
@@ -167,6 +182,8 @@ impl Default for PiiConfig {
             dict_paths: vec![],
             placeholder_style: default_placeholder_style(),
             entities: std::collections::HashMap::new(),
+            reversible: false,
+            deanonymize_strategy: default_deanon_strategy(),
         }
     }
 }

@@ -179,6 +179,75 @@ impl Redactor {
         self.rules.iter().map(|r| r.entity.clone()).collect()
     }
 
+    /// Redact `text` using a Vault, so each match is recorded as a
+    /// (placeholder → original) pair the output deanonymizer can restore.
+    /// Only rules whose entity name appears in `entities` are applied.
+    pub fn redact_text_with_vault<V: crate::guard::vault::Vault>(
+        &self,
+        text: &str,
+        entities: &std::collections::HashSet<String>,
+        vault: &mut V,
+    ) -> String {
+        let mut out = text.to_string();
+        for rule in &self.rules {
+            if !entities.contains(&rule.entity) {
+                continue;
+            }
+            let matches: Vec<(usize, usize, String)> = rule
+                .regex
+                .find_iter(&out)
+                .map(|m| (m.start(), m.end(), m.as_str().to_string()))
+                .collect();
+            // Apply right-to-left to keep earlier offsets valid.
+            for (start, end, value) in matches.into_iter().rev() {
+                let placeholder = vault.store(&rule.entity, &value);
+                out.replace_range(start..end, &placeholder);
+            }
+        }
+        out
+    }
+
+    /// Walk a JSON request body and redact each `messages[].content` field
+    /// through a Vault. Returns true if any redaction occurred.
+    pub fn redact_messages_with_vault<V: crate::guard::vault::Vault>(
+        &self,
+        body: &mut Value,
+        entities: &std::collections::HashSet<String>,
+        vault: &mut V,
+    ) -> bool {
+        let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+            return false;
+        };
+        let mut changed = false;
+        for msg in messages {
+            let Some(content) = msg.get_mut("content") else {
+                continue;
+            };
+            if let Some(text) = content.as_str() {
+                let redacted = self.redact_text_with_vault(text, entities, vault);
+                if redacted != text {
+                    *content = Value::String(redacted);
+                    changed = true;
+                }
+            } else if let Some(parts) = content.as_array_mut() {
+                for part in parts {
+                    let Some(text_val) = part.get_mut("text") else {
+                        continue;
+                    };
+                    let Some(text) = text_val.as_str() else {
+                        continue;
+                    };
+                    let redacted = self.redact_text_with_vault(text, entities, vault);
+                    if redacted != text {
+                        *text_val = Value::String(redacted);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     pub fn redact_text(&self, text: &str) -> String {
         match self.style {
             PlaceholderStyle::Bare => self.redact_text_bare(text),
