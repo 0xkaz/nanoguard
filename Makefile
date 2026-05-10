@@ -1,6 +1,6 @@
 .PHONY: all build dev test e2e check lint fmt clean run run-openai ollama-start \
-        docker docker-run release watch-docker watch watch-test watch-lint \
-        bench coverage miri audit ci
+        docker docker-run release docker-release watch-docker watch watch-test watch-lint \
+        bench coverage miri audit ci push release-patch release-minor release-major
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -131,3 +131,17 @@ ollama-start:
 	  ollama pull $(MODEL); \
 	fi
 	@echo "Ollama ready (model=$(MODEL))"
+
+# ── Release helpers (cargo-edit + tools/release.sh + tools/push.sh) ─────────
+
+release-patch:
+	./tools/release.sh patch
+
+release-minor:
+	./tools/release.sh minor
+
+release-major:
+	./tools/release.sh major
+
+push:
+	./tools/push.sh
