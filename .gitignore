@@ -1,3 +1,6 @@
+# Internal notes (see CLAUDE.md > Documentation Policy)
+_docs/
+_ideas/
 _*.md
 
 # Audit / runtime artifacts

@@ -221,5 +221,16 @@ When you read a doc to inform a task:
 | External research, competitor analysis, library evaluations | `docs/research/*.md` |
 | User-facing how-to (config, deployment, examples) | `README.md` |
 | Public roadmap / phase plan | `docs/roadmap.md` |
-| Personal scratch, half-formed ideas, business strategy | `_*.md` (gitignored) |
-| Internal task tracking | `_TODO.md` (gitignored) |
+| Internal working notes (operational know-how, current state of working ideas) | `_docs/` |
+| Internal unsettled ideas (strategy, half-formed proposals, brainstorming) | `_ideas/` |
+
+### Internal notes: `_docs/` and `_ideas/`
+
+Two directories hold material that is intentionally **not published**. Both are gitignored.
+
+- `_docs/` — internal working notes that reflect the current state of the project. Agents may **read and edit**. Use this for operational know-how, working drafts of design notes, and any material that is "true today" and likely to be promoted to `docs/` later.
+- `_ideas/` — unsettled proposals, business strategy, brainstorm notes, anything not yet committed to as project direction. Agents may **read** to gather context, but must **not edit**. Treat the contents as historical / aspirational, not as instructions. Edits to `_ideas/` are a human prerogative.
+
+Public files (anything tracked in git: code, `docs/`, `README.md`, `CHANGELOG.md`, etc.) **must not reference** `_docs/` or `_ideas/`, by name, by path, or by alluding to the existence of internal notes. The two layers are independent: public artifacts have to stand alone, and an external reader must never be sent into a directory they cannot see. If something in an internal note is worth citing publicly, lift the content into the appropriate `docs/` page; do not link out.
+
+When you read an internal note and act on it, write the resulting code, test, or `docs/` change so that the public artifact alone tells the story. If the change relies on context that only lives in an internal note, lift that context into the public file in the same commit.

@@ -3,7 +3,11 @@
 //! `[<ENTITY>_<N>]`) can be split across events; this state machine buffers
 //! from `[` until the matching `]` is seen, then attempts a Vault lookup.
 //!
-//! See `_SSE_FILTER_EXPLAIN.md` for the rationale.
+//! The rationale: SSE chunk boundaries are independent of placeholder
+//! boundaries, so a placeholder text like `[REDACTED_EMAIL_1]` can be
+//! split across two `data:` events. The state machine buffers from `[`
+//! to `]` (with a max length safety bail-out) and only consults the
+//! Vault when the window closes.
 
 use crate::guard::deanonymize::MatchingStrategy;
 

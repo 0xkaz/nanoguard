@@ -16,8 +16,8 @@
 //!
 //! The bundle is loaded once at startup. Policy rules complement (do not
 //! replace) the existing TOML inline lists — both feed into the same
-//! matcher / redactor at build time. See _POLICY_ENGINE.md for the
-//! design rationale.
+//! matcher / redactor at build time. See `docs/design/policy-engine.md`
+//! for the public design contract.
 
 use std::path::Path;
 

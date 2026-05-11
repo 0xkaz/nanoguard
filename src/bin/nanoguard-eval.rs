@@ -20,7 +20,9 @@
 //!   nanoguard-eval --gold corpus.jsonl --json report.json
 //!   nanoguard-eval --gold corpus.jsonl --match strict | lenient
 //!
-//! See _RECOGNIZER_EVAL.md for the full design rationale.
+//! The harness is intentionally simple: a flat JSONL corpus in, a
+//! per-entity P/R/F1 report out. Wrappers like span-overlap scoring or
+//! per-document weighting are out of scope.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
