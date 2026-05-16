@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — hot-reload proposal
+
+New file `docs/design/hot-reload.md` (status: proposed) scopes a SIGHUP-driven atomic reload of the request-side configuration: matcher, redactor, spotlight, schema, tool gate, and policy index. The design wraps the config-derived subset of `AppState` in `ArcSwap<ReloadableState>` so handlers acquire a per-request snapshot with a single lock-free pointer load. Validation-on-reload is all-or-nothing; on failure the live state is retained and a `reload_failed` audit entry is written. Listening socket, backend HTTP client, budget DB, and the audit file handle remain restart-only. No implementation yet.
+
 ### Docs — dependency policy catches up with Cargo.toml
 
 `CLAUDE.md > Dependency Policy` listed only some of the crates the binary actually pulls in. `tower-http`, `serde_json`, and `tracing-subscriber` have been on the dependency list since v0.5 / v0.6 but were missing from the Allowed line; added now so the policy matches the lockfile.
