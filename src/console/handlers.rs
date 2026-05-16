@@ -1049,11 +1049,13 @@ pub async fn api_reload_status(
             .as_secs_f64()
             - 30.0
     });
-    let since = if since.is_finite() && since >= 0.0 {
-        since
-    } else {
-        0.0
-    };
+    if !since.is_finite() || since < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "since must be a non-negative finite number"})),
+        )
+            .into_response();
+    }
     let after = std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(since);
     let result = super::reload::poll_reload_status(&state.config.audit.path, after, 200);
     match result {
