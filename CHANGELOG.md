@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Fixed — `filter_output` now case-insensitive (silent PII leak on LLM responses)
+
+`Matchers::filter_output` was running iword's `Dictionary::filter` in case-sensitive mode against raw LLM output. The output dictionary entries are lowercase (`ssn`, `social security`, `credit card`), but LLMs almost always emit these capitalized (`SSN`, `Social Security`, `Credit Card`), so the last-line-of-defence PII mask was silently bypassed for the common shape. The filter now scans a lowercased copy of the response and projects matched byte ranges back onto the original text, preserving user-visible casing / whitespace / NFKC form everywhere except the masked spans. Vault placeholders such as `[SSN_1]` are explicitly skipped so the existing PII round-trip restoration still works. Five new matcher tests cover the uppercase and capitalized variants plus the placeholder skip.
+
 ### Added — client-token authentication (Stage 1, opt-in)
 
 Bearer client-token verification on the proxy endpoints, gated behind `[auth] enabled = false` by default so existing deployments are unaffected. When enabled, requests to `/v1/chat/completions`, `/v1/messages`, and `/v1/models` must carry `Authorization: Bearer ng_<env>_<24 char secret>` or get a 401. `/health` stays unauthenticated for load-balancer probes; `/v1/admin/*` keeps its existing `ADMIN_API_KEY` gate.

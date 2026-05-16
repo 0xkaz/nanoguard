@@ -309,6 +309,39 @@ pub struct Matchers {
     normalize: NormalizeConfig,
 }
 
+/// Build a lowercase copy of `text` together with a per-byte map from each
+/// byte in the lowered buffer back to the byte offset of the originating
+/// char in `text`. Used by `filter_output` to project matches found in the
+/// lowered text back onto the original (which preserves the user-visible
+/// casing, whitespace, NFKC form, etc. — we only mask matched ranges).
+fn lower_with_byte_map(text: &str) -> (String, Vec<usize>) {
+    let mut lowered = String::with_capacity(text.len());
+    let mut map: Vec<usize> = Vec::with_capacity(text.len());
+    for (orig_idx, ch) in text.char_indices() {
+        let mut any = false;
+        for lc in ch.to_lowercase() {
+            let before = lowered.len();
+            lowered.push(lc);
+            let after = lowered.len();
+            map.extend(std::iter::repeat_n(orig_idx, after - before));
+            any = true;
+        }
+        if !any {
+            // `char::to_lowercase` always yields at least one char; this arm
+            // is defensive and should be unreachable.
+            let before = lowered.len();
+            lowered.push(ch);
+            let after = lowered.len();
+            map.extend(std::iter::repeat_n(orig_idx, after - before));
+        }
+    }
+    // Sentinel: one past the end of the lowered buffer maps to one past the
+    // end of the original text, so `map[pos + len]` is always valid when
+    // `pos + len == lowered.len()`.
+    map.push(text.len());
+    (lowered, map)
+}
+
 impl Matchers {
     pub fn build(cfg: &KeywordConfig) -> anyhow::Result<Self> {
         Self::build_with_engine(cfg, &cfg.engine)
@@ -358,8 +391,54 @@ impl Matchers {
     }
 
     pub fn filter_output(&self, text: &str) -> String {
-        self.output.filter(text, Mode::FORBID)
+        // The output dictionary is keyed on lowercase ASCII phrases (e.g.
+        // "ssn", "social security", "credit card"). LLMs commonly emit these
+        // capitalized ("SSN", "Social Security"), so a raw case-sensitive
+        // scan misses the most likely PII leak shape. iword's IGNORE_CASE
+        // mode is currently unsafe (panics on some non-ASCII inputs — see
+        // iword-rs XKA-42), so instead we scan a lowercased copy and
+        // project the matched byte ranges back onto the original text. That
+        // keeps the user-visible response intact (casing, whitespace, NFKC
+        // form) except for the masked PII spans themselves.
+        let (lowered, map) = lower_with_byte_map(text);
+        let matches = self.output.scan(&lowered, Mode::FORBID);
+        if matches.is_empty() {
+            return text.to_string();
+        }
+        let bytes = text.as_bytes();
+        let mut buf = bytes.to_vec();
+        for m in &matches {
+            let start = map[m.position];
+            let end = map[m.position + m.length];
+            // Vault placeholders such as `[SSN_1]` / `[EMAIL_1]` reuse PII
+            // keyword names inside their token. The output filter runs
+            // *before* deanonymize in the proxy pipeline, so masking the
+            // keyword bytes inside a placeholder would corrupt the token
+            // and break PII round-trip restoration. Skip any match whose
+            // start sits inside an unclosed `[...]` bracket pair.
+            if is_inside_brackets(bytes, start) {
+                continue;
+            }
+            buf[start..end].fill(b'*');
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     }
+}
+
+/// Return `true` if byte offset `pos` in `bytes` is inside an unclosed
+/// `[ ... ]` pair — i.e. the nearest preceding `[` or `]` is a `[`.
+/// Used by `filter_output` to leave vault placeholders intact.
+fn is_inside_brackets(bytes: &[u8], pos: usize) -> bool {
+    let mut i = pos;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'[' => return true,
+            b']' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn load_ac_dict_file(
