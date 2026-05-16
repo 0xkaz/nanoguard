@@ -23,7 +23,8 @@ reviews:
 
   # Quieter on docs-only PRs: still review, but skip the high-level
   # summary block. Inline comments still appear when warranted.
-  high_level_summary: true
+  # high_level_summary: true
+  high_level_summary: false
 
   profile: chill   # less nit-picky than "assertive"; matches our small-team review style
 
