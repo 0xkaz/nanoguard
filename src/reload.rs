@@ -241,13 +241,16 @@ pub async fn run_reload_task(shared: SharedState, runtime: RuntimeHandles) {
             }
             Err(e) => {
                 let elapsed_us = t0.elapsed().as_micros() as u64;
-                let msg = format!("{e}");
+                let reason = classify_reload_error(&e);
+                // Full chain is local-debug only; it can carry config /
+                // policy / schema content that we do not want to persist.
+                tracing::debug!("hot reload: error chain: {e:#}");
                 tracing::warn!(
                     "hot reload: FAILED ({}µs) — live state retained: {}",
                     elapsed_us,
-                    msg
+                    reason
                 );
-                emit_reload_audit(&shared, false, Some(msg), elapsed_us);
+                emit_reload_audit(&shared, false, Some(reason.to_string()), elapsed_us);
             }
         }
     }
@@ -274,4 +277,38 @@ fn emit_reload_audit(shared: &SharedState, ok: bool, error: Option<String>, late
         return;
     };
     audit.write_reload(ok, error, latency_us);
+}
+
+/// Classify an anyhow reload error into a short, bounded label.
+///
+/// The full `Display` of an anyhow error chain can include the offending
+/// TOML / YAML line text, regex pattern, JSON Schema body, or filesystem
+/// path. None of that should land in the audit log, which is meant to be
+/// shippable to compliance pipelines. The classifier returns one of a
+/// small enum-like set of strings; the full error chain stays in
+/// `tracing::debug` (volatile, local).
+#[cfg(unix)]
+fn classify_reload_error(e: &anyhow::Error) -> &'static str {
+    for cause in e.chain() {
+        if cause.is::<toml::de::Error>() {
+            return "config_parse_error";
+        }
+        if cause.is::<serde_yaml::Error>() {
+            return "policy_yaml_parse_error";
+        }
+        if cause.is::<regex::Error>() {
+            return "regex_compile_error";
+        }
+        if cause.is::<serde_json::Error>() {
+            return "json_parse_error";
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::NotFound => "file_not_found",
+                std::io::ErrorKind::PermissionDenied => "file_permission_denied",
+                _ => "io_error",
+            };
+        }
+    }
+    "build_failed"
 }
