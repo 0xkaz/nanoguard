@@ -94,9 +94,8 @@ pub async fn verify_request(
         );
     };
 
-    let lookup = auth.with_conn(|conn| super::store::lookup_by_prefix(conn, &parsed.prefix));
-    let row_and_hash = match lookup {
-        Ok(Some(pair)) => pair,
+    let cached = match auth.lookup(&parsed.prefix) {
+        Ok(Some(c)) => c,
         Ok(None) => {
             // Same body as the hash-mismatch case below to defeat
             // prefix enumeration via response-content side-channels.
@@ -114,7 +113,8 @@ pub async fn verify_request(
             return internal_error("auth lookup failed");
         }
     };
-    let (row, stored_hash) = row_and_hash;
+    let row = cached.row;
+    let stored_hash = cached.hash;
 
     if !verify(parsed.wire, &stored_hash) {
         return unauthorized(

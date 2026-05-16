@@ -869,15 +869,16 @@ REVOKE_RESP=$(curl -s -X DELETE -H "Authorization: Bearer s23-admin" \
 REVOKE_STATUS=$(echo "$REVOKE_RESP" | jq -r '.status // empty')
 assert_eq "23i. DELETE /v1/admin/clients/:id returns status=revoked" "$REVOKE_STATUS" "revoked"
 
-# 23j. The cache TTL (default 60s in our [auth] block) means the revoked
-# token MIGHT still work for up to cache_ttl_secs. There is no cache yet
-# (that lands in task #43), so for now revocation takes effect on the
-# next request. Verify that:
+# 23j. The verification cache (default 60s TTL) sits in front of the
+# SQLite store. The admin revoke path calls `invalidate_cached` on the
+# affected prefix, so the revoke takes effect on the very next request,
+# not after the TTL window — exactly what an operator running a "kill
+# this leaked token" runbook expects.
 REVOKED_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN_WIRE" \
     -d '{"model":"test","messages":[{"role":"user","content":"after revoke"}]}')
-assert_eq "23j. revoked token is rejected (401)" "$REVOKED_CODE" "401"
+assert_eq "23j. revoked token is rejected immediately (401)" "$REVOKED_CODE" "401"
 
 # 23k. Admin rejects an empty label at mint time (Greptile-flagged
 # inconsistency: previously stored as NULL, response echoed "").

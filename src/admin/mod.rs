@@ -444,18 +444,47 @@ pub async fn revoke_client(
             .into_response();
     };
 
-    let result = auth.with_conn(|conn| crate::client_auth::store::revoke(conn, id));
+    // Read the prefix before the revoke so the cache invalidation
+    // afterwards can target the right key. Lookup + revoke share a
+    // single `with_conn` so the prefix we cache-invalidate definitely
+    // matches the row we just updated, even if some other handler is
+    // racing on the same id.
+    let result = auth.with_conn(|conn| {
+        // Only QueryReturnedNoRows is mapped to None — other rusqlite
+        // errors (I/O, lock contention) must propagate so the revoke
+        // bails out instead of silently skipping cache invalidation.
+        let prefix = match conn.query_row(
+            "SELECT prefix FROM client_tokens WHERE id = ?",
+            rusqlite::params![id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(p) => Some(p),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+        let affected = crate::client_auth::store::revoke(conn, id)?;
+        Ok::<_, rusqlite::Error>((prefix, affected))
+    });
     match result {
         // 0 rows = already revoked OR id never existed. Either way the
         // outcome (the token is unusable) is what the caller wants, so
         // we return 200 in both cases. The `affected` field lets a
         // careful caller distinguish.
-        Ok(affected) => Json(json!({
-            "id": id,
-            "status": "revoked",
-            "affected": affected,
-        }))
-        .into_response(),
+        Ok((prefix, affected)) => {
+            // Drop the cached entry so the revoke takes effect on the
+            // next request rather than waiting for the TTL window to
+            // expire. Safe to call when prefix is None (already-gone
+            // tokens) — invalidate is a no-op on missing keys.
+            if let Some(p) = prefix.as_deref() {
+                auth.invalidate_cached(p);
+            }
+            Json(json!({
+                "id": id,
+                "status": "revoked",
+                "affected": affected,
+            }))
+            .into_response()
+        }
         Err(e) => {
             tracing::warn!("admin/clients: revoke failed: {}", e);
             (

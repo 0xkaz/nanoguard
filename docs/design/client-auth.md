@@ -1,18 +1,16 @@
-> **Status:** partial (commit 6ed6ac5, 2026-05-16)
+> **Status:** partial (commit 8b2d8d2, 2026-05-17 — per-token `pii_overrides`, real `users` table integration, and shadow mode still open; see "Still open" below)
 
 # Client Authentication
 
 **Stage 1 of the rollout is shipped:** token format, SQLite storage,
 the axum verification middleware, the admin CRUD endpoints
-(`/v1/admin/clients` POST/GET/DELETE), and an opt-in `[auth].enabled`
-flag are all in place. Existing deployments are not affected because
-the flag defaults to `false`.
+(`/v1/admin/clients` POST/GET/DELETE), an opt-in `[auth].enabled`
+flag, and the in-memory verification cache with TTL + explicit
+invalidation on revoke. Existing deployments are not affected
+because the flag defaults to `false`.
 
 **Still open** (keeps the doc at `partial` rather than `shipped`):
 
-- In-memory verification cache. Each authed request currently does
-  one SQLite read under a mutex. Fine for v1; the next perf target.
-- TTL + broadcast invalidation, paired with the cache.
 - Per-token `pii_overrides`. The field is reserved on `ClientView`
   but no PII action consults it yet.
 - Integration with the user-management work that introduces the real
@@ -185,23 +183,37 @@ verification time, dropped at request end. Never serialized.
 ## Caching
 
 The hot path must not hit SQLite per request. A read-through cache
-keyed by token prefix:
+keyed by token prefix sits inside `ClientAuth`:
 
-- **Capacity**: bounded (default 10_000 entries). Eviction is LRU.
-- **TTL**: configurable, default 60 seconds. After TTL, the next
+- **Capacity**: bounded by `[auth].cache_capacity` (default 10_000
+  entries). On insert into a full cache, expired entries are
+  preferred for eviction; if every slot is still fresh, the entry
+  with the smallest `last_used` counter (least recently used) is
+  dropped.
+- **TTL**: `[auth].cache_ttl_secs` (default 60). After TTL, the next
   verification re-reads from SQLite. This bounds the maximum
   staleness window for revocations.
-- **Invalidation**: explicit. When a token is revoked or a user is
-  disabled via the admin API or the console, an invalidation
-  message is sent through a tokio broadcast channel to the cache.
-  The cache drops the affected entry immediately. The TTL is the
-  fallback for cases where the invalidation message is missed
-  (process crashed between revoke and broadcast, etc.).
+- **Negative caching**: not done. A lookup that misses in SQLite
+  does not populate the cache. Two reasons: (a) a flood of bogus
+  prefixes must not be able to grow the cache; (b) a newly-minted
+  token has to be visible on the very next request, which
+  caching a `None` would defeat.
+- **Invalidation**: explicit, in-process. The admin revoke handler
+  resolves the token's prefix and calls `auth.invalidate_cached`
+  before returning. The next request for that prefix re-reads
+  SQLite and observes `revoked_at`. The TTL is the fallback for
+  any future revocation source that does not call `invalidate_cached`
+  (e.g., direct SQLite edits).
 
-A revocation that loses the broadcast still becomes effective
-within TTL. A revocation that succeeds the broadcast is effective
-on the next request after the broadcast is processed (typically
-sub-millisecond).
+A direct in-process call beats a tokio broadcast channel here
+because the revoke admin handler and the verification middleware
+both run in the same process against the same `Arc<TokenCache>`.
+A broadcast layer would add complexity without removing any race:
+the channel reader sits on the same task pool as the verifier.
+
+The cache is in-memory only. Process restart clears it; the next
+batch of requests warms it from SQLite. That is the intended
+behavior — there is no persistent cache state to lose.
 
 ## Budget integration
 
