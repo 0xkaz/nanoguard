@@ -54,13 +54,30 @@ fn session_lifecycle() {
     insert_user(&conn, "bob", None, None, "user", None).unwrap();
 
     let sid = vec![1u8; 32];
+    let csrf = vec![2u8; 32];
     let expires = "2026-12-31T23:59:59Z";
-    create_session(&conn, &sid, 1, expires, Some("Mozilla"), Some("127.0.0.1")).unwrap();
+    create_session(
+        &conn,
+        &sid,
+        1,
+        expires,
+        Some("Mozilla"),
+        Some("127.0.0.1"),
+        &csrf,
+    )
+    .unwrap();
 
     let s = session_by_id(&conn, &sid).unwrap().expect("session exists");
     assert_eq!(s.user_id, 1);
+    assert_eq!(s.csrf_token.as_deref(), Some(csrf.as_slice()));
 
     touch_session(&conn, &sid).unwrap();
+
+    let new_csrf = vec![3u8; 32];
+    let rotated = rotate_csrf_token(&conn, &sid, &new_csrf).unwrap();
+    assert_eq!(rotated, 1);
+    let after = session_by_id(&conn, &sid).unwrap().unwrap();
+    assert_eq!(after.csrf_token.as_deref(), Some(new_csrf.as_slice()));
 
     let pruned = prune_expired_sessions(&conn).unwrap();
     assert_eq!(pruned, 0);

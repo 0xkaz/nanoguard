@@ -17,9 +17,19 @@ use axum::{
 use cookie::{Cookie, Key, SameSite};
 use rand::rngs::OsRng;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
-use super::db::{user_by_id, User};
+use super::db::{session_by_id, user_by_id, User};
 
+/// HTTP header carrying the per-session CSRF token on mutating requests.
+pub const CSRF_HEADER: &str = "x-csrf-token";
+
+/// HTTP response header used to communicate a rotated CSRF token back to the
+/// client after a successful mutation. JS clients refresh their cached token
+/// from this header.
+pub const CSRF_NEXT_HEADER: &str = "x-csrf-token-next";
+
+#[derive(Debug)]
 pub struct AuthError(pub StatusCode, pub String);
 
 impl IntoResponse for AuthError {
@@ -59,6 +69,37 @@ pub fn generate_session_id() -> Vec<u8> {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     bytes.to_vec()
+}
+
+/// Generate a 32-byte random CSRF token. Returned as raw bytes; encode with
+/// [`encode_csrf_token`] before sending to a client.
+pub fn generate_csrf_token() -> Vec<u8> {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.to_vec()
+}
+
+/// Encode a raw CSRF token for wire transport. Hex keeps the value
+/// header-safe and trivial to compare client-side.
+pub fn encode_csrf_token(raw: &[u8]) -> String {
+    hex::encode(raw)
+}
+
+/// Decode an incoming CSRF token from the header back into raw bytes. Returns
+/// `None` on malformed input rather than propagating an error so the handler
+/// can fold "missing" and "garbage" into a single 403.
+pub fn decode_csrf_token(s: &str) -> Option<Vec<u8>> {
+    hex::decode(s.trim()).ok()
+}
+
+/// Constant-time comparison of two CSRF tokens. Both inputs are byte slices
+/// of the raw 32-byte token (already hex-decoded). Defeats timing oracles
+/// that would otherwise reveal the prefix of the stored token.
+pub fn csrf_tokens_match(provided: &[u8], stored: &[u8]) -> bool {
+    if provided.len() != stored.len() {
+        return false;
+    }
+    provided.ct_eq(stored).into()
 }
 
 /// Build a signed session cookie.
@@ -172,21 +213,97 @@ impl FromRequestParts<Arc<super::ConsoleState>> for CurrentUser {
     }
 }
 
-/// Optional current user extractor (returns None for anonymous requests).
-pub struct MaybeUser(pub Option<User>);
+/// Extractor for mutating handlers: combines session lookup with CSRF
+/// double-submit verification. The handler must call
+/// [`super::db::rotate_csrf_token`] after a successful side-effecting write
+/// and include the new token in the response via [`CSRF_NEXT_HEADER`].
+///
+/// The flow is:
+///
+/// 1. Extract the session ID from the signed cookie (same as `CurrentUser`).
+/// 2. Look up the session row, including its stored `csrf_token`.
+/// 3. Compare the `X-CSRF-Token` header against the stored token in constant
+///    time. Missing header, malformed hex, mismatched length, or mismatched
+///    bytes all collapse to a single `403 Forbidden` to avoid leaking which
+///    failure mode tripped.
+/// 4. Hand the user + session id to the handler.
+#[derive(Debug)]
+pub struct MutatingUser {
+    pub user: User,
+    pub session_id: Vec<u8>,
+}
 
 #[async_trait]
-impl FromRequestParts<Arc<super::ConsoleState>> for MaybeUser {
+impl FromRequestParts<Arc<super::ConsoleState>> for MutatingUser {
     type Rejection = AuthError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &Arc<super::ConsoleState>,
     ) -> Result<Self, Self::Rejection> {
-        match CurrentUser::from_request_parts(parts, state).await {
-            Ok(CurrentUser(u)) => Ok(MaybeUser(Some(u))),
-            Err(_) => Ok(MaybeUser(None)),
+        let session_id = extract_session_id(&parts.headers, &state.config.console.session_secret)
+            .ok_or_else(|| AuthError(StatusCode::UNAUTHORIZED, "no session".into()))?;
+
+        let provided_header = parts
+            .headers
+            .get(CSRF_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(decode_csrf_token);
+
+        let (user, session_csrf, expired) = state
+            .db
+            .with_conn(|conn| {
+                let session = session_by_id(conn, &session_id)?;
+                let Some(session) = session else {
+                    return Ok((None, None, true));
+                };
+                let now = chrono::Utc::now();
+                let expires = chrono::DateTime::parse_from_rfc3339(&session.expires_at)
+                    .unwrap_or_else(|_| chrono::DateTime::UNIX_EPOCH.into());
+                if now > expires {
+                    let _ = super::db::delete_session(conn, &session_id);
+                    return Ok((None, None, true));
+                }
+                let _ = super::db::touch_session(conn, &session_id);
+                let user = user_by_id(conn, session.user_id)?;
+                Ok((user, session.csrf_token, false))
+            })
+            .map_err(|e| AuthError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if expired {
+            return Err(AuthError(
+                StatusCode::UNAUTHORIZED,
+                "session expired".into(),
+            ));
         }
+
+        let Some(user) = user else {
+            return Err(AuthError(StatusCode::UNAUTHORIZED, "user not found".into()));
+        };
+
+        if user.disabled {
+            return Err(AuthError(
+                StatusCode::UNAUTHORIZED,
+                "account disabled".into(),
+            ));
+        }
+
+        let stored = session_csrf.ok_or_else(|| {
+            AuthError(
+                StatusCode::FORBIDDEN,
+                "csrf token missing from session".into(),
+            )
+        })?;
+        let provided = provided_header
+            .ok_or_else(|| AuthError(StatusCode::FORBIDDEN, "csrf token missing".into()))?;
+        if !csrf_tokens_match(&provided, &stored) {
+            return Err(AuthError(
+                StatusCode::FORBIDDEN,
+                "csrf token mismatch".into(),
+            ));
+        }
+
+        Ok(MutatingUser { user, session_id })
     }
 }
 
@@ -205,5 +322,196 @@ mod tests {
     fn session_id_is_32_bytes() {
         let id = generate_session_id();
         assert_eq!(id.len(), 32);
+    }
+
+    #[test]
+    fn csrf_token_roundtrip() {
+        let raw = generate_csrf_token();
+        assert_eq!(raw.len(), 32);
+        let wire = encode_csrf_token(&raw);
+        let back = decode_csrf_token(&wire).expect("decodes");
+        assert_eq!(raw, back);
+    }
+
+    #[test]
+    fn csrf_tokens_match_accepts_equal_and_rejects_diffs() {
+        let a = vec![7u8; 32];
+        let b = vec![7u8; 32];
+        let c = vec![8u8; 32];
+        let short = vec![7u8; 16];
+        assert!(csrf_tokens_match(&a, &b));
+        assert!(!csrf_tokens_match(&a, &c));
+        assert!(!csrf_tokens_match(&a, &short));
+    }
+
+    #[test]
+    fn csrf_decode_rejects_garbage() {
+        assert!(decode_csrf_token("not-hex").is_none());
+        assert!(decode_csrf_token("").is_some()); // empty hex decodes to empty
+    }
+
+    // ── MutatingUser extractor integration tests ─────────────────────────
+    //
+    // The extractor combines session lookup with CSRF verification. The
+    // tests below stand up a real `ConsoleState` against an in-memory
+    // SQLite DB and drive it via `from_request_parts` to cover the missing
+    // / mismatched / valid + rotation paths called out in XKA-59.
+
+    use crate::console::db::ConsoleDb;
+    use crate::console::ConsoleState;
+    use axum::http::Request;
+    use std::sync::{Arc, Mutex};
+
+    fn test_state() -> (Arc<ConsoleState>, i64, Vec<u8>, Vec<u8>) {
+        let mut config = crate::config::Config::from_file_content(
+            r#"
+[backend]
+provider = "ollama"
+endpoint = "http://localhost:11434"
+
+[console]
+session_secret = "test-secret-for-csrf-tests-zzzzz"
+"#,
+        )
+        .expect("parse test config");
+        // Force in-memory budget DB so the ConsoleDb opens against ":memory:".
+        config.budget.db_path = ":memory:".to_string();
+
+        let db = ConsoleDb {
+            conn: Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        };
+        db.with_conn(crate::console::db::__test_migrate).unwrap();
+
+        let user_id = db
+            .with_conn(|c| {
+                crate::console::db::insert_user(
+                    c,
+                    "alice",
+                    Some("Alice"),
+                    None,
+                    "admin",
+                    Some(b"fake-hash"),
+                )
+            })
+            .unwrap();
+
+        let sid = generate_session_id();
+        let csrf = generate_csrf_token();
+        db.with_conn(|c| {
+            crate::console::db::create_session(
+                c,
+                &sid,
+                user_id,
+                "2099-12-31T23:59:59Z",
+                None,
+                None,
+                &csrf,
+            )
+        })
+        .unwrap();
+
+        let state = Arc::new(ConsoleState {
+            config,
+            db,
+            secure_cookie: false,
+            audit_log: None,
+        });
+        (state, user_id, sid, csrf)
+    }
+
+    fn cookie_header(state: &ConsoleState, sid: &[u8]) -> String {
+        let cookie = build_session_cookie(sid, &state.config.console.session_secret, false);
+        cookie.to_string()
+    }
+
+    #[tokio::test]
+    async fn mutating_user_rejects_missing_csrf_header() {
+        let (state, _uid, sid, _csrf) = test_state();
+        let req = Request::builder()
+            .uri("/api/tokens")
+            .header(axum::http::header::COOKIE, cookie_header(&state, &sid))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = MutatingUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect_err("missing csrf must reject");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mutating_user_rejects_mismatched_csrf() {
+        let (state, _uid, sid, _csrf) = test_state();
+        let wrong = encode_csrf_token(&[0xAAu8; 32]);
+        let req = Request::builder()
+            .uri("/api/tokens")
+            .header(axum::http::header::COOKIE, cookie_header(&state, &sid))
+            .header(CSRF_HEADER, wrong)
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = MutatingUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect_err("mismatched csrf must reject");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mutating_user_accepts_valid_csrf() {
+        let (state, uid, sid, csrf) = test_state();
+        let req = Request::builder()
+            .uri("/api/tokens")
+            .header(axum::http::header::COOKIE, cookie_header(&state, &sid))
+            .header(CSRF_HEADER, encode_csrf_token(&csrf))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let mu = MutatingUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("valid csrf must pass");
+        assert_eq!(mu.user.id, uid);
+        assert_eq!(mu.session_id, sid);
+    }
+
+    #[tokio::test]
+    async fn rotate_csrf_token_changes_stored_value() {
+        let (state, _uid, sid, csrf) = test_state();
+        let new_raw = generate_csrf_token();
+        let n = state
+            .db
+            .with_conn(|c| crate::console::db::rotate_csrf_token(c, &sid, &new_raw))
+            .unwrap();
+        assert_eq!(n, 1);
+        let session = state
+            .db
+            .with_conn(|c| crate::console::db::session_by_id(c, &sid))
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.csrf_token.as_deref(), Some(new_raw.as_slice()));
+        assert_ne!(session.csrf_token.as_deref(), Some(csrf.as_slice()));
+
+        // Old token now fails the extractor; new token succeeds.
+        let req_old = Request::builder()
+            .uri("/api/tokens")
+            .header(axum::http::header::COOKIE, cookie_header(&state, &sid))
+            .header(CSRF_HEADER, encode_csrf_token(&csrf))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req_old.into_parts();
+        let err = MutatingUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect_err("old csrf must reject after rotation");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let req_new = Request::builder()
+            .uri("/api/tokens")
+            .header(axum::http::header::COOKIE, cookie_header(&state, &sid))
+            .header(CSRF_HEADER, encode_csrf_token(&new_raw))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req_new.into_parts();
+        MutatingUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect("new csrf must pass after rotation");
     }
 }
