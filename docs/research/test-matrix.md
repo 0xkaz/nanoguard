@@ -106,8 +106,8 @@ request/response trace.
 | Case | Input shape | Expected result | Failure mode | Related module |
 |---|---|---|---|---|
 | Policy bundle match | Policy rule set selects a path | Deterministic allow/block/redact result | Policy not applied or wrong precedence | `src/policy` if present, otherwise policy layer docs |
-| Recognizer true positive | Recognizer detects the intended class | Evaluation marks success | Missed detection | `_RECOGNIZER_EVAL.md`, recognizer code |
-| Recognizer false positive | Recognizer over-matches benign text | Evaluation marks overreach | False confidence from eval | `_RECOGNIZER_EVAL.md`, recognizer code |
+| Recognizer true positive | Recognizer detects the intended class | Evaluation marks success | Missed detection | `src/bin/nanoguard-eval.rs` |
+| Recognizer false positive | Recognizer over-matches benign text | Evaluation marks overreach | False confidence from eval | `src/bin/nanoguard-eval.rs` |
 | Anthropic tool use | `tool_use` or equivalent appears in Anthropic flow | Tool gate still applies | OpenAI-only logic misses Anthropic path | Anthropic adapter, tool gate |
 
 ## Minimum Pass Criteria

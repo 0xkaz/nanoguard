@@ -29,14 +29,14 @@ e2e:
 e2e-live:
 	./e2e_test.sh
 
-# lint = clippy + fmt check (CI と同じ判定)
+# lint = clippy + fmt check
 lint:
 	cargo clippy -- -D warnings
 	cargo fmt --check
 	@echo "=== lint OK ==="
 
-# check は lint の別名（後方互換）
-check: lint
+# check = test + lint
+check: test lint
 
 fmt:
 	cargo fmt

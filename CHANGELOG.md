@@ -4,6 +4,24 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — web config UI proposal
+
+New file `docs/design/web-config-ui.md` (status: proposed) describes an optional, out-of-process `nanoguard-console` binary. The console serves a read-only audit / budget dashboard and edits `nanoguard.toml`, `dicts/*.txt`, and `policies/*.yaml` through validated forms; on submit it atomically renames the file, writes an edit-audit entry, and sends SIGHUP to the proxy to trigger hot reload. The core proxy keeps its narrow surface — no mutation endpoint on the proxy itself. Loopback + static-token auth is the default; OIDC and CSRF hardening are later-phase. No implementation yet.
+
+### Docs — hot-reload proposal
+
+New file `docs/design/hot-reload.md` (status: proposed) scopes a SIGHUP-driven atomic reload of the request-side configuration: matcher, redactor, spotlight, schema, tool gate, and policy index. The design wraps the config-derived subset of `AppState` in `ArcSwap<ReloadableState>` so handlers acquire a per-request snapshot with a single lock-free pointer load. Validation-on-reload is all-or-nothing; on failure the live state is retained and a `reload_failed` audit entry is written. Listening socket, backend HTTP client, budget DB, and the audit file handle remain restart-only. No implementation yet.
+
+### Docs — dependency policy catches up with Cargo.toml
+
+`CLAUDE.md > Dependency Policy` listed only some of the crates the binary actually pulls in. `tower-http`, `serde_json`, and `tracing-subscriber` have been on the dependency list since v0.5 / v0.6 but were missing from the Allowed line; added now so the policy matches the lockfile.
+
+### Docs — internal notes layout cleanup
+
+Tracked artifacts no longer reference unpublished internal notes by filename or path. The CLAUDE.md Documentation Policy now recognises two internal directories, both gitignored: one agents may edit (working notes that reflect the project's current state) and one they may only read (unsettled proposals, strategy, brainstorming). Public files — code comments, `docs/*`, `CHANGELOG.md`, `README.md` — must stand alone; allusions to internal-only material have been stripped.
+
+This commit removes nine such references that had leaked into tracked files (`src/policy/mod.rs`, `src/guard/sse_deanon.rs`, `src/bin/nanoguard-eval.rs`, `docs/design/policy-engine.md`, `docs/research/test-matrix.md`, and two CHANGELOG lines). The content that used to live inline in those references is preserved where it was useful and dropped where it was just a pointer.
+
 ### Docs — public design docs for v0.4 / v0.5 features
 
 Three new files under `docs/design/`, all status `shipped`, written so the existing implementations finally have a public design doc to point at:
@@ -123,7 +141,7 @@ rules:
 - Multi-bundle stacking and per-tenant override hierarchies.
 - A literal pattern with `redact` / `reject` / `log` action — for those, declare a regex pattern with a placeholder.
 
-These are tracked in `_POLICY_ENGINE.md` and the docs/design/policy-engine.md "Limitations" section.
+These are intentional gaps; see the "Limitations" section in `docs/design/policy-engine.md`.
 
 ## [0.6.0] — 2026-05-10
 
@@ -267,7 +285,7 @@ datamark_char = "^"
 
 - Spotlighting is purely a request-side preprocessor. It does not affect the response path or streaming.
 - Anthropic `/v1/messages` does *not* yet apply spotlighting (its tool-result message shape differs and warrants a separate pass).
-- See `_SPOTLIGHT.md` for design notes and `_SPOTLIGHT_RAG_C.md` for the RAG chunk pipeline that this enables next.
+- A RAG chunk pipeline that builds on spotlighting is on the roadmap.
 
 ## [0.3.0] — 2026-05-10
 

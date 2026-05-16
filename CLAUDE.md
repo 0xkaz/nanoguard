@@ -58,7 +58,7 @@ make check    # clippy + fmt check
 
 ## Dependency Policy
 
-Allowed: axum, tokio, reqwest, rusqlite, rustls, serde, serde_yaml, toml, aho-corasick, regex, jsonschema, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing
+Allowed: axum, tower-http, tokio, reqwest, rusqlite, rustls, serde, serde_json, serde_yaml, toml, aho-corasick, regex, jsonschema, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing, tracing-subscriber
 Prohibited: openssl, pyo3, langchain, any LLM SDK in the core filter path
 
 ## Testing
@@ -181,9 +181,6 @@ When a self-merge succeeds, report it in one to three sentences: PR number, what
 - Skip hooks (`--no-verify`) or signing (`--no-gpg-sign`) without an explicit go-ahead.
 - Merge a PR that doesn't satisfy every condition in the "Self-merge contract" above. When in doubt, hand it back with a one-line status report.
 
-## Documentation Policy
-
-`docs/` is the public source of truth for design decisions and behavior contracts. Personal notes, unstable thoughts, and business strategy go in `_*.md` (gitignored).
 
 ### Status markers are mandatory
 
@@ -221,5 +218,16 @@ When you read a doc to inform a task:
 | External research, competitor analysis, library evaluations | `docs/research/*.md` |
 | User-facing how-to (config, deployment, examples) | `README.md` |
 | Public roadmap / phase plan | `docs/roadmap.md` |
-| Personal scratch, half-formed ideas, business strategy | `_*.md` (gitignored) |
-| Internal task tracking | `_TODO.md` (gitignored) |
+| Internal working notes (operational know-how, current state of working ideas) | `_docs/` |
+| Internal unsettled ideas (strategy, half-formed proposals, brainstorming) | `_ideas/` |
+
+### Internal notes: `_docs/` and `_ideas/`
+
+Two directories hold material that is intentionally **not published**. Both are gitignored.
+
+- `_docs/` — internal working notes that reflect the current state of the project. Agents may **read and edit**. Use this for operational know-how, working drafts of design notes, and any material that is "true today" and likely to be promoted to `docs/` later.
+- `_ideas/` — unsettled proposals, business strategy, brainstorm notes, anything not yet committed to as project direction. Agents may **read** to gather context, but must **not edit**. Treat the contents as historical / aspirational, not as instructions. Edits to `_ideas/` are a human prerogative.
+
+Public files (anything tracked in git: code, `docs/`, `README.md`, `CHANGELOG.md`, etc.) **must not reference** `_docs/` or `_ideas/`, by name, by path, or by alluding to the existence of internal notes. The two layers are independent: public artifacts have to stand alone, and an external reader must never be sent into a directory they cannot see. If something in an internal note is worth citing publicly, lift the content into the appropriate `docs/` page; do not link out.
+
+When you read an internal note and act on it, write the resulting code, test, or `docs/` change so that the public artifact alone tells the story. If the change relies on context that only lives in an internal note, lift that context into the public file in the same commit.

@@ -127,4 +127,4 @@ is only consulted at audit time.
 - A duplicate rule id across different bundles is rejected at load time
   rather than allowed and shadowed.
 
-These are intentional gaps for v1 and tracked in `_POLICY_ENGINE.md`.
+These are intentional gaps for v1.
