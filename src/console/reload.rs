@@ -83,8 +83,23 @@ fn trigger_via_socket(socket_path: &str) -> Result<()> {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    let mut stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("connecting to reload socket {}", socket_path))?;
+    // Connect with timeout to avoid blocking indefinitely.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let socket_path_owned = socket_path.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(UnixStream::connect(&socket_path_owned));
+    });
+    let timeout = Duration::from_secs(5);
+    let mut stream = match rx.recv_timeout(timeout) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(e).with_context(|| format!("connecting to reload socket {}", socket_path));
+        }
+        Err(_) => {
+            bail!("connect to reload socket timed out after {:?}", timeout);
+        }
+    };
+
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .with_context(|| "setting read timeout")?;

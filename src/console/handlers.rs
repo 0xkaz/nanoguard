@@ -799,10 +799,13 @@ pub struct BackupQuery {
 /// Validate that a path is safe for editing/backup/revert.
 fn is_safe_editable_path(path: &str) -> bool {
     let p = std::path::Path::new(path);
-    // Reject any path with parent directory components.
-    if p.components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // Reject absolute paths and parent directory traversal.
+    if p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
         return false;
     }
     path.starts_with("dicts/") || path.starts_with("policies/") || path == "nanoguard.toml"
@@ -902,6 +905,14 @@ pub async fn api_validate_file(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "path is required"})),
+        )
+            .into_response();
+    }
+
+    if !is_safe_editable_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "validating this file is not allowed"})),
         )
             .into_response();
     }

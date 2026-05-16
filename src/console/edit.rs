@@ -356,11 +356,19 @@ pub fn revert_to_backup(file_path: impl AsRef<Path>, backup_name: &str) -> Resul
     };
 
     // Reject path traversal in backup_name.
-    if backup_name.contains("..") || backup_name.contains('/') || backup_name.contains('\\') {
+    let backup_name_path = Path::new(backup_name);
+    if backup_name_path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
         bail!("invalid backup name: {}", backup_name);
     }
-
-    let backup_path = backup_dir.join(backup_name);
+    let file_name = backup_name_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid backup name"))?;
+    let backup_path = backup_dir.join(file_name);
     if !backup_path.exists() {
         bail!("backup not found: {}", backup_name);
     }
@@ -386,7 +394,16 @@ pub fn revert_to_backup(file_path: impl AsRef<Path>, backup_name: &str) -> Resul
         let file = std::fs::File::open(&tmp_path)?;
         file.sync_all()?;
     }
+
     std::fs::rename(&tmp_path, file_path)?;
+
+    // fsync the directory so the rename is durable.
+    #[cfg(unix)]
+    {
+        let dir_file = std::fs::File::open(dir)
+            .with_context(|| format!("opening directory {:?} for fsync", dir))?;
+        let _ = dir_file.sync_all();
+    }
 
     Ok(content)
 }
