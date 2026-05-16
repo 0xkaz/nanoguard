@@ -1,6 +1,13 @@
-> **Status:** shipped (commit pending, 2026-05-16)
+> **Status:** proposed (2026-05-16)
 
 # Aikido SCA in CI
+
+The workflow file is in place but the integration has not been
+exercised against this repo yet (the operator-side enablement —
+account, secret, repo variable — hasn't happened). This note will
+be promoted to `shipped (commit <SHA>, <date>)` after Aikido has
+run on at least one PR in this repo and the operator confirms the
+findings shape is what they expected.
 
 This note records why the project adopted Aikido's dependency-scan
 GitHub Action as an opt-in CI step, what it does, and what it
