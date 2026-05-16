@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — dependency policy catches up with Cargo.toml
+
+`CLAUDE.md > Dependency Policy` listed only some of the crates the binary actually pulls in. `tower-http`, `serde_json`, and `tracing-subscriber` have been on the dependency list since v0.5 / v0.6 but were missing from the Allowed line; added now so the policy matches the lockfile.
+
 ### Docs — internal notes layout cleanup
 
 Tracked artifacts no longer reference unpublished internal notes by filename or path. The CLAUDE.md Documentation Policy now recognises two internal directories, both gitignored: one agents may edit (working notes that reflect the project's current state) and one they may only read (unsettled proposals, strategy, brainstorming). Public files — code comments, `docs/*`, `CHANGELOG.md`, `README.md` — must stand alone; allusions to internal-only material have been stripped.

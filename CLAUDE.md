@@ -58,7 +58,7 @@ make check    # clippy + fmt check
 
 ## Dependency Policy
 
-Allowed: axum, tokio, reqwest, rusqlite, rustls, serde, serde_yaml, toml, aho-corasick, regex, jsonschema, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing
+Allowed: axum, tower-http, tokio, reqwest, rusqlite, rustls, serde, serde_json, serde_yaml, toml, aho-corasick, regex, jsonschema, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing, tracing-subscriber
 Prohibited: openssl, pyo3, langchain, any LLM SDK in the core filter path
 
 ## Testing
@@ -181,9 +181,6 @@ When a self-merge succeeds, report it in one to three sentences: PR number, what
 - Skip hooks (`--no-verify`) or signing (`--no-gpg-sign`) without an explicit go-ahead.
 - Merge a PR that doesn't satisfy every condition in the "Self-merge contract" above. When in doubt, hand it back with a one-line status report.
 
-## Documentation Policy
-
-`docs/` is the public source of truth for design decisions and behavior contracts. Personal notes, unstable thoughts, and business strategy go in `_*.md` (gitignored).
 
 ### Status markers are mandatory
 
