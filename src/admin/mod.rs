@@ -410,6 +410,7 @@ pub async fn list_clients(
                         "created_at": r.created_at,
                         "expires_at": r.expires_at,
                         "revoked_at": r.revoked_at,
+                        "last_used_at": r.last_used_at,
                     })
                 })
                 .collect();
@@ -521,6 +522,7 @@ mod tests {
                 tools: Default::default(),
                 policies: Default::default(),
                 auth: Default::default(),
+                console: Default::default(),
             },
             matchers: std::sync::Arc::new(
                 crate::matcher::Matchers::build(&Default::default()).unwrap(),

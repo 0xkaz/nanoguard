@@ -23,6 +23,7 @@ pub struct ClientTokenRow {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub revoked_at: Option<String>,
+    pub last_used_at: Option<String>,
 }
 
 /// Apply the `client_tokens` schema to an open SQLite connection.
@@ -48,7 +49,15 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_client_tokens_user
             ON client_tokens(user_id);
         "#,
-    )
+    )?;
+    // Idempotently add last_used_at for databases created before this column.
+    let has_col: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('client_tokens') WHERE name = 'last_used_at'")?
+        .exists([])?;
+    if !has_col {
+        conn.execute("ALTER TABLE client_tokens ADD COLUMN last_used_at TEXT", [])?;
+    }
+    Ok(())
 }
 
 /// Insert a freshly-generated token. Returns the row id.
@@ -86,7 +95,7 @@ pub fn lookup_by_prefix(
 ) -> rusqlite::Result<Option<(ClientTokenRow, [u8; 32])>> {
     let mut stmt = conn.prepare(
         "SELECT id, prefix, hash, user_id, label,
-                created_at, expires_at, revoked_at
+                created_at, expires_at, revoked_at, last_used_at
          FROM client_tokens
          WHERE prefix = ?",
     )?;
@@ -103,6 +112,7 @@ pub fn lookup_by_prefix(
     let created_at: String = row.get(5)?;
     let expires_at: Option<String> = row.get(6)?;
     let revoked_at: Option<String> = row.get(7)?;
+    let last_used_at: Option<String> = row.get(8)?;
 
     if hash_blob.len() != 32 {
         return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -123,6 +133,7 @@ pub fn lookup_by_prefix(
             created_at,
             expires_at,
             revoked_at,
+            last_used_at,
         },
         hash,
     )))
@@ -131,7 +142,7 @@ pub fn lookup_by_prefix(
 /// List all tokens for a user. Prefix only — no hash exposed.
 pub fn list_for_user(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<ClientTokenRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, prefix, user_id, label, created_at, expires_at, revoked_at
+        "SELECT id, prefix, user_id, label, created_at, expires_at, revoked_at, last_used_at
          FROM client_tokens
          WHERE user_id = ?
          ORDER BY created_at DESC",
@@ -145,6 +156,7 @@ pub fn list_for_user(conn: &Connection, user_id: i64) -> rusqlite::Result<Vec<Cl
             created_at: row.get(4)?,
             expires_at: row.get(5)?,
             revoked_at: row.get(6)?,
+            last_used_at: row.get(7)?,
         })
     })?;
     rows.collect()

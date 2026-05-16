@@ -5,6 +5,7 @@ pub mod backend;
 pub mod budget;
 pub mod client_auth;
 pub mod config;
+pub mod console;
 pub mod guard;
 pub mod matcher;
 pub mod policy;

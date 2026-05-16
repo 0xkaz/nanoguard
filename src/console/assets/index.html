@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nanoguard Console</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app">
+  <div id="login-page" class="page">
+    <div class="card login-card">
+      <h1>Nanoguard Console</h1>
+      <form id="login-form">
+        <div class="field">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" required autofocus>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" required>
+        </div>
+        <button type="submit" class="btn primary">Sign In</button>
+        <p id="login-error" class="error"></p>
+      </form>
+    </div>
+  </div>
+
+  <div id="main-page" class="page hidden">
+    <header>
+      <div class="brand">Nanoguard Console</div>
+      <nav id="nav"></nav>
+      <div class="user">
+        <span id="user-name"></span>
+        <button id="logout-btn" class="btn small">Logout</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="tab-overview" class="tab">
+        <h2>Overview</h2>
+        <div class="grid">
+          <div class="card">
+            <h3>Configuration</h3>
+            <p>Files on disk: <span id="cfg-count">—</span></p>
+            <button class="btn" data-tab="config">View Config</button>
+          </div>
+          <div class="card">
+            <h3>Audit Log</h3>
+            <p>Recent entries: <span id="audit-count">—</span></p>
+            <button class="btn" data-tab="audit">View Audit</button>
+          </div>
+          <div class="card">
+            <h3>Budget</h3>
+            <p>Active keys: <span id="budget-count">—</span></p>
+            <button class="btn" data-tab="budget">View Budget</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-tokens" class="tab hidden">
+        <h2>My Tokens</h2>
+        <button id="create-token-btn" class="btn primary">Create Token</button>
+        <table class="table" id="tokens-table">
+          <thead><tr><th>Prefix</th><th>Label</th><th>Created</th><th>Last Used</th><th>Expires</th><th>Revoked</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section id="tab-budget" class="tab hidden">
+        <h2>Budget</h2>
+        <table class="table" id="budget-table">
+          <thead><tr><th>API Key</th><th>Usage</th><th>Limit</th><th>Utilization</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section id="tab-audit" class="tab hidden">
+        <h2>Audit Log</h2>
+        <div class="filters">
+          <select id="audit-verdict">
+            <option value="">All verdicts</option>
+            <option value="block">block</option>
+            <option value="alert">alert</option>
+            <option value="flag">flag</option>
+            <option value="reload_ok">reload_ok</option>
+            <option value="reload_failed">reload_failed</option>
+          </select>
+          <button id="audit-refresh" class="btn small">Refresh</button>
+        </div>
+        <table class="table" id="audit-table">
+          <thead><tr><th>Time</th><th>Verdict</th><th>Rule</th><th>Model</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section id="tab-config" class="tab hidden">
+        <h2>Configuration</h2>
+        <div id="config-list"></div>
+      </section>
+
+      <section id="tab-users" class="tab hidden">
+        <h2>Users</h2>
+        <button id="create-user-btn" class="btn primary">Create User</button>
+        <table class="table" id="users-table">
+          <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Disabled</th><th>Created</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- Create Token Modal -->
+<dialog id="token-modal">
+  <form method="dialog" class="modal-form">
+    <h3>Create Token</h3>
+    <div class="field">
+      <label for="token-label">Label</label>
+      <input type="text" id="token-label" required>
+    </div>
+    <div class="field">
+      <label for="token-expires">Expires (optional, RFC3339)</label>
+      <input type="text" id="token-expires" placeholder="2026-12-31T23:59:59Z">
+    </div>
+    <div id="token-result" class="hidden">
+      <div class="alert warning">
+        <strong>Store this token now — it is not recoverable.</strong>
+      </div>
+      <div class="field">
+        <input type="text" id="token-secret" readonly>
+        <button type="button" id="copy-token-btn" class="btn small">Copy</button>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="submit" id="token-submit" class="btn primary">Create</button>
+      <button type="button" id="token-close" class="btn">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Create User Modal -->
+<dialog id="user-modal">
+  <form method="dialog" class="modal-form">
+    <h3>Create User</h3>
+    <div class="field">
+      <label for="new-username">Username</label>
+      <input type="text" id="new-username" required>
+    </div>
+    <div class="field">
+      <label for="new-password">Password (min 12 chars)</label>
+      <input type="password" id="new-password" required minlength="12">
+    </div>
+    <div class="field">
+      <label for="new-role">Role</label>
+      <select id="new-role"><option value="user">user</option><option value="admin">admin</option></select>
+    </div>
+    <p id="user-error" class="error"></p>
+    <div class="actions">
+      <button type="submit" id="user-submit" class="btn primary">Create</button>
+      <button type="button" id="user-close" class="btn">Close</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>

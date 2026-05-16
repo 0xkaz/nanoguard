@@ -2,7 +2,7 @@
 name = "nanoguard"
 version = "0.7.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.88"
 description = "Nano-fast CPU-only offline-first LLM guardrails proxy"
 license = "MIT"
 
@@ -17,6 +17,10 @@ path = "src/main.rs"
 [[bin]]
 name = "nanoguard-eval"
 path = "src/bin/nanoguard-eval.rs"
+
+[[bin]]
+name = "nanoguard-console"
+path = "src/bin/nanoguard-console.rs"
 
 [dependencies]
 axum = "0.7"
@@ -46,7 +50,11 @@ jsonschema = { version = "0.30", default-features = false }
 serde_yaml = "0.9"
 arc-swap = "1"
 subtle = "2"
-rand = "0.9"
+rand = "0.8"
+argon2 = "0.5"
+cookie = { version = "0.18", features = ["signed", "percent-encode", "key-expansion"] }
+hex = "0.4"
+zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
