@@ -35,13 +35,25 @@ jobs:
   aikido:
     name: aikido / dependency scan
     runs-on: ubuntu-latest
-    if: vars.AIKIDO_ENABLED == 'true'
+    # Skip on PRs from forks — secrets.AIKIDO_SECRET_KEY isn't passed to
+    # fork workflows for security reasons, so the Aikido step would
+    # receive an empty secret-key and error noisily. (`continue-on-error`
+    # below softens this to an advisory check, but adding the fork
+    # exemption avoids the noise entirely on external contributions.)
+    if: |
+      vars.AIKIDO_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions pinned to immutable commit SHAs — tags can
+      # be force-pushed by upstream maintainers, and a repositioned
+      # tag in a security scanner is exactly the supply-chain attack
+      # this workflow is supposed to defend against.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Aikido scan
-        uses: AikidoSec/github-actions-workflow@v1.0.13
+        uses: AikidoSec/github-actions-workflow@47d83dbcf3e6635044c4b31cef590c1e095217cc # v1.0.13
         with:
           secret-key: ${{ secrets.AIKIDO_SECRET_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
