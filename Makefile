@@ -284,8 +284,8 @@ preflight:
 	    echo "       install once with:"; \
 	    echo "           cargo install cargo-audit"; \
 	    echo ""; \
-	    echo "       cargo-audit is required by preflight because protected"; \
-	    echo "       branch and nightly CI run the security audit; failures"; \
+	    echo "       cargo-audit is required by preflight because nightly CI"; \
+	    echo "       runs the security audit; failures"; \
 	    echo "       here surface advisories before review."; \
 	    exit 1; \
 	}

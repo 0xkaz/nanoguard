@@ -19,12 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Use the RustSec action to avoid compiling cargo-audit from source on
-      # every run. Local `make preflight` remains stricter with `--deny warnings`.
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-audit
+        run: cargo binstall cargo-audit --no-confirm
+
       - name: Audit dependencies
-        uses: rustsec/audit-check@v1.4.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --deny warnings
 
   coverage:
     name: test coverage
