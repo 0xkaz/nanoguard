@@ -1,6 +1,6 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
-        bench coverage miri audit ci push release-patch release-minor release-major \
+        bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight mirai preflight-mirai
 
 
@@ -103,7 +103,7 @@ mirai:
 	    echo "       MIRAI is an optional deep static-analysis pass."; \
 	    exit 1; \
 	}
-	cargo mirai --tests
+	cargo mirai --tests $(MIRAI_FLAGS)
 
 # ── Security audit (requires: cargo install cargo-audit) ─────────────────────
 # Checks dependencies against RustSec advisory database

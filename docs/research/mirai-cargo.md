@@ -1,4 +1,4 @@
-> **Status:** proposed - optional developer/static-analysis workflow, not a required CI gate.
+> **Status:** partial (`make mirai` / `make preflight-mirai` shipped; CI promotion pending after false-positive triage)
 
 # MIRAI cargo integration
 
