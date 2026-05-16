@@ -3,7 +3,9 @@
 //! Local-password auth with argon2id + signed session cookies.
 
 use argon2::{
-    password_hash::{rand_core::RngCore, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{
+        rand_core::RngCore, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
     Argon2,
 };
 use axum::{
@@ -89,13 +91,11 @@ pub fn build_logout_cookie(secret: &str, secure: bool) -> Cookie<'static> {
 
     let mut jar = cookie::CookieJar::new();
     jar.signed_mut(&key).add(cookie.clone());
-    jar.get("ng_session")
-        .cloned()
-        .unwrap_or_else(|| {
-            let mut c = Cookie::new("ng_session", "");
-            c.set_max_age(cookie::time::Duration::seconds(0));
-            c
-        })
+    jar.get("ng_session").cloned().unwrap_or_else(|| {
+        let mut c = Cookie::new("ng_session", "");
+        c.set_max_age(cookie::time::Duration::seconds(0));
+        c
+    })
 }
 
 /// Extract the raw session ID from the signed cookie header value.
@@ -151,7 +151,10 @@ impl FromRequestParts<Arc<super::ConsoleState>> for CurrentUser {
             .map_err(|e| AuthError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         if expired {
-            return Err(AuthError(StatusCode::UNAUTHORIZED, "session expired".into()));
+            return Err(AuthError(
+                StatusCode::UNAUTHORIZED,
+                "session expired".into(),
+            ));
         }
 
         let Some(user) = user else {
@@ -159,7 +162,10 @@ impl FromRequestParts<Arc<super::ConsoleState>> for CurrentUser {
         };
 
         if user.disabled {
-            return Err(AuthError(StatusCode::UNAUTHORIZED, "account disabled".into()));
+            return Err(AuthError(
+                StatusCode::UNAUTHORIZED,
+                "account disabled".into(),
+            ));
         }
 
         Ok(CurrentUser(user))

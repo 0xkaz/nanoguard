@@ -1,5 +1,5 @@
-use rusqlite::Connection;
 use super::*;
+use rusqlite::Connection;
 
 fn in_memory() -> Connection {
     Connection::open_in_memory().unwrap()
@@ -10,7 +10,15 @@ fn user_crud_roundtrip() {
     let conn = in_memory();
     migrate(&conn).unwrap();
 
-    let id = insert_user(&conn, "alice", Some("Alice"), Some("a@example.com"), "user", None).unwrap();
+    let id = insert_user(
+        &conn,
+        "alice",
+        Some("Alice"),
+        Some("a@example.com"),
+        "user",
+        None,
+    )
+    .unwrap();
     assert_eq!(id, 1);
 
     let user = user_by_id(&conn, id).unwrap().expect("user exists");
@@ -19,10 +27,21 @@ fn user_crud_roundtrip() {
     assert_eq!(user.role, "user");
     assert!(!user.disabled);
 
-    let by_name = user_by_username(&conn, "alice").unwrap().expect("user by name");
+    let by_name = user_by_username(&conn, "alice")
+        .unwrap()
+        .expect("user by name");
     assert_eq!(by_name.id, id);
 
-    update_user(&conn, id, Some("Alice Smith"), None, Some("admin"), None, None, None).unwrap();
+    update_user(
+        &conn,
+        id,
+        UserUpdate {
+            display_name: Some("Alice Smith"),
+            role: Some("admin"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let updated = user_by_id(&conn, id).unwrap().unwrap();
     assert_eq!(updated.display_name, Some("Alice Smith".into()));
     assert_eq!(updated.role, "admin");

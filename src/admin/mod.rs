@@ -522,6 +522,7 @@ mod tests {
                 tools: Default::default(),
                 policies: Default::default(),
                 auth: Default::default(),
+                console: Default::default(),
             },
             matchers: std::sync::Arc::new(
                 crate::matcher::Matchers::build(&Default::default()).unwrap(),

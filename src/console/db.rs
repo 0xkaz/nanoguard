@@ -164,49 +164,47 @@ pub fn list_users(conn: &Connection) -> anyhow::Result<Vec<User>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-pub fn update_user(
-    conn: &Connection,
-    id: i64,
-    display_name: Option<&str>,
-    email: Option<&str>,
-    role: Option<&str>,
-    disabled: Option<bool>,
-    allowed_models: Option<&str>,
-    budget_limit: Option<Option<i64>>,
-) -> anyhow::Result<usize> {
+/// Patch struct for `update_user`. Each `None` field is left untouched; each
+/// `Some` field is written. Grouped into one struct to keep the function
+/// signature within clippy's `too_many_arguments` budget.
+#[derive(Default)]
+pub struct UserUpdate<'a> {
+    pub display_name: Option<&'a str>,
+    pub email: Option<&'a str>,
+    pub role: Option<&'a str>,
+    pub disabled: Option<bool>,
+    pub allowed_models: Option<&'a str>,
+    pub budget_limit: Option<Option<i64>>,
+}
+
+pub fn update_user(conn: &Connection, id: i64, patch: UserUpdate<'_>) -> anyhow::Result<usize> {
     let mut total = 0;
-    if let Some(v) = display_name {
+    if let Some(v) = patch.display_name {
         total += conn.execute(
             "UPDATE users SET display_name = ?1 WHERE id = ?2",
             params![v, id],
         )?;
     }
-    if let Some(v) = email {
-        total += conn.execute(
-            "UPDATE users SET email = ?1 WHERE id = ?2",
-            params![v, id],
-        )?;
+    if let Some(v) = patch.email {
+        total += conn.execute("UPDATE users SET email = ?1 WHERE id = ?2", params![v, id])?;
     }
-    if let Some(v) = role {
-        total += conn.execute(
-            "UPDATE users SET role = ?1 WHERE id = ?2",
-            params![v, id],
-        )?;
+    if let Some(v) = patch.role {
+        total += conn.execute("UPDATE users SET role = ?1 WHERE id = ?2", params![v, id])?;
     }
-    if let Some(v) = disabled {
+    if let Some(v) = patch.disabled {
         let flag: i64 = if v { 1 } else { 0 };
         total += conn.execute(
             "UPDATE users SET disabled = ?1 WHERE id = ?2",
             params![flag, id],
         )?;
     }
-    if let Some(v) = allowed_models {
+    if let Some(v) = patch.allowed_models {
         total += conn.execute(
             "UPDATE users SET allowed_models = ?1 WHERE id = ?2",
             params![v, id],
         )?;
     }
-    if let Some(v) = budget_limit {
+    if let Some(v) = patch.budget_limit {
         total += conn.execute(
             "UPDATE users SET budget_limit = ?1 WHERE id = ?2",
             params![v, id],
@@ -336,10 +334,16 @@ pub fn maybe_bootstrap_admin(
     if count > 0 {
         return Ok(false);
     }
-    insert_user(conn, username, Some(username), None, "admin", Some(password_hash))?;
+    insert_user(
+        conn,
+        username,
+        Some(username),
+        None,
+        "admin",
+        Some(password_hash),
+    )?;
     Ok(true)
 }
-
 
 #[cfg(test)]
 mod tests;

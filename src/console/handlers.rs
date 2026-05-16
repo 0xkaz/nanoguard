@@ -6,9 +6,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -102,19 +102,25 @@ impl From<User> for UserResponse {
 
 // ── Auth helpers ────────────────────────────────────────────────────────────
 
-fn require_admin(user: &User) -> Result<(), Response> {
+fn require_admin(user: &User) -> Result<(), Box<Response>> {
     if user.role != "admin" {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "admin required"})),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "admin required"})),
+            )
+                .into_response(),
+        ));
     }
     Ok(())
 }
 
 fn session_cookie(state: &ConsoleState, session_id: &[u8]) -> cookie::Cookie<'static> {
-    build_session_cookie(session_id, &state.config.console.session_secret, state.secure_cookie)
+    build_session_cookie(
+        session_id,
+        &state.config.console.session_secret,
+        state.secure_cookie,
+    )
 }
 
 fn logout_cookie(state: &ConsoleState) -> cookie::Cookie<'static> {
@@ -209,23 +215,31 @@ pub async fn api_login(
             .into_response();
     }
 
-    if let Err(e) = state.db.with_conn(|conn| db::update_last_login(conn, user.id)) {
+    if let Err(e) = state
+        .db
+        .with_conn(|conn| db::update_last_login(conn, user.id))
+    {
         tracing::warn!("login: failed to update last_login: {}", e);
     }
 
     let session_id = super::auth::generate_session_id();
     let ttl_hours = state.config.console.session_ttl_hours;
     let expires = chrono::Utc::now() + chrono::Duration::hours(ttl_hours);
-    let user_agent = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok());
+    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
     let ip = headers
         .get("x-forwarded-for")
         .or_else(|| headers.get("x-real-ip"))
         .and_then(|v| v.to_str().ok());
 
     if let Err(e) = state.db.with_conn(|conn| {
-        db::create_session(conn, &session_id, user.id, &expires.to_rfc3339(), user_agent, ip)
+        db::create_session(
+            conn,
+            &session_id,
+            user.id,
+            &expires.to_rfc3339(),
+            user_agent,
+            ip,
+        )
     }) {
         tracing::warn!("login: failed to create session: {}", e);
         return (
@@ -254,7 +268,9 @@ pub async fn api_logout(
     // Instead, we'll just let the client clear it and rely on the cookie expiry.
     if let Some(u) = user {
         // Best-effort: delete all sessions for this user (aggressive logout).
-        let _ = state.db.with_conn(|conn| db::delete_user_sessions(conn, u.id));
+        let _ = state
+            .db
+            .with_conn(|conn| db::delete_user_sessions(conn, u.id));
     }
 
     let cookie = logout_cookie(&state);
@@ -276,7 +292,9 @@ pub async fn api_list_tokens(
     State(state): State<Arc<ConsoleState>>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    let result = state.db.with_conn(|conn| Ok(token_store::list_for_user(conn, user.id)?));
+    let result = state
+        .db
+        .with_conn(|conn| Ok(token_store::list_for_user(conn, user.id)?));
     match result {
         Ok(rows) => {
             let items: Vec<_> = rows
@@ -371,7 +389,11 @@ pub async fn api_create_token(
     let (id, token) = match minted {
         Some(pair) => pair,
         None => {
-            tracing::warn!("create_token: failed after {} attempts: {:?}", MAX_ATTEMPTS, last_err);
+            tracing::warn!(
+                "create_token: failed after {} attempts: {:?}",
+                MAX_ATTEMPTS,
+                last_err
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "failed to persist token"})),
@@ -400,12 +422,10 @@ pub async fn api_revoke_token(
     Path(id): Path<i64>,
 ) -> Response {
     // Verify the token belongs to the current user (non-admins cannot revoke others' tokens).
-    let belongs = state
-        .db
-        .with_conn(|conn| {
-            let rows = token_store::list_for_user(conn, user.id)?;
-            Ok(rows.into_iter().any(|r| r.id == id))
-        });
+    let belongs = state.db.with_conn(|conn| {
+        let rows = token_store::list_for_user(conn, user.id)?;
+        Ok(rows.into_iter().any(|r| r.id == id))
+    });
 
     match belongs {
         Ok(true) => {}
@@ -426,7 +446,10 @@ pub async fn api_revoke_token(
         }
     }
 
-    match state.db.with_conn(|conn| Ok(token_store::revoke(conn, id)?)) {
+    match state
+        .db
+        .with_conn(|conn| Ok(token_store::revoke(conn, id)?))
+    {
         Ok(affected) => Json(json!({
             "id": id,
             "status": "revoked",
@@ -637,7 +660,7 @@ pub async fn api_list_users(
     CurrentUser(user): CurrentUser,
 ) -> Response {
     if let Err(e) = require_admin(&user) {
-        return e;
+        return *e;
     }
 
     match state.db.with_conn(db::list_users) {
@@ -662,7 +685,7 @@ pub async fn api_create_user(
     Json(body): Json<CreateUserRequest>,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
-        return e;
+        return *e;
     }
 
     let username = body.username.trim();
@@ -733,19 +756,21 @@ pub async fn api_update_user(
     Json(body): Json<UpdateUserRequest>,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
-        return e;
+        return *e;
     }
 
     match state.db.with_conn(|conn| {
         db::update_user(
             conn,
             id,
-            body.display_name.as_deref(),
-            body.email.as_deref(),
-            body.role.as_deref(),
-            body.disabled,
-            body.allowed_models.as_deref(),
-            body.budget_limit,
+            db::UserUpdate {
+                display_name: body.display_name.as_deref(),
+                email: body.email.as_deref(),
+                role: body.role.as_deref(),
+                disabled: body.disabled,
+                allowed_models: body.allowed_models.as_deref(),
+                budget_limit: body.budget_limit,
+            },
         )
     }) {
         Ok(n) => Json(json!({ "affected": n })).into_response(),

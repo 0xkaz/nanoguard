@@ -48,9 +48,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(ref bootstrap) = config.console.auth.local.bootstrap_admin {
         if let Ok(pw) = std::env::var(&bootstrap.password_env) {
             let hash = auth::hash_password(&pw)?;
-            let created = db.with_conn(|conn| {
-                db::maybe_bootstrap_admin(conn, &bootstrap.username, &hash)
-            })?;
+            let created =
+                db.with_conn(|conn| db::maybe_bootstrap_admin(conn, &bootstrap.username, &hash))?;
             if created {
                 tracing::info!(
                     "Bootstrap admin '{}' provisioned. Clear ${} from the environment.",
@@ -99,12 +98,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route("/api/login", post(handlers::api_login))
         .route("/api/logout", post(handlers::api_logout))
         .route("/api/me", get(handlers::api_me))
-        .route("/api/tokens", get(handlers::api_list_tokens).post(handlers::api_create_token))
+        .route(
+            "/api/tokens",
+            get(handlers::api_list_tokens).post(handlers::api_create_token),
+        )
         .route("/api/tokens/:id", delete(handlers::api_revoke_token))
         .route("/api/audit", get(handlers::api_audit))
         .route("/api/budget", get(handlers::api_budget))
         .route("/api/config", get(handlers::api_config))
-        .route("/api/users", get(handlers::api_list_users).post(handlers::api_create_user))
+        .route(
+            "/api/users",
+            get(handlers::api_list_users).post(handlers::api_create_user),
+        )
         .route("/api/users/:id", put(handlers::api_update_user))
         .with_state(state);
 
