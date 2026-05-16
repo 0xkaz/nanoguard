@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — provider matrix expansion entered the roadmap
+
+`docs/roadmap.md` gains a "Provider matrix expansion (post-v1, opt-in)" entry covering when and how nanoguard might grow its adapter set beyond the current OpenAI / Anthropic / Ollama trio. The entry codifies four design lines that any future Gemini / Bedrock / Cohere / Vertex adapter must hold: pluggable behind Cargo features so the default binary stays small, OpenAI-shaped IR so the translation layer stays at N+N rather than N², guardrails stay first-class (every adapter must be audit-symmetric with the OpenAI path), and the README continues to recommend LiteLLM downstream as the default deployment for 100+-provider needs. `docs/design/multi-backend-routing.md > Open questions` gains a back-reference so the design-doc reader sees the same bounds.
+
 ### CI — opt-in Aikido SCA scan
 
 New `.github/workflows/aikido.yml` runs Aikido's dependency vulnerability scan on push to `main` and on PRs. The job is gated by the repo variable `AIKIDO_ENABLED == 'true'` so it stays inert until an operator opts in (the repo also needs the `AIKIDO_SECRET_KEY` secret provisioned from the Aikido dashboard), and skips PRs from forks (which don't have access to the secret). Third-party actions are pinned to immutable commit SHAs with the matching tag in a comment — relevant supply-chain hygiene for a security scanner. `continue-on-error: true` means a real finding shows up as an advisory check, not a merge-blocker, until we have a release cycle of clean runs and promote it to required. Setup instructions live in `docs/operations.md > External CI scans`; the tool-decision write-up lives in `docs/research/aikido-sca.md`. The scan complements (does not duplicate) the existing CodeRabbit / Greptile / Qodo review bots — those reason about diffs, Aikido scans the dependency tree against CVE feeds.
