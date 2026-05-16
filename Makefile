@@ -267,8 +267,8 @@ pr-web: pr
 	@gh pr view --web
 
 # ── Preflight (run before make pr) ──────────────────────────────────────────
-# Mirrors the CI lint, test, audit, and e2e jobs so a feature branch fails
-# locally instead of red-statusing a PR. Required by CLAUDE.md > Branch Policy.
+# Local superset of PR and protected-branch CI so a feature branch fails before
+# review. Required by CLAUDE.md > Branch Policy.
 
 preflight:
 	@echo "→ cargo fmt --check"
@@ -284,9 +284,9 @@ preflight:
 	    echo "       install once with:"; \
 	    echo "           cargo install cargo-audit"; \
 	    echo ""; \
-	    echo "       cargo-audit is required by preflight because the CI"; \
-	    echo "       'security audit' job runs it; failures here surface"; \
-	    echo "       advisories before they break a PR."; \
+	    echo "       cargo-audit is required by preflight because protected"; \
+	    echo "       branch and nightly CI run the security audit; failures"; \
+	    echo "       here surface advisories before review."; \
 	    exit 1; \
 	}
 	cargo audit --deny warnings
