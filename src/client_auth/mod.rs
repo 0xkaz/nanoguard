@@ -16,9 +16,12 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+pub mod middleware;
 pub mod runtime;
 pub mod store;
 
+pub use crate::config::AuthConfig;
+pub use middleware::{verify_request, ClientView};
 pub use runtime::ClientAuth;
 
 #[cfg(test)]

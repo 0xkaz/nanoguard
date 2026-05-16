@@ -85,10 +85,25 @@ async fn main() -> Result<()> {
     let provider = cfg.backend.provider.clone();
     let endpoint = cfg.backend.endpoint.clone();
 
-    let app = Router::new()
+    // Routes that go through client-token verification (when
+    // [auth].enabled = true; the middleware short-circuits otherwise).
+    // /v1/models is gated too — listing models is privileged information
+    // once token-scoped allowed_models lands.
+    let protected = Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/messages", post(proxy::anthropic::messages))
         .route("/v1/models", get(proxy::list_models))
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            nanoguard::client_auth::verify_request,
+        ));
+
+    // Public + admin-gated routes. /health stays unauthenticated for LB
+    // probes. /v1/admin/* has its own ADMIN_API_KEY Bearer check inside
+    // each handler — adding the client-token layer here would require
+    // operators to mint a client token before they could even configure
+    // budgets, which inverts the bootstrap order.
+    let public_and_admin = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/admin/budget/:api_key", get(admin::get_budget))
         .route(
@@ -98,8 +113,9 @@ async fn main() -> Result<()> {
         .route(
             "/v1/admin/budget/:api_key/reset",
             axum::routing::delete(admin::reset_budget),
-        )
-        .with_state(shared.clone());
+        );
+
+    let app = protected.merge(public_and_admin).with_state(shared.clone());
 
     let addr = listen.parse::<std::net::SocketAddr>()?;
     tracing::info!("nanoguard listening on http://{addr}");
