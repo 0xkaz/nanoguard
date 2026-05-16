@@ -14,6 +14,7 @@
 - buffered SSE output filtering
 - ToolGate for tool-call evaluation
 - schema validation module for structured responses and tool arguments
+- Release Strategy review and initial automation (GitHub Release)
 
 ## Partial
 
