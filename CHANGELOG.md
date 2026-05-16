@@ -4,6 +4,14 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — hot reload via SIGHUP
+
+The proxy now picks up config / dict / policy bundle changes without a restart. SIGHUP triggers a rebuild of the matcher, redactor, spotlight, schema, tool gate, and policy index; on success the new state is atomically swapped in (lock-free via `arc-swap`). In-flight requests finish on the snapshot they acquired at handler entry, so a reload mid-request never produces a half-applied filter pass.
+
+Reload is all-or-nothing: a TOML parse error, an invalid policy YAML, a regex that fails to compile, or any other build failure leaves the live state untouched and writes a `reload_failed` audit entry. A successful reload writes `reload_ok`. Restart-only knobs (listen address, log level, backend pool, budget DB, audit file handle) are isolated in a `RuntimeHandles` struct that survives across reloads.
+
+`docs/design/hot-reload.md` graduates from `proposed` to `shipped`. Two new e2e scenarios (20: SIGHUP picks up a new block rule; 21: invalid config keeps live state) bring the e2e count from 41 to 47 assertions.
+
 ### Docs — multi-user auth & routing design set
 
 Four new / revised design docs that together describe how nanoguard becomes a real policy boundary for multi-user deployments. All status `proposed`; no implementation yet.

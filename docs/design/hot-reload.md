@@ -1,4 +1,4 @@
-> **Status:** proposed (2026-05-16)
+> **Status:** shipped (commit 19fddf0, 2026-05-16)
 
 # Hot Reload
 
