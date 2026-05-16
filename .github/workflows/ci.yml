@@ -11,7 +11,14 @@ env:
 jobs:
   test:
     name: build + test + lint
-    runs-on: ubuntu-latest
+    # Matrix expands the test job across linux + macOS so platform-specific
+    # build breakage in bundled deps (rusqlite, rustls) surfaces in CI rather
+    # than at release time. Windows is intentionally left for a follow-up.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,11 +42,49 @@ jobs:
       - name: Test
         run: cargo test
 
+      # `--all-targets` includes benches and integration tests so the CI lint
+      # surface matches `make preflight` (see CLAUDE.md > Branch Policy).
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Format check
         run: cargo fmt --check
+
+  msrv:
+    name: MSRV check (Cargo.toml rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          set -euo pipefail
+          rv=$(awk -F'"' '/^rust-version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          if [ -z "${rv}" ]; then
+            echo "Cargo.toml is missing [package].rust-version" >&2
+            exit 1
+          fi
+          echo "version=${rv}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # Build (not test) on the declared MSRV — proves the pinned rust-version
+      # is honest. Tests stay on stable so the matrix doesn't double its cost.
+      - name: Build on MSRV
+        run: cargo build --tests
 
   audit:
     name: security audit
@@ -48,8 +93,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      # `--deny warnings` so future advisories that only emit a warning still
+      # fail CI instead of passing silently. Matches `make preflight`.
       - name: Audit dependencies
-        run: cargo audit
+        run: cargo audit --deny warnings
 
   trivy:
     name: trivy scan

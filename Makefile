@@ -29,9 +29,10 @@ e2e:
 e2e-live:
 	./e2e_test.sh
 
-# lint = clippy + fmt check
+# lint = clippy + fmt check. Match CI: --all-targets --all-features so benches
+# and integration tests are linted too (see .github/workflows/ci.yml).
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 	cargo fmt --check
 	@echo "=== lint OK ==="
 
@@ -272,8 +273,8 @@ pr-web: pr
 preflight:
 	@echo "→ cargo fmt --check"
 	cargo fmt --check
-	@echo "→ cargo clippy --all-targets -- -D warnings"
-	cargo clippy --all-targets -- -D warnings
+	@echo "→ cargo clippy --all-targets --all-features -- -D warnings"
+	cargo clippy --all-targets --all-features -- -D warnings
 	@echo "→ cargo test"
 	cargo test --quiet
 	@echo "→ cargo audit"
@@ -288,7 +289,7 @@ preflight:
 	    echo "       advisories before they break a PR."; \
 	    exit 1; \
 	}
-	cargo audit
+	cargo audit --deny warnings
 	@echo "→ semgrep"
 	@command -v docker >/dev/null 2>&1 || { \
 	    echo ""; \
