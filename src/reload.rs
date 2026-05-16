@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 
-use crate::{audit, backend, budget, config, AppState};
+use crate::{audit, backend, budget, client_auth, config, AppState};
 
 /// Handles that survive a hot reload.
 ///
@@ -13,12 +13,19 @@ use crate::{audit, backend, budget, config, AppState};
 /// in flight (SQLite connection pooling, open file handles, HTTP
 /// keep-alive pools). Reload reuses them as-is and only rebuilds the
 /// matcher / redactor / guards / policy index on top.
+///
+/// Client-auth lives here too because its SQLite connection and (in a
+/// later commit) its in-memory verification cache + invalidation
+/// broadcast channel must persist across reloads — operators editing
+/// `[auth]` keys other than `enabled` get a "restart-only" warning,
+/// same pattern as `[backend]`.
 #[derive(Clone)]
 pub struct RuntimeHandles {
     pub backend: backend::Backend,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,
     pub audit: Option<Arc<audit::AuditLog>>,
+    pub client_auth: Option<client_auth::ClientAuth>,
 }
 
 /// Shared, swappable handle to the live `AppState`.
@@ -203,6 +210,7 @@ pub fn build_app_state(mut cfg: config::Config, runtime: RuntimeHandles) -> Resu
         http_client: runtime.http_client,
         budget: runtime.budget,
         audit: runtime.audit,
+        client_auth: runtime.client_auth,
     })
 }
 
@@ -341,6 +349,27 @@ fn warn_on_restart_only_drift(live: &crate::config::Config, new: &crate::config:
     }
     if live.audit.hash_only != new.audit.hash_only {
         ignored.push("[audit].hash_only");
+    }
+    // [auth].* is restart-only in v1: the SQLite handle for client_tokens
+    // and (in a later commit) the verification cache + invalidation
+    // broadcast channel are runtime state owned by RuntimeHandles. Live
+    // toggling of `enabled` is plausible but easy to misuse (flip on
+    // before any tokens exist → lock everyone out), so we keep all of
+    // [auth] behind a restart for the first iteration.
+    if live.auth.enabled != new.auth.enabled {
+        ignored.push("[auth].enabled");
+    }
+    if live.auth.env_marker != new.auth.env_marker {
+        ignored.push("[auth].env_marker");
+    }
+    if live.auth.cache_capacity != new.auth.cache_capacity {
+        ignored.push("[auth].cache_capacity");
+    }
+    if live.auth.cache_ttl_secs != new.auth.cache_ttl_secs {
+        ignored.push("[auth].cache_ttl_secs");
+    }
+    if live.auth.require_https != new.auth.require_https {
+        ignored.push("[auth].require_https");
     }
 
     if !ignored.is_empty() {

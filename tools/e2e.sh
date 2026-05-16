@@ -773,6 +773,227 @@ else
     ng "22e. audit log contains the original endpoint string — error sanitizer regression?"
 fi
 
+# --- 23. Client token auth — mint, use, revoke ----------------------------
+info "scenario 23: client-token enforcement (mint → use → revoke)"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+S23_DB="$LOGDIR/e2e.s23.db"
+S23_TOML="$LOGDIR/e2e.s23.toml"
+S23_LOG="$LOGDIR/ng.s23.log"
+rm -f "$S23_DB"
+
+# Build a config with [auth].enabled and a known ADMIN_API_KEY.
+# [budget] is also enabled so the same DB file holds budget + tokens.
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S23_TOML"
+cat >> "$S23_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S23_DB"
+admin_api_key = "s23-admin"
+
+[auth]
+enabled = true
+env_marker = "t"
+EOF
+
+NANOGUARD_CONFIG="$S23_TOML" "$BIN" > "$S23_LOG" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# 23a. /health remains unauthenticated.
+HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/health")
+assert_eq "23a. /health stays unauthenticated when [auth].enabled" "$HEALTH_CODE" "200"
+
+# 23b. Proxy endpoint without a bearer is rejected (401).
+NO_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"no token"}]}')
+assert_eq "23b. /v1/chat/completions rejects missing bearer with 401" "$NO_AUTH_CODE" "401"
+
+# 23c. Malformed bearer is also 401.
+BAD_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer not-a-real-token" \
+    -d '{"model":"test","messages":[{"role":"user","content":"bad token"}]}')
+assert_eq "23c. /v1/chat/completions rejects malformed bearer with 401" "$BAD_AUTH_CODE" "401"
+
+# 23d. Mint a token through the admin API.
+MINT_RESP=$(curl -s "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"e2e-test","user_id":1}')
+TOKEN_WIRE=$(echo "$MINT_RESP" | jq -r '.token // empty')
+TOKEN_ID=$(echo "$MINT_RESP" | jq -r '.id // empty')
+if [ -n "$TOKEN_WIRE" ] && [ "$TOKEN_WIRE" != "null" ]; then
+    ok "23d. admin POST /v1/admin/clients returns a wire token"
+else
+    ng "23d. mint response missing 'token' field: $MINT_RESP"
+fi
+
+# 23e. The token follows the ng_t_ shape (env_marker=t in this config).
+case "$TOKEN_WIRE" in
+    ng_t_*) ok "23e. minted token uses the configured env_marker (ng_t_…)" ;;
+    *)      ng "23e. minted token does NOT start with ng_t_: $TOKEN_WIRE" ;;
+esac
+
+# 23f. Using the minted token, the same request succeeds.
+AUTHED_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_WIRE" \
+    -d '{"model":"test","messages":[{"role":"user","content":"with token"}]}')
+assert_eq "23f. /v1/chat/completions accepts a valid bearer (200)" "$AUTHED_CODE" "200"
+
+# 23g. List shows the token by prefix (never the secret).
+LIST_RESP=$(curl -s -H "Authorization: Bearer s23-admin" "$NG_URL/v1/admin/clients?user_id=1")
+LIST_PREFIX=$(echo "$LIST_RESP" | jq -r '.data[0].prefix // empty')
+case "$LIST_PREFIX" in
+    ng_t_*) ok "23g. GET /v1/admin/clients lists the token by prefix" ;;
+    *)      ng "23g. list did not return prefix; resp: $LIST_RESP" ;;
+esac
+
+# 23h. The list response never includes the secret.
+if echo "$LIST_RESP" | jq -e '.data[0].token // empty' > /dev/null 2>&1; then
+    ng "23h. list leaked the secret token (.data[0].token present)"
+else
+    ok "23h. list does not include the full wire token"
+fi
+
+# 23i. Revoke through the admin API.
+REVOKE_RESP=$(curl -s -X DELETE -H "Authorization: Bearer s23-admin" \
+    "$NG_URL/v1/admin/clients/$TOKEN_ID")
+REVOKE_STATUS=$(echo "$REVOKE_RESP" | jq -r '.status // empty')
+assert_eq "23i. DELETE /v1/admin/clients/:id returns status=revoked" "$REVOKE_STATUS" "revoked"
+
+# 23j. The cache TTL (default 60s in our [auth] block) means the revoked
+# token MIGHT still work for up to cache_ttl_secs. There is no cache yet
+# (that lands in task #43), so for now revocation takes effect on the
+# next request. Verify that:
+REVOKED_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_WIRE" \
+    -d '{"model":"test","messages":[{"role":"user","content":"after revoke"}]}')
+assert_eq "23j. revoked token is rejected (401)" "$REVOKED_CODE" "401"
+
+# 23k. Admin rejects an empty label at mint time (Greptile-flagged
+# inconsistency: previously stored as NULL, response echoed "").
+EMPTY_LABEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"","user_id":1}')
+assert_eq "23k. POST /v1/admin/clients rejects empty label (400)" "$EMPTY_LABEL_CODE" "400"
+
+# 23l. Admin rejects a malformed expires_at (Qodo-flagged: bad format
+# previously stored verbatim, made the token effectively non-expiring).
+BAD_EXP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"x","user_id":1,"expires_at":"not-a-timestamp"}')
+assert_eq "23l. POST /v1/admin/clients rejects malformed expires_at (400)" "$BAD_EXP_CODE" "400"
+
+# 23m. A valid RFC3339 expires_at IS accepted.
+GOOD_EXP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"x","user_id":1,"expires_at":"2099-12-31T23:59:59Z"}')
+assert_eq "23m. POST /v1/admin/clients accepts RFC3339 expires_at (201)" "$GOOD_EXP_CODE" "201"
+
+# --- 24. Hot reload — restart-only [auth].* drift -------------------------
+info "scenario 24: changing [auth].* on reload warns and is ignored"
+# Reuse the auth-enabled proxy from scenario 23. Edit [auth].env_marker
+# and SIGHUP; the live state should keep env_marker=t.
+sed -i.bak 's|env_marker = "t"|env_marker = "x"|' "$S23_TOML"
+kill -HUP "$NG_PID" 2>/dev/null || true
+# Poll for the specific reload-only warning (restart-only key + [auth].env_marker)
+# rather than a fixed sleep and a broad grep — fixed sleeps flake under load.
+RELOAD_WARN_RE='restart-only key.*\[auth\]\.env_marker|\[auth\]\.env_marker.*restart-only key'
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    grep -Eq "$RELOAD_WARN_RE" "$S23_LOG" 2>/dev/null && break
+done
+
+if grep -Eq "$RELOAD_WARN_RE" "$S23_LOG" 2>/dev/null; then
+    ok "24a. proxy log warns about ignored [auth].env_marker change"
+else
+    ng "24a. expected restart-only warn for [auth].env_marker; tail: $(tail -10 "$S23_LOG")"
+fi
+
+# Confirm the live env_marker is still 't': mint a new token, check prefix.
+NEW_MINT=$(curl -s "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"post-reload","user_id":1}')
+NEW_PREFIX=$(echo "$NEW_MINT" | jq -r '.prefix // empty')
+case "$NEW_PREFIX" in
+    ng_t_*) ok "24b. live env_marker unchanged after SIGHUP (still ng_t_)" ;;
+    *)      ng "24b. env_marker drifted: prefix=$NEW_PREFIX" ;;
+esac
+
+# --- 25. require_https enforcement ----------------------------------------
+info "scenario 25: [auth].require_https rejects plain-HTTP requests"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+S25_DB="$LOGDIR/e2e.s25.db"
+S25_TOML="$LOGDIR/e2e.s25.toml"
+S25_LOG="$LOGDIR/ng.s25.log"
+rm -f "$S25_DB"
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S25_TOML"
+cat >> "$S25_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S25_DB"
+admin_api_key = "s25-admin"
+
+[auth]
+enabled = true
+env_marker = "t"
+require_https = true
+EOF
+
+NANOGUARD_CONFIG="$S25_TOML" "$BIN" > "$S25_LOG" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# Mint a token to use as a valid bearer in the next checks.
+MINT_S25=$(curl -s "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s25-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"s25","user_id":1}')
+TOKEN_S25=$(echo "$MINT_S25" | jq -r '.token // empty')
+
+# Without X-Forwarded-Proto, the request is rejected 403 even with a
+# valid bearer — transport check happens before token verification.
+NO_PROTO_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_S25" \
+    -d '{"model":"test","messages":[{"role":"user","content":"no proto"}]}')
+assert_eq "25a. require_https rejects without X-Forwarded-Proto (403)" "$NO_PROTO_CODE" "403"
+
+# X-Forwarded-Proto: http is also rejected.
+HTTP_PROTO_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_S25" \
+    -H "X-Forwarded-Proto: http" \
+    -d '{"model":"test","messages":[{"role":"user","content":"http proto"}]}')
+assert_eq "25b. require_https rejects X-Forwarded-Proto: http (403)" "$HTTP_PROTO_CODE" "403"
+
+# X-Forwarded-Proto: https + valid bearer = success.
+HTTPS_OK_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_S25" \
+    -H "X-Forwarded-Proto: https" \
+    -d '{"model":"test","messages":[{"role":"user","content":"https proto"}]}')
+assert_eq "25c. require_https accepts X-Forwarded-Proto: https (200)" "$HTTPS_OK_CODE" "200"
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"
