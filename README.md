@@ -499,9 +499,27 @@ make dev      # debug build + run
 make test     # cargo test
 make check    # clippy + fmt
 make bench    # criterion benchmarks → target/criterion/
+make mirai    # optional MIRAI static analysis
 ```
 
 Requires: Rust 1.75+
+
+Optional deep static analysis uses MIRAI. Install it once from the maintained
+upstream repository:
+
+```bash
+git clone https://github.com/endorlabs/MIRAI.git
+cd MIRAI
+cargo install --locked --path ./checker
+```
+
+Then run `make mirai` from this repo. Use `make preflight-mirai` when you want
+the normal preflight suite plus MIRAI before opening a security-sensitive PR.
+You can pass MIRAI options through `MIRAI_FLAGS`, for example:
+
+```bash
+MIRAI_FLAGS="--diag=verify --body_analysis_timeout 60" make mirai
+```
 
 ---
 
