@@ -9,8 +9,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect non-doc changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!_docs/**'
+              - '!README*'
+              - '!CHANGELOG*'
+
   test:
     name: build + test + lint
+    needs: changes
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -19,7 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Skip Rust checks for docs-only PR
+        if: github.event_name == 'pull_request' && needs.changes.outputs.code != 'true'
+        run: echo "Only documentation paths changed; build, test, and lint are covered by non-doc PRs and pushes."
+
       - name: Install Rust stable
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         # dtolnay/rust-toolchain ships its versions as branch tips, not tagged releases,
         # so we pin the `stable` branch HEAD by commit SHA. Bump deliberately when the
         # upstream toolchain bump matters; see docs/research/aikido-sca.md.
@@ -31,6 +58,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache cargo
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -39,18 +67,22 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Format check
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         run: cargo fmt --check
 
       # `--all-targets` includes benches and integration tests so the CI lint
       # surface matches `make preflight` (see CLAUDE.md > Branch Policy).
       - name: Clippy
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         run: cargo test --all-features
 
   msrv:
     name: MSRV check (Cargo.toml rust-version)
+    needs: changes
     runs-on: ubuntu-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -59,8 +91,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Skip MSRV for docs-only PR
+        if: github.event_name == 'pull_request' && needs.changes.outputs.code != 'true'
+        run: echo "Only documentation paths changed; MSRV build is skipped for this PR."
+
       - name: Read rust-version from Cargo.toml
         id: msrv
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         run: |
           set -euo pipefail
           rv=$(awk -F'"' '/^rust-version[[:space:]]*=/{print $2; exit}' Cargo.toml)
@@ -71,6 +108,7 @@ jobs:
           echo "version=${rv}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust ${{ steps.msrv.outputs.version }}
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
@@ -79,6 +117,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache cargo
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -89,19 +128,31 @@ jobs:
       # Build (not test) on the declared MSRV — proves the pinned rust-version
       # is honest. Tests stay on stable so the matrix doesn't double its cost.
       - name: Build on MSRV
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         run: cargo build --tests --all-features
 
   audit:
     name: security audit
+    needs: changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      # `--deny warnings` so future advisories that only emit a warning still
-      # fail CI instead of passing silently. Matches `make preflight`.
+
+      - name: Skip audit for PRs
+        if: github.event_name == 'pull_request'
+        run: echo "Cargo audit runs on protected-branch pushes and in the scheduled nightly workflow."
+
+      # Use the RustSec action to avoid compiling cargo-audit from source on
+      # every run. Local `make preflight` remains stricter with `--deny warnings`.
       - name: Audit dependencies
-        run: cargo audit --deny warnings
+        if: github.event_name != 'pull_request'
+        uses: rustsec/audit-check@v1.4.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   trivy:
     name: trivy scan
@@ -169,20 +220,32 @@ jobs:
 
   coverage:
     name: test coverage
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Skip coverage for PRs
+        if: github.event_name == 'pull_request'
+        run: echo "Coverage runs on protected-branch pushes and in the scheduled nightly workflow."
+
       - name: Install Rust stable
+        if: github.event_name != 'pull_request'
         # See comment in `build + test + lint` job above for pinning rationale.
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-17
         with:
           components: llvm-tools-preview
 
+      - name: Install cargo-binstall
+        if: github.event_name != 'pull_request'
+        uses: cargo-bins/cargo-binstall@main
+
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
+        if: github.event_name != 'pull_request'
+        run: cargo binstall cargo-llvm-cov --no-confirm
 
       - name: Cache cargo
+        if: github.event_name != 'pull_request'
         uses: actions/cache@v4
         with:
           path: |
@@ -192,4 +255,5 @@ jobs:
           key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Coverage summary
+        if: github.event_name != 'pull_request'
         run: cargo llvm-cov --all-features --summary-only

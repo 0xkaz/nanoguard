@@ -508,6 +508,12 @@ make mirai    # optional MIRAI static analysis
 
 Requires: Rust 1.75+
 
+PR CI runs the fast build/test/lint matrix plus MSRV, Trivy, and Semgrep for
+code changes. Documentation-only PRs keep the same required check names green
+but skip Rust build/test/lint, MSRV, audit, and coverage. `security audit` and
+`test coverage` still run on protected-branch pushes and in the scheduled
+Nightly workflow; run `make preflight` locally before opening code PRs.
+
 Optional deep static analysis uses MIRAI. Install it once from the maintained
 upstream repository:
 
