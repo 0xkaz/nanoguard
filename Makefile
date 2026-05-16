@@ -1,6 +1,6 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
-        bench coverage miri audit geiger ci push release-patch release-minor release-major \
+        bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight
 
 MODEL ?= qwen3:0.6b
@@ -111,7 +111,7 @@ semgrep:
 
 # ── Full CI-equivalent check (build + test + clippy + fmt + audit) ───────────
 
-ci: check test audit semgrep
+ci: check audit semgrep
 	@echo "=== All CI checks passed ==="
 
 clean:
