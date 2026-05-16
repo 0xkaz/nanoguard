@@ -2,7 +2,7 @@
 name = "nanoguard"
 version = "0.7.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.86"
 description = "Nano-fast CPU-only offline-first LLM guardrails proxy"
 license = "MIT"
 
