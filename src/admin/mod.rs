@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::{AppState, SharedState};
@@ -22,9 +23,9 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Respon
 
     // If admin is disabled (None) or configured with an empty key
     // (Some("") from TOML), expected == "" and an unauthenticated
-    // caller (provided == "") would otherwise pass ct_eq.  Reject
-    // both cases uniformly so neither enables unauthenticated access
-    // and the status code does not leak whether admin is enabled.
+    // caller (provided == "") would otherwise pass the comparison.
+    // Reject both cases uniformly so neither enables unauthenticated
+    // access and the status code does not leak whether admin is enabled.
     let unauthorized = || {
         Box::new(
             (
@@ -39,8 +40,15 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Respon
         return Err(unauthorized());
     }
 
-    // Constant-time comparison to prevent timing attacks.
-    if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
+    // Hash both sides to fixed-size 32-byte digests before comparing.
+    // `subtle::ConstantTimeEq` on raw byte slices short-circuits when
+    // the lengths differ, which would leak the configured key length
+    // through response timing. Comparing SHA-256 digests instead keeps
+    // the comparison over a uniform 32-byte buffer regardless of input
+    // length, removing the length-based side channel.
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    let expected_digest = Sha256::digest(expected.as_bytes());
+    if !bool::from(provided_digest.ct_eq(&expected_digest)) {
         return Err(unauthorized());
     }
 
@@ -584,5 +592,25 @@ mod tests {
         let resp_enabled = *require_admin(&enabled, &headers).unwrap_err();
 
         assert_eq!(resp_disabled.status(), resp_enabled.status());
+    }
+
+    #[test]
+    fn require_admin_rejects_token_with_different_length() {
+        // Regression: previously `ct_eq` on raw byte slices short-circuited
+        // when lengths differed, leaking the configured key's byte-length
+        // through response timing. Hashing both sides to fixed-size digests
+        // removes the length branch — any-length wrong token still rejects.
+        let state = dummy_state(Some("supersecret".to_string()));
+        for guess in ["", "a", "x".repeat(64).as_str(), "supersecre"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {guess}").parse().unwrap());
+            let resp = *require_admin(&state, &headers).unwrap_err();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "guess {:?} should be rejected",
+                guess
+            );
+        }
     }
 }
