@@ -1,0 +1,52 @@
+name: Aikido SCA scan
+
+# Opt-in supply-chain / dependency vulnerability scan via Aikido
+# (https://www.aikido.dev). The job is intentionally gated by a repo
+# variable (`AIKIDO_ENABLED`) so it stays inert in forks and in this
+# repo until the secret `AIKIDO_SECRET_KEY` has been provisioned.
+#
+# To enable on this repo:
+#   1. Create an account at aikido.dev (free tier is sufficient for SCA).
+#   2. Generate a CI secret key in Settings → Integrations → CI/CD.
+#   3. Add it to GitHub: Settings → Secrets and variables → Actions →
+#      New repository secret → name=AIKIDO_SECRET_KEY, value=<key>.
+#   4. Flip the variable: Settings → Secrets and variables → Actions →
+#      Variables tab → New repository variable → name=AIKIDO_ENABLED,
+#      value=true.
+#
+# The check is NOT added to the main-branch ruleset's required status
+# checks until it's been running cleanly for a release cycle — we don't
+# want a third-party SaaS outage to block merges.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Aikido is informational for now; never block PRs on a transient failure.
+# (`fail-on-dependency-scan: true` below is what *causes* the job to
+# return non-zero on a real finding; the workflow-level continue-on-error
+# converts that into an advisory check on the PR.)
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  aikido:
+    name: aikido / dependency scan
+    runs-on: ubuntu-latest
+    if: vars.AIKIDO_ENABLED == 'true'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Aikido scan
+        uses: AikidoSec/github-actions-workflow@v1.0.13
+        with:
+          secret-key: ${{ secrets.AIKIDO_SECRET_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # CRITICAL only for now — start narrow so the signal-to-noise
+          # ratio is high. Widen to HIGH once we've seen what CRITICAL
+          # flags in practice.
+          minimum-severity: 'CRITICAL'
+          fail-on-dependency-scan: true
