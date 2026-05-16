@@ -299,11 +299,13 @@ budget.
 
 Bearer tokens are credentials. nanoguard does not terminate TLS
 itself by default — the deployment model assumes a reverse proxy
-(Caddy / nginx / Cloudflare / a managed LB) in front. When the
-proxy listens on a non-loopback interface and `[auth].
-require_https = true`, the proxy rejects requests where the
-`X-Forwarded-Proto` header is not `https`. Loopback listens are
-exempt because they are not over a network.
+(Caddy / nginx / Cloudflare / a managed LB) in front. When
+`[auth].require_https = true`, the proxy rejects requests where
+the `X-Forwarded-Proto` header is not `https`. The check is
+unconditional when enabled: there is no loopback exemption in
+Stage 1 because the middleware does not have `ConnectInfo`
+plumbing to distinguish loopback from non-loopback clients.
+Operators running on loopback should leave `require_https = false`.
 
 This is opt-in because operators who run nanoguard behind a
 local proxy that strips the header still need it to work. The

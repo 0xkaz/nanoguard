@@ -12,7 +12,7 @@
 //! wiring (the in-memory cache, the request-extension threading, the admin
 //! endpoints) lands in a follow-up commit.
 
-use rand::RngCore;
+use rand::{rngs::OsRng, TryRngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -72,8 +72,12 @@ impl Token {
     /// glance which environment it belonged to.
     pub fn generate(env_marker: char) -> Self {
         let mut secret_bytes = [0u8; SECRET_LEN];
-        let mut rng = rand::thread_rng();
-        rng.fill_bytes(&mut secret_bytes);
+        // Use the OS RNG directly. We could go through `rand::rng()` (the
+        // thread-local CSPRNG) but token minting is far off the hot path and
+        // the OS source removes one layer between us and the kernel entropy.
+        OsRng
+            .try_fill_bytes(&mut secret_bytes)
+            .expect("OS RNG must be available to mint client tokens");
 
         let mut secret = String::with_capacity(SECRET_LEN);
         for b in secret_bytes.iter() {

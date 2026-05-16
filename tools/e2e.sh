@@ -908,12 +908,18 @@ info "scenario 24: changing [auth].* on reload warns and is ignored"
 # and SIGHUP; the live state should keep env_marker=t.
 sed -i.bak 's|env_marker = "t"|env_marker = "x"|' "$S23_TOML"
 kill -HUP "$NG_PID" 2>/dev/null || true
-sleep 0.5  # give the reload task a moment
+# Poll for the specific reload-only warning (restart-only key + [auth].env_marker)
+# rather than a fixed sleep and a broad grep — fixed sleeps flake under load.
+RELOAD_WARN_RE='restart-only key.*\[auth\]\.env_marker|\[auth\]\.env_marker.*restart-only key'
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    grep -Eq "$RELOAD_WARN_RE" "$S23_LOG" 2>/dev/null && break
+done
 
-if grep -q "\[auth\].env_marker" "$S23_LOG" 2>/dev/null; then
+if grep -Eq "$RELOAD_WARN_RE" "$S23_LOG" 2>/dev/null; then
     ok "24a. proxy log warns about ignored [auth].env_marker change"
 else
-    ng "24a. expected [auth].env_marker in warn; tail: $(tail -10 "$S23_LOG")"
+    ng "24a. expected restart-only warn for [auth].env_marker; tail: $(tail -10 "$S23_LOG")"
 fi
 
 # Confirm the live env_marker is still 't': mint a new token, check prefix.

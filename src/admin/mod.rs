@@ -54,8 +54,12 @@ pub struct SetLimitRequest {
 #[derive(Deserialize)]
 pub struct CreateClientRequest {
     /// Required user-supplied label so an operator can identify the
-    /// token in lists later. The full secret is shown ONCE on
-    /// successful creation and never persisted in plaintext.
+    /// token in lists later. The handler rejects empty / whitespace-only
+    /// values with 400. `#[serde(default)]` keeps a missing field on the
+    /// 400 path (with a clear error body) instead of axum's generic 422
+    /// JSON-extractor error. The full secret is shown ONCE on successful
+    /// creation and never persisted in plaintext.
+    #[serde(default)]
     pub label: String,
     /// Optional RFC3339 timestamp at which the token expires. Null /
     /// missing = no expiry; the middleware will not reject on expiry.
@@ -70,7 +74,10 @@ pub struct CreateClientRequest {
 
 #[derive(Deserialize)]
 pub struct ListClientsQuery {
-    /// Optional filter. Omitted = list every token across all users.
+    /// Required filter. Omitting `user_id` results in a 400 from the
+    /// `list_clients` handler — Stage 1 does not support listing all
+    /// users at once. `#[serde(default)]` keeps the field on the 400
+    /// path with a clear error body instead of axum's generic 422.
     #[serde(default)]
     pub user_id: Option<i64>,
 }
