@@ -288,8 +288,11 @@ session_secret    = "${CONSOLE_SESSION_SECRET}"
 session_ttl_hours = 24                    # default; cookie + DB session lifetime
 
 [console.auth]
-mode = "oidc"                          # "oidc" | "local" | "both"
-                                       # Phase 1 only implements "local"
+mode = "local"                         # "oidc" | "local" | "both"
+                                       # Phase 1 only implements "local";
+                                       # the "oidc" block below is a
+                                       # Phase 4 forward-reference, not
+                                       # yet wired up.
 
 [console.auth.oidc]
 issuer       = "https://idp.example.com"
@@ -478,13 +481,13 @@ model). File editing depends on hot reload.
    spotlight, schema, tool gate). Restart-only keys (listen,
    backends.*, audit.path, budget.db_path) remain read-only in the
    UI.
-4. **Phase 4 — OIDC + CSRF hardening.** Adds the OIDC login flow
+4. **Phase 4 — OIDC integration.** Adds the OIDC login flow
    from `user-management.md`, with auto-provisioning and
-   admin-claim mapping. Per-session double-submit CSRF token.
-   Documents how to put the console behind a reverse proxy.
-   Static-token auth (the simpler single-operator mode that was
-   the earlier version of this doc) is dropped: local password and
-   OIDC are the two supported modes.
+   admin-claim mapping. CSRF protection is already in place from
+   Phase 2; this phase documents how to put the console behind a
+   reverse proxy. Static-token auth (the simpler single-operator
+   mode that was the earlier version of this doc) is dropped:
+   local password and OIDC are the two supported modes.
 5. **Phase 5 (optional) — change-request mode.** Instead of
    writing the file directly, the console writes to a worktree
    branch and opens a PR via the local `gh` CLI. The reload only
