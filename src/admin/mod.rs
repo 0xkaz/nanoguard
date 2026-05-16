@@ -6,39 +6,50 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::{AppState, SharedState};
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    let expected = match &state.config.budget.admin_api_key {
-        Some(k) => k,
-        None => {
-            return Err(Box::new(
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "admin API is disabled"})),
-                )
-                    .into_response(),
-            ))
-        }
-    };
-
+    let expected = state.config.budget.admin_api_key.as_deref().unwrap_or("");
     let provided = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    if provided != expected {
-        return Err(Box::new(
+    // If admin is disabled (None) or configured with an empty key
+    // (Some("") from TOML), expected == "" and an unauthenticated
+    // caller (provided == "") would otherwise pass the comparison.
+    // Reject both cases uniformly so neither enables unauthenticated
+    // access and the status code does not leak whether admin is enabled.
+    let unauthorized = || {
+        Box::new(
             (
                 StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "invalid admin API key"})),
+                Json(json!({"error": "unauthorized"})),
             )
                 .into_response(),
-        ));
+        )
+    };
+
+    if expected.is_empty() {
+        return Err(unauthorized());
+    }
+
+    // Hash both sides to fixed-size 32-byte digests before comparing.
+    // `subtle::ConstantTimeEq` on raw byte slices short-circuits when
+    // the lengths differ, which would leak the configured key length
+    // through response timing. Comparing SHA-256 digests instead keeps
+    // the comparison over a uniform 32-byte buffer regardless of input
+    // length, removing the length-based side channel.
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    let expected_digest = Sha256::digest(expected.as_bytes());
+    if !bool::from(provided_digest.ct_eq(&expected_digest)) {
+        return Err(unauthorized());
     }
 
     Ok(())
@@ -476,6 +487,154 @@ pub async fn revoke_client(
                 Json(json!({"error": "failed to revoke token"})),
             )
                 .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BackendConfig, BudgetConfig, Config};
+
+    fn dummy_state(admin_key: Option<String>) -> AppState {
+        AppState {
+            config: Config {
+                nanoguard: Default::default(),
+                backend: BackendConfig {
+                    provider: "ollama".to_string(),
+                    endpoint: "http://localhost:11434".to_string(),
+                    api_key: None,
+                    model: None,
+                },
+                input: Default::default(),
+                output: Default::default(),
+                budget: BudgetConfig {
+                    admin_api_key: admin_key,
+                    ..Default::default()
+                },
+                audit: Default::default(),
+                tools: Default::default(),
+                policies: Default::default(),
+                auth: Default::default(),
+            },
+            matchers: std::sync::Arc::new(
+                crate::matcher::Matchers::build(&Default::default()).unwrap(),
+            ),
+            redactor: std::sync::Arc::new(crate::proxy::redact::Redactor::build(&[], &[]).unwrap()),
+            pii_actions: std::sync::Arc::new(crate::proxy::redact::ActionPartition {
+                mask: std::collections::HashSet::new(),
+                reject: std::collections::HashSet::new(),
+                log: std::collections::HashSet::new(),
+            }),
+            spotlight: None,
+            schema: None,
+            tool_gate: None,
+            policy: None,
+            backend: crate::backend::Backend::new(BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            }),
+            http_client: reqwest::Client::new(),
+            budget: None,
+            audit: None,
+            client_auth: None,
+        }
+    }
+
+    #[test]
+    fn require_admin_accepts_valid_key() {
+        let state = dummy_state(Some("supersecret".to_string()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer supersecret".parse().unwrap());
+        assert!(require_admin(&state, &headers).is_ok());
+    }
+
+    #[test]
+    fn require_admin_rejects_wrong_key() {
+        let state = dummy_state(Some("supersecret".to_string()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_missing_header_when_key_is_set() {
+        let state = dummy_state(Some("supersecret".to_string()));
+        let headers = HeaderMap::new();
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_when_disabled() {
+        let state = dummy_state(None);
+        let headers = HeaderMap::new();
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_empty_string_key() {
+        // admin_api_key = "" in TOML produces Some(""), which must behave
+        // identically to None (admin disabled) — not grant access.
+        let state = dummy_state(Some(String::new()));
+        let headers = HeaderMap::new(); // no Authorization header => provided == ""
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_empty_string_key_with_any_token() {
+        let state = dummy_state(Some(String::new()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer any-token".parse().unwrap());
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_any_token_when_disabled() {
+        let state = dummy_state(None);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer any-token".parse().unwrap());
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_same_status_for_disabled_and_wrong_key() {
+        let disabled = dummy_state(None);
+        let enabled = dummy_state(Some("key".to_string()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+
+        let resp_disabled = *require_admin(&disabled, &headers).unwrap_err();
+        let resp_enabled = *require_admin(&enabled, &headers).unwrap_err();
+
+        assert_eq!(resp_disabled.status(), resp_enabled.status());
+    }
+
+    #[test]
+    fn require_admin_rejects_token_with_different_length() {
+        // Regression: previously `ct_eq` on raw byte slices short-circuited
+        // when lengths differed, leaking the configured key's byte-length
+        // through response timing. Hashing both sides to fixed-size digests
+        // removes the length branch — any-length wrong token still rejects.
+        let state = dummy_state(Some("supersecret".to_string()));
+        for guess in ["", "a", "x".repeat(64).as_str(), "supersecre"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {guess}").parse().unwrap());
+            let resp = *require_admin(&state, &headers).unwrap_err();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "guess {:?} should be rejected",
+                guess
+            );
         }
     }
 }

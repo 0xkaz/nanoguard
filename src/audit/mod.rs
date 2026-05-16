@@ -1,7 +1,10 @@
 use std::{
     io::Write,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use serde::Serialize;
@@ -44,6 +47,12 @@ pub struct AuditEntry {
 pub struct AuditLog {
     file: Mutex<std::fs::File>,
     hash_only: bool,
+    fsync_every_write: bool,
+    // `Mutex::into_inner` on a `PoisonError` does not clear the poison flag,
+    // so every subsequent `lock()` will return `Err(poisoned)` for the rest
+    // of the process lifetime. We log the recovery exactly once and silently
+    // recover thereafter to avoid flooding the operator log on every write.
+    poison_logged: AtomicBool,
 }
 
 impl AuditLog {
@@ -61,6 +70,8 @@ impl AuditLog {
         Ok(Arc::new(Self {
             file: Mutex::new(file),
             hash_only: cfg.hash_only,
+            fsync_every_write: cfg.fsync_every_write,
+            poison_logged: AtomicBool::new(false),
         }))
     }
 
@@ -74,13 +85,11 @@ impl AuditLog {
         let line = match serde_json::to_string(entry) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("audit serialize error: {e}");
+                tracing::error!("audit serialize error: {e}");
                 return;
             }
         };
-        if let Ok(mut f) = self.file.lock() {
-            let _ = writeln!(f, "{line}");
-        }
+        self.write_line(&line, "request");
     }
 
     /// Append a reload outcome to the audit log.
@@ -103,17 +112,50 @@ impl AuditLog {
         let line = match serde_json::to_string(&entry) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("audit serialize error (reload): {e}");
+                tracing::error!("audit serialize error (reload): {e}");
                 return;
             }
         };
-        if let Ok(mut f) = self.file.lock() {
-            let _ = writeln!(f, "{line}");
-        }
+        self.write_line(&line, "reload");
     }
 
     pub fn hash_only(&self) -> bool {
         self.hash_only
+    }
+
+    // Shared sink for both request and reload entries. Surfaces lock
+    // poisoning and I/O failures via `tracing::error!` instead of dropping
+    // them silently — see XKA-48.
+    fn write_line(&self, line: &str, kind: &str) {
+        // Recover from a poisoned mutex: if a previous thread panicked
+        // while holding the lock, the file handle itself is still valid,
+        // so we keep writing rather than blackholing every subsequent
+        // entry.
+        let mut guard = match self.file.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                // `into_inner` does not clear the poison flag, so every
+                // future `lock()` returns `Err(poisoned)` too. Log the
+                // recovery once per process to avoid flooding the operator
+                // log; the subsequent recoveries are silent but still
+                // succeed.
+                if !self.poison_logged.swap(true, Ordering::Relaxed) {
+                    tracing::error!(
+                        "audit lock was poisoned ({kind}); recovering and continuing (further recoveries on this log will be silent)"
+                    );
+                }
+                poisoned.into_inner()
+            }
+        };
+        if let Err(e) = writeln!(&mut *guard, "{line}") {
+            tracing::error!("audit write failed ({kind}): {e}");
+            return;
+        }
+        if self.fsync_every_write {
+            if let Err(e) = guard.sync_all() {
+                tracing::error!("audit fsync failed ({kind}): {e}");
+            }
+        }
     }
 }
 
@@ -134,12 +176,200 @@ struct ReloadEntry {
     latency_us: u64,
 }
 
+// Monotonic counter mixed into request ids so two ids minted in the same
+// nanosecond (or on platforms with coarse clocks) still differ. This is a
+// collision-prevention measure, not an unpredictability guarantee — the
+// counter component is sequential and trivially predictable from a prior id.
+// Request ids are not used for authentication or capability checks.
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub fn new_request_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // simple unique id: timestamp_ns in hex (no uuid dep)
-    format!("{ns:032x}")
+    let seq = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 32 hex chars of timestamp + 16 hex chars of a monotonic counter.
+    // The counter half is purely a collision-prevention tie-breaker for
+    // same-nanosecond ids; it is not unpredictable. No uuid dep.
+    format!("{ns:032x}{seq:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AuditConfig;
+    use std::io::{BufRead, BufReader};
+
+    fn temp_audit_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "nanoguard-audit-{tag}-{}-{nanos}.jsonl",
+            std::process::id()
+        ))
+    }
+
+    fn sample_entry() -> AuditEntry {
+        AuditEntry {
+            request_id: "test-req".to_string(),
+            timestamp: "2026-05-17T00:00:00Z".to_string(),
+            api_key: "alice".to_string(),
+            model: "llama3.2".to_string(),
+            prompt_hash: "deadbeef".to_string(),
+            verdict: Verdict::Allow,
+            matched_rule: None,
+            rule_id: None,
+            category: None,
+            severity: None,
+            compliance: vec![],
+            latency_us: 42,
+        }
+    }
+
+    fn read_lines(path: &std::path::Path) -> Vec<String> {
+        let f = std::fs::File::open(path).expect("open audit file");
+        BufReader::new(f)
+            .lines()
+            .map(|l| l.expect("read audit line"))
+            .collect()
+    }
+
+    #[test]
+    fn write_appends_jsonl_to_tempfile() {
+        let path = temp_audit_path("write-basic");
+        let cfg = AuditConfig {
+            enabled: true,
+            path: path.to_string_lossy().into_owned(),
+            hash_only: true,
+            fsync_every_write: false,
+        };
+        let log = AuditLog::open(&cfg).expect("open audit log");
+        log.write(&sample_entry());
+        log.write(&sample_entry());
+
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 2, "two entries should land in the file");
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("each line is valid JSON");
+            assert_eq!(v["verdict"], "allow");
+            assert_eq!(v["api_key"], "alice");
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_recovers_from_poisoned_lock() {
+        let path = temp_audit_path("poison");
+        let cfg = AuditConfig {
+            enabled: true,
+            path: path.to_string_lossy().into_owned(),
+            hash_only: true,
+            fsync_every_write: false,
+        };
+        let log = AuditLog::open(&cfg).expect("open audit log");
+
+        // Poison the mutex by panicking inside a thread that holds it.
+        let log_c = Arc::clone(&log);
+        let _ = std::thread::spawn(move || {
+            let _g = log_c.file.lock().expect("acquire lock before panic");
+            panic!("intentional poison for XKA-48 test");
+        })
+        .join();
+        assert!(
+            log.file.is_poisoned(),
+            "precondition: the mutex must be poisoned after the panic"
+        );
+        assert!(
+            !log.poison_logged.load(Ordering::Relaxed),
+            "precondition: recovery has not been logged yet"
+        );
+
+        // Subsequent writes must still land in the file (and must not panic).
+        // `into_inner` does not clear the poison flag, so every write after
+        // this point will hit the poisoned arm — they must all succeed.
+        log.write(&sample_entry());
+        log.write(&sample_entry());
+        log.write(&sample_entry());
+
+        assert!(
+            log.poison_logged.load(Ordering::Relaxed),
+            "recovery must be marked as logged after the first poisoned write"
+        );
+
+        let lines = read_lines(&path);
+        assert_eq!(
+            lines.len(),
+            3,
+            "every write after lock poison should still append the entry"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fsync_every_write_setting_is_honored() {
+        // We cannot directly assert that fsync was called, but we can
+        // assert that turning the flag on does not break writes and that
+        // the data is durably visible on the filesystem after the call
+        // returns — which is the user-visible contract.
+        let path = temp_audit_path("fsync");
+        let cfg = AuditConfig {
+            enabled: true,
+            path: path.to_string_lossy().into_owned(),
+            hash_only: true,
+            fsync_every_write: true,
+        };
+        let log = AuditLog::open(&cfg).expect("open audit log");
+        assert!(log.fsync_every_write, "config flag should be plumbed");
+
+        log.write(&sample_entry());
+        // Drop the log handle to release the OS file handle, then re-read.
+        drop(log);
+
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_request_id_is_unique_under_tight_loop() {
+        // Without the atomic counter, a tight loop on coarse-clock
+        // platforms can mint duplicate ids. With it, ids must be unique.
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let id = new_request_id();
+            assert!(ids.insert(id), "request ids must be unique");
+        }
+    }
+
+    #[test]
+    fn write_reload_emits_reload_verdict() {
+        let path = temp_audit_path("reload");
+        let cfg = AuditConfig {
+            enabled: true,
+            path: path.to_string_lossy().into_owned(),
+            hash_only: true,
+            fsync_every_write: false,
+        };
+        let log = AuditLog::open(&cfg).expect("open audit log");
+
+        log.write_reload(true, None, 1234);
+        log.write_reload(false, Some("boom".to_string()), 5678);
+
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 2);
+        let ok: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let fail: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(ok["verdict"], "reload_ok");
+        assert_eq!(fail["verdict"], "reload_failed");
+        assert_eq!(fail["error"], "boom");
+
+        let _ = std::fs::remove_file(path);
+    }
 }
