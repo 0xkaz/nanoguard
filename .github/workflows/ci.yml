@@ -103,6 +103,18 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
 
+  semgrep:
+    name: semgrep scan
+    runs-on: ubuntu-latest
+    # Pinned tag keeps CI deterministic across Semgrep releases (rule
+    # additions / exit-code changes) — bump intentionally to refresh rules.
+    container:
+      image: semgrep/semgrep:1.124.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        run: semgrep scan --config p/default --error
+
   coverage:
     name: test coverage
     runs-on: ubuntu-latest

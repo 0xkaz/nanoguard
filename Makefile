@@ -1,6 +1,6 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
-        bench coverage miri audit geiger ci push release-patch release-minor release-major \
+        bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight install-trivy trivy trivy-image
 
 MODEL ?= qwen3:0.6b
@@ -129,9 +129,24 @@ trivy-image: install-trivy
 	@echo "Scanning Docker image with Trivy..."
 	trivy image --format table nanoguard:latest
 
+# ── Semgrep security scan (requires: docker) ────────────────────────────────
+# Runs Semgrep CE via the official container image — keeps Python tooling off
+# the host and matches the CI job. Pinned tag is bumped intentionally.
+
+SEMGREP_IMAGE ?= semgrep/semgrep:1.124.0
+
+semgrep:
+	@command -v docker >/dev/null 2>&1 || { \
+	    echo "error: docker not installed (required to run Semgrep without Python)."; \
+	    exit 1; \
+	}
+	docker run --rm -v "$(CURDIR):/src" -w /src $(SEMGREP_IMAGE) \
+	    semgrep scan --config p/default --error
+	@echo "=== semgrep OK ==="
+
 # ── Full CI-equivalent check (build + test + clippy + fmt + audit) ───────────
 
-ci: check test audit trivy
+ci: check audit trivy semgrep
 	@echo "=== All CI checks passed ==="
 
 clean:
@@ -249,6 +264,17 @@ preflight:
 	    exit 1; \
 	}
 	cargo audit
+	@echo "→ semgrep"
+	@command -v docker >/dev/null 2>&1 || { \
+	    echo ""; \
+	    echo "error: docker not installed."; \
+	    echo "       semgrep runs via the official $(SEMGREP_IMAGE) container,"; \
+	    echo "       which is required by preflight because the CI 'semgrep'"; \
+	    echo "       job runs it; failures here surface security issues"; \
+	    echo "       before they break a PR."; \
+	    exit 1; \
+	}
+	$(MAKE) semgrep
 	@echo "→ tools/e2e.sh"
 	./tools/e2e.sh
 	@echo "✓ preflight passed"
