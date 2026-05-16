@@ -29,7 +29,7 @@ jobs:
               - '!CHANGELOG*'
 
   test:
-    name: build + test + lint
+    name: build/test/lint (${{ matrix.os }})
     needs: changes
     # Matrix expands the test job across linux + macOS so platform-specific
     # build breakage in bundled deps (rusqlite, rustls) surfaces in CI rather
@@ -82,6 +82,20 @@ jobs:
       - name: Test
         if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         run: cargo test
+
+  test-required:
+    name: build + test + lint
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check platform matrix result
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Platform build/test/lint matrix finished with: ${{ needs.test.result }}" >&2
+            exit 1
+          fi
+          echo "Platform build/test/lint matrix passed."
 
   msrv:
     name: MSRV check (Cargo.toml rust-version)
