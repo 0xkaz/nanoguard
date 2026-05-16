@@ -1,0 +1,172 @@
+:root {
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --surface-hover: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #38bdf8;
+  --accent-hover: #0ea5e9;
+  --danger: #f87171;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --border: #334155;
+  --radius: 8px;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.hidden { display: none !important; }
+
+/* Login */
+.login-card {
+  max-width: 380px;
+  margin: 10vh auto;
+}
+.login-card h1 {
+  text-align: center;
+  margin-bottom: 1.5rem;
+  font-weight: 700;
+}
+
+/* Layout */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: .75rem 1.25rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.brand { font-weight: 700; letter-spacing: .02em; }
+nav { display: flex; gap: .25rem; }
+nav button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  padding: .4rem .75rem;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+nav button.active, nav button:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+.user { display: flex; align-items: center; gap: .75rem; }
+
+main { padding: 1.25rem; max-width: 1200px; margin: 0 auto; }
+
+/* Cards */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+/* Forms */
+.field { margin-bottom: .9rem; }
+label { display: block; font-size: .875rem; color: var(--muted); margin-bottom: .25rem; }
+input, select, textarea {
+  width: 100%;
+  padding: .5rem .65rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 1rem;
+}
+input:focus, select:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .4rem;
+  padding: .5rem .85rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-hover);
+  color: var(--text);
+  cursor: pointer;
+  font-size: .95rem;
+}
+.btn.primary { background: var(--accent); color: #0f172a; border-color: var(--accent); }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.small { padding: .3rem .55rem; font-size: .85rem; }
+.btn.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+
+/* Tables */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: .75rem;
+  font-size: .92rem;
+}
+.table th, .table td {
+  text-align: left;
+  padding: .55rem .65rem;
+  border-bottom: 1px solid var(--border);
+}
+.table th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+.table tr:hover td { background: rgba(255,255,255,.03); }
+
+/* Filters */
+.filters { display: flex; gap: .5rem; align-items: center; margin: .75rem 0; }
+.filters select { width: auto; min-width: 160px; }
+
+/* Alerts */
+.alert { padding: .75rem; border-radius: var(--radius); margin: .5rem 0; }
+.alert.warning { background: rgba(251,191,36,.12); border: 1px solid rgba(251,191,36,.35); color: var(--warning); }
+.alert.success { background: rgba(74,222,128,.12); border: 1px solid rgba(74,222,128,.35); color: var(--success); }
+
+/* Errors */
+.error { color: var(--danger); font-size: .875rem; margin: .25rem 0 0; }
+
+/* Modal */
+dialog {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  min-width: 360px;
+  max-width: 90vw;
+}
+dialog::backdrop { background: rgba(0,0,0,.6); }
+.modal-form .actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+
+/* Config viewer */
+.config-file { margin-bottom: 1.25rem; }
+.config-file h4 { margin: 0 0 .25rem; font-size: .95rem; }
+.config-file pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: .75rem;
+  overflow: auto;
+  font-size: .85rem;
+  line-height: 1.4;
+  max-height: 480px;
+}
+
+/* Misc */
+h2 { margin-top: 0; font-size: 1.25rem; }
+h3 { margin-top: 0; font-size: 1.05rem; }

@@ -15,7 +15,7 @@
 //! - [`middleware::verify_request`] for the axum middleware that consumes
 //!   the above to gate the proxy endpoints.
 
-use rand::{rngs::OsRng, TryRngCore};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -80,9 +80,7 @@ impl Token {
         // Use the OS RNG directly. We could go through `rand::rng()` (the
         // thread-local CSPRNG) but token minting is far off the hot path and
         // the OS source removes one layer between us and the kernel entropy.
-        OsRng
-            .try_fill_bytes(&mut secret_bytes)
-            .expect("OS RNG must be available to mint client tokens");
+        OsRng.fill_bytes(&mut secret_bytes);
 
         let mut secret = String::with_capacity(SECRET_LEN);
         for b in secret_bytes.iter() {

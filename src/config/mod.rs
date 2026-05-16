@@ -21,6 +21,8 @@ pub struct Config {
     pub policies: PoliciesConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub console: ConsoleConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -456,6 +458,66 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct ConsoleConfig {
+    pub listen: String,
+    pub session_secret: String,
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: i64,
+    #[serde(default)]
+    pub auth: ConsoleAuthConfig,
+}
+
+impl ConsoleConfig {
+    pub fn default_listen() -> String {
+        "127.0.0.1:8081".to_string()
+    }
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        Self {
+            listen: Self::default_listen(),
+            session_secret: String::new(),
+            session_ttl_hours: default_session_ttl_hours(),
+            auth: ConsoleAuthConfig::default(),
+        }
+    }
+}
+
+fn default_session_ttl_hours() -> i64 {
+    24
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ConsoleAuthConfig {
+    #[serde(default = "default_console_auth_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub local: ConsoleLocalAuthConfig,
+    /// Reserved for future OIDC support (Phase 4). Present so TOML with
+    /// `[console.auth.oidc]` does not fail to parse.
+    #[serde(default)]
+    pub oidc: Option<toml::Value>,
+}
+
+fn default_console_auth_mode() -> String {
+    "local".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ConsoleLocalAuthConfig {
+    #[serde(default)]
+    pub allow_signup: bool,
+    pub bootstrap_admin: Option<BootstrapAdminConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BootstrapAdminConfig {
+    pub username: String,
+    pub password_env: String,
+}
+
 impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let content = std::fs::read_to_string(&path)
@@ -496,6 +558,7 @@ impl Config {
                 tools: ToolsConfig::default(),
                 policies: PoliciesConfig::default(),
                 auth: AuthConfig::default(),
+                console: ConsoleConfig::default(),
             })
         }
     }

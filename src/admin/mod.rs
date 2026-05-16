@@ -410,6 +410,7 @@ pub async fn list_clients(
                         "created_at": r.created_at,
                         "expires_at": r.expires_at,
                         "revoked_at": r.revoked_at,
+                        "last_used_at": r.last_used_at,
                     })
                 })
                 .collect();
