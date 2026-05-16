@@ -48,6 +48,7 @@ make          # build release binary
 make dev      # build debug + run with Ollama backend
 make test     # run all tests
 make check    # clippy + fmt check
+make geiger   # unsafe code audit
 ```
 
 ## Performance Targets

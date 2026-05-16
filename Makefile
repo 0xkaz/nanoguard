@@ -1,6 +1,6 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
-        bench coverage miri audit ci push release-patch release-minor release-major \
+        bench coverage miri audit geiger ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight
 
 MODEL ?= qwen3:0.6b
@@ -87,6 +87,12 @@ miri:
 
 audit:
 	cargo audit
+
+# ── Geiger security audit (requires: cargo install cargo-geiger) ──────────
+# Checks for unsafe code usage in dependencies
+
+geiger:
+	cargo geiger --update-advisories
 
 # ── Full CI-equivalent check (build + test + clippy + fmt + audit) ───────────
 
