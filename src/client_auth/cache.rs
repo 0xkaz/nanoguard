@@ -303,13 +303,13 @@ mod tests {
         // a comfortably wide TTL so the assertion does not depend on
         // tight scheduling — what we are actually checking is the
         // refresh, not the parser's reaction to wall clock jitter.
-        let cache = TokenCache::new(4, Duration::from_millis(200));
+        let cache = TokenCache::new(4, Duration::from_millis(400));
         cache.insert("a".to_string(), token("a", 1));
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(150));
         cache.insert("a".to_string(), token("a", 1));
         // Lookup immediately after the refresh: definitely inside the
-        // 200ms window. If the refresh failed to update `inserted_at`
-        // the entry would still appear fresh too (50ms < 200ms), so we
+        // 400ms window. If the refresh failed to update `inserted_at`
+        // the entry would still appear fresh too (150ms < 400ms), so we
         // need a separate longer wait below.
         assert!(
             cache.get("a").is_some(),
@@ -317,10 +317,10 @@ mod tests {
         );
 
         // Now wait past the *original* TTL window but inside the
-        // refreshed one. 175ms after the refresh = 225ms after the
-        // original insert: past 200ms original TTL, well inside the
-        // refreshed 200ms window.
-        std::thread::sleep(Duration::from_millis(175));
+        // refreshed one. 300ms after the refresh = 450ms after the
+        // original insert: past 400ms original TTL, well inside the
+        // refreshed 400ms window (100ms margin).
+        std::thread::sleep(Duration::from_millis(300));
         assert!(
             cache.get("a").is_some(),
             "refresh resets the TTL clock — entry past original TTL still cached"
