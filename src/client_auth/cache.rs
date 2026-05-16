@@ -205,6 +205,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             expires_at: None,
             revoked_at: None,
+            last_used_at: None,
         }
     }
 
