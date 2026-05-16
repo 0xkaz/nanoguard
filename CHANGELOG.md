@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — README catches up with v0.4 → present feature set
+
+README now advertises the features that landed across v0.4 / v0.5 / v0.6 / v0.7 / the in-flight hot-reload work: Tool gate (allow / deny / schema / entity scan), Output JSON Schema validation, Policy bundles (YAML rule sets with stable ids / severity / compliance tags), and Hot reload (SIGHUP-driven atomic config swap). The proxy architecture diagram at the top reflects the actual pipeline shape today instead of the v0.3 sketch. Cross-links to `docs/design/` and `docs/operations.md` for the deeper material.
+
 ### Docs — operations runbook + audit log format
 
 Two new public docs that pair with the hot-reload feature: `docs/operations.md` is the operator-facing runbook (systemd unit, SIGHUP usage, logrotate snippet, common-issues section), and `docs/design/audit-log-format.md` is the JSONL schema reference for both request entries and the new reload entries. The audit-log doc enumerates the bounded `error` label vocabulary used in `reload_failed` entries so audit-pipeline consumers can match against a stable set.
