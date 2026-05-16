@@ -6,36 +6,42 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use subtle::ConstantTimeEq;
 
 use crate::{AppState, SharedState};
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    let expected = match &state.config.budget.admin_api_key {
-        Some(k) => k,
-        None => {
-            return Err(Box::new(
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "admin API is disabled"})),
-                )
-                    .into_response(),
-            ))
-        }
-    };
-
+    let expected = state.config.budget.admin_api_key.as_deref().unwrap_or("");
     let provided = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    if provided != expected {
+    // Constant-time comparison to prevent timing attacks.
+    // When admin is disabled, expected is empty, so any non-empty
+    // provided token will fail.  This prevents leaking whether admin
+    // is enabled via timing or status code.
+    if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
         return Err(Box::new(
             (
                 StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "invalid admin API key"})),
+                Json(json!({"error": "unauthorized"})),
+            )
+                .into_response(),
+        ));
+    }
+
+    // If admin is disabled, expected == "" and provided == "" (no
+    // Authorization header) would pass ct_eq.  Reject uniformly so
+    // the status code does not leak whether admin is enabled.
+    if state.config.budget.admin_api_key.is_none() {
+        return Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
             )
                 .into_response(),
         ));
@@ -453,5 +459,116 @@ pub async fn revoke_client(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BackendConfig, BudgetConfig, Config};
+
+    fn dummy_state(admin_key: Option<String>) -> AppState {
+        AppState {
+            config: Config {
+                nanoguard: Default::default(),
+                backend: BackendConfig {
+                    provider: "ollama".to_string(),
+                    endpoint: "http://localhost:11434".to_string(),
+                    api_key: None,
+                    model: None,
+                },
+                input: Default::default(),
+                output: Default::default(),
+                budget: BudgetConfig {
+                    admin_api_key: admin_key,
+                    ..Default::default()
+                },
+                audit: Default::default(),
+                tools: Default::default(),
+                policies: Default::default(),
+                auth: Default::default(),
+            },
+            matchers: std::sync::Arc::new(
+                crate::matcher::Matchers::build(&Default::default()).unwrap(),
+            ),
+            redactor: std::sync::Arc::new(
+                crate::proxy::redact::Redactor::build(&[], &[]).unwrap(),
+            ),
+            pii_actions: std::sync::Arc::new(crate::proxy::redact::ActionPartition {
+                mask: std::collections::HashSet::new(),
+                reject: std::collections::HashSet::new(),
+                log: std::collections::HashSet::new(),
+            }),
+            spotlight: None,
+            schema: None,
+            tool_gate: None,
+            policy: None,
+            backend: crate::backend::Backend::new(BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            }),
+            http_client: reqwest::Client::new(),
+            budget: None,
+            audit: None,
+            client_auth: None,
+        }
+    }
+
+    #[test]
+    fn require_admin_accepts_valid_key() {
+        let state = dummy_state(Some("supersecret".to_string()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer supersecret".parse().unwrap());
+        assert!(require_admin(&state, &headers).is_ok());
+    }
+
+    #[test]
+    fn require_admin_rejects_wrong_key() {
+        let state = dummy_state(Some("supersecret".to_string()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_missing_header_when_key_is_set() {
+        let state = dummy_state(Some("supersecret".to_string()));
+        let headers = HeaderMap::new();
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_when_disabled() {
+        let state = dummy_state(None);
+        let headers = HeaderMap::new();
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_any_token_when_disabled() {
+        let state = dummy_state(None);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer any-token".parse().unwrap());
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_same_status_for_disabled_and_wrong_key() {
+        let disabled = dummy_state(None);
+        let enabled = dummy_state(Some("key".to_string()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+
+        let resp_disabled = *require_admin(&disabled, &headers).unwrap_err();
+        let resp_enabled = *require_admin(&enabled, &headers).unwrap_err();
+
+        assert_eq!(resp_disabled.status(), resp_enabled.status());
     }
 }
