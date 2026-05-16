@@ -1,13 +1,13 @@
-> **Status:** proposed (2026-05-16)
+> **Status:** shipped (commit cbfa2c8, 2026-05-17)
 
 # Aikido SCA in CI
 
-The workflow file is in place but the integration has not been
-exercised against this repo yet (the operator-side enablement —
-account, secret, repo variable — hasn't happened). This note will
-be promoted to `shipped (commit <SHA>, <date>)` after Aikido has
-run on at least one PR in this repo and the operator confirms the
-findings shape is what they expected.
+The workflow has been exercised end-to-end: the operator-side
+enablement (account, `AIKIDO_SECRET_KEY`, `vars.AIKIDO_ENABLED`)
+happened in PR #15, and the scan has produced findings against
+this repo's dependency graph. The first wave of findings drove
+the supply-chain hygiene fixes in PR #20 (dtolnay action pinned
+by SHA, distroless runtime image switched to `:nonroot`).
 
 This note records why the project adopted Aikido's dependency-scan
 GitHub Action as an opt-in CI step, what it does, and what it

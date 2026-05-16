@@ -107,6 +107,8 @@ docker run -p 8080:8080 \
 
 > Image: [ghcr.io/0xkaz/nanoguard](https://github.com/0xkaz/nanoguard/pkgs/container/nanoguard) — `linux/amd64` and `linux/arm64`
 
+The image runs as the distroless `nonroot` user (UID 65532). The bundled `nanoguard.toml` writes its audit log to `/app/nanoguard-audit.jsonl` (and, if `[budget].enabled = true`, a SQLite file to `/app/nanoguard.db`). If you want to run the container with `--read-only`, either disable `[audit]` / `[budget]`, mount a writable volume over `/app`, or override the paths in your own config to a writable location.
+
 ### With Ollama (build from source)
 
 ```bash

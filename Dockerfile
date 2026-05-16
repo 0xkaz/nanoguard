@@ -10,8 +10,12 @@ RUN cargo build --release
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 # Use the `:nonroot` variant of distroless so the container runs as UID 65532
-# (`nonroot`) by default. Combined with a read-only root filesystem at deploy
-# time this gives "process inside cannot mutate the image"-grade isolation.
+# (`nonroot`) by default. This removes the default-root posture; it does *not*
+# by itself make the image read-only-rootfs-safe — the bundled `nanoguard.toml`
+# writes `nanoguard-audit.jsonl` under `/app` and (if `[budget].enabled = true`)
+# `nanoguard.db` as well. Operators who want `docker run --read-only` must
+# either disable audit/budget or mount a writable volume over `/app` (or
+# override the paths in their own config). See README for the runtime story.
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 WORKDIR /app
