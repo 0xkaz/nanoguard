@@ -682,6 +682,65 @@ HTTP_AFTER=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions
     -d '{"model":"test","messages":[{"role":"user","content":"hello"}]}')
 assert_eq "21c. requests still served after failed reload" "$HTTP_AFTER" "200"
 
+# --- 22. Hot reload — restart-only key changes produce a warn -------------
+info "scenario 22: changing a restart-only key on reload warns and is ignored"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+S22_TOML="$LOGDIR/e2e.s22.toml"
+S22_AUDIT="$LOGDIR/e2e.s22-audit.jsonl"
+S22_LOG="$LOGDIR/ng.s22.log"
+rm -f "$S22_AUDIT"
+awk '/^\[audit\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S22_TOML"
+cat >> "$S22_TOML" <<EOF
+
+[audit]
+enabled = true
+path = "$S22_AUDIT"
+hash_only = true
+EOF
+
+# Capture the original endpoint so we can verify the live Backend
+# still points at it after a SIGHUP-with-changed-[backend].
+ORIG_ENDPOINT=$(grep -E '^endpoint *=' "$S22_TOML" | head -1 | sed -E 's/.*= *"([^"]+)".*/\1/')
+
+NANOGUARD_CONFIG="$S22_TOML" "$BIN" > "$S22_LOG" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# Edit a restart-only key — change [backend].endpoint to a clearly wrong
+# value. The reload should detect the drift, log a warn, and otherwise
+# succeed (audit reload_ok), but /v1/models must still report the
+# original endpoint (Backend handle was preserved).
+sed -i.bak 's|^endpoint = .*|endpoint = "http://unreachable.example:9999"|' "$S22_TOML"
+
+kill -HUP "$NG_PID" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    grep -q "reload_ok" "$S22_AUDIT" 2>/dev/null && break
+done
+
+if grep -q "reload_ok" "$S22_AUDIT" 2>/dev/null; then
+    ok "22a. reload still records reload_ok when only restart-only keys changed"
+else
+    ng "22a. expected reload_ok in audit, got: $(tail -3 "$S22_AUDIT" 2>/dev/null || echo none)"
+fi
+
+if grep -q "restart-only key" "$S22_LOG" 2>/dev/null; then
+    ok "22b. proxy log warns about ignored restart-only key changes"
+else
+    ng "22b. expected restart-only-key warn in log; tail: $(tail -5 "$S22_LOG")"
+fi
+
+if grep -q "\[backend\].endpoint" "$S22_LOG" 2>/dev/null; then
+    ok "22c. warn names the changed key ([backend].endpoint)"
+else
+    ng "22c. expected [backend].endpoint in the warn; tail: $(tail -5 "$S22_LOG")"
+fi
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

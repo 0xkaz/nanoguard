@@ -233,13 +233,23 @@ pub async fn run_reload_task(shared: SharedState, runtime: RuntimeHandles) {
     while sig.recv().await.is_some() {
         tracing::info!("hot reload: SIGHUP received, rebuilding state");
         let t0 = std::time::Instant::now();
-        match reload_once(&shared, &runtime) {
-            Ok(()) => {
+        // The config + dict + policy reads and the matcher / redactor /
+        // schema rebuilds are all blocking I/O and CPU work. Run them
+        // on the blocking thread pool so they cannot stall the Tokio
+        // worker that's also responsible for the SIGHUP stream and the
+        // graceful-shutdown listener.
+        let shared_for_task = shared.clone();
+        let runtime_for_task = runtime.clone();
+        let result =
+            tokio::task::spawn_blocking(move || reload_once(&shared_for_task, &runtime_for_task))
+                .await;
+        match result {
+            Ok(Ok(())) => {
                 let elapsed_us = t0.elapsed().as_micros() as u64;
                 tracing::info!("hot reload: success ({}µs)", elapsed_us);
                 emit_reload_audit(&shared, true, None, elapsed_us);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let elapsed_us = t0.elapsed().as_micros() as u64;
                 let reason = classify_reload_error(&e);
                 // Full chain is local-debug only; it can carry config /
@@ -252,6 +262,15 @@ pub async fn run_reload_task(shared: SharedState, runtime: RuntimeHandles) {
                 );
                 emit_reload_audit(&shared, false, Some(reason.to_string()), elapsed_us);
             }
+            Err(join_err) => {
+                let elapsed_us = t0.elapsed().as_micros() as u64;
+                tracing::warn!(
+                    "hot reload: blocking task failed ({}µs): {}",
+                    elapsed_us,
+                    join_err
+                );
+                emit_reload_audit(&shared, false, Some("build_failed".to_string()), elapsed_us);
+            }
         }
     }
 }
@@ -262,12 +281,75 @@ pub async fn run_reload_task(shared: SharedState, runtime: RuntimeHandles) {
 /// previous state is dropped after every in-flight request that already
 /// loaded it releases its `Arc`. On failure the live state is untouched
 /// (all-or-nothing).
+///
+/// Restart-only keys (`[nanoguard].listen`, `[nanoguard].log_level`,
+/// `[backend].*`, `[budget].*`, `[audit].*`) are detected by comparing
+/// the new config against the live one. Changes are surfaced via
+/// `tracing::warn` so an operator who pushes a TOML edit and SIGHUPs
+/// doesn't get a silent `reload_ok` while their edit was actually
+/// ignored on those fields.
 #[cfg(unix)]
 fn reload_once(shared: &SharedState, runtime: &RuntimeHandles) -> anyhow::Result<()> {
-    let cfg = crate::config::Config::from_env_or_default()?;
-    let candidate = build_app_state(cfg, runtime.clone())?;
+    let new_cfg = crate::config::Config::from_env_or_default()?;
+    let live = shared.load_full();
+    warn_on_restart_only_drift(&live.config, &new_cfg);
+    let candidate = build_app_state(new_cfg, runtime.clone())?;
     shared.store(Arc::new(candidate));
     Ok(())
+}
+
+/// Compare restart-only keys between the live and incoming config; emit
+/// a single `tracing::warn` listing any that drift.
+///
+/// The build_app_state docstring promises this; reload_once is the
+/// caller that has to deliver it. The list of restart-only keys here
+/// must stay in sync with `docs/design/hot-reload.md > What is not
+/// reloadable, and why` and with the `docs/operations.md` runbook.
+#[cfg(unix)]
+fn warn_on_restart_only_drift(live: &crate::config::Config, new: &crate::config::Config) {
+    let mut ignored: Vec<&'static str> = Vec::new();
+
+    if live.nanoguard.listen != new.nanoguard.listen {
+        ignored.push("[nanoguard].listen");
+    }
+    if live.nanoguard.log_level != new.nanoguard.log_level {
+        ignored.push("[nanoguard].log_level");
+    }
+    if live.backend.provider != new.backend.provider {
+        ignored.push("[backend].provider");
+    }
+    if live.backend.endpoint != new.backend.endpoint {
+        ignored.push("[backend].endpoint");
+    }
+    if live.backend.api_key != new.backend.api_key {
+        ignored.push("[backend].api_key");
+    }
+    if live.backend.model != new.backend.model {
+        ignored.push("[backend].model");
+    }
+    if live.budget.enabled != new.budget.enabled {
+        ignored.push("[budget].enabled");
+    }
+    if live.budget.db_path != new.budget.db_path {
+        ignored.push("[budget].db_path");
+    }
+    if live.audit.enabled != new.audit.enabled {
+        ignored.push("[audit].enabled");
+    }
+    if live.audit.path != new.audit.path {
+        ignored.push("[audit].path");
+    }
+    if live.audit.hash_only != new.audit.hash_only {
+        ignored.push("[audit].hash_only");
+    }
+
+    if !ignored.is_empty() {
+        tracing::warn!(
+            "hot reload: restart-only key(s) changed in config — \
+             change(s) IGNORED until process restart: {}",
+            ignored.join(", ")
+        );
+    }
 }
 
 #[cfg(unix)]
