@@ -4,6 +4,9 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+- **`docs/design/release-strategy.md` (new)** — Reviews the current release process and proposes a three-phase strategy for distribution hardening and workflow automation.
+- **CI/CD: Automated GitHub Releases** — `release.yml` now builds multi-arch binaries for Linux and macOS and uploads them to a GitHub Release automatically when a tag is pushed.
+
 ### Added — client-auth verification cache (TTL + LRU + revoke-driven invalidation)
 
 The middleware no longer hits SQLite on every authed request. `ClientAuth::lookup` is a read-through cache keyed by token prefix: cache hit on the hot path, SQLite read + populate on miss. Bounded by `[auth].cache_capacity` (default 10_000) with `[auth].cache_ttl_secs` (default 60s) eviction. Negative results (unknown prefixes) are intentionally not cached so a flood of bogus prefixes cannot grow the cache and a newly-minted token is visible immediately.
