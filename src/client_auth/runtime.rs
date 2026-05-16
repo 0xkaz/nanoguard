@@ -38,6 +38,21 @@ impl ClientAuth {
     /// holds both — operators get one place to back up, one place to
     /// configure permissions, one place to inspect with `sqlite3`.
     pub fn open(db_path: &str, config: AuthConfig) -> Result<Self> {
+        // Validate `env_marker` at startup. The wire token shape is
+        // "ng_<env>_<24 char secret>" and `PrefixedToken::parse`
+        // requires the env-marker position to be ASCII alphanumeric.
+        // Without this check, an operator who sets, say,
+        // `env_marker = "@"` would see tokens mint successfully but
+        // every subsequent request would 401 with no indication that
+        // the configuration is wrong. Fail fast so the misconfig
+        // surfaces at startup, not at first request.
+        if !config.env_marker.is_ascii_alphanumeric() {
+            anyhow::bail!(
+                "[auth].env_marker must be a single ASCII alphanumeric character (got {:?})",
+                config.env_marker
+            );
+        }
+
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening client_tokens DB at {db_path}"))?;
         super::store::migrate(&conn).context("applying client_tokens migration")?;
@@ -128,5 +143,39 @@ mod tests {
         let ca = in_memory(cfg);
         assert!(ca.enabled());
         assert_eq!(ca.env_marker(), 't');
+    }
+
+    #[test]
+    fn open_rejects_non_alphanumeric_env_marker() {
+        // The wire token shape requires the env-marker position to be
+        // ASCII alphanumeric. A misconfigured marker would silently
+        // mint tokens that fail every verification — fail at startup
+        // instead.
+        for bad in ['@', '#', '$', '!', '_', '-', ' ', '\t'] {
+            let cfg = AuthConfig {
+                env_marker: bad,
+                ..AuthConfig::default()
+            };
+            let err = ClientAuth::open(":memory:", cfg)
+                .err()
+                .expect("non-alphanumeric env_marker should fail open()");
+            assert!(
+                format!("{err}").contains("env_marker"),
+                "error for {:?} should mention env_marker; got: {err}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn open_accepts_valid_env_markers() {
+        for good in ['p', 't', 's', '0', '9', 'X'] {
+            let cfg = AuthConfig {
+                env_marker: good,
+                ..AuthConfig::default()
+            };
+            let _ca = ClientAuth::open(":memory:", cfg)
+                .unwrap_or_else(|e| panic!("env_marker {:?} should succeed: {e}", good));
+        }
     }
 }
