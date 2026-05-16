@@ -11,3 +11,7 @@ nanoguard*.db
 # Added by cargo
 
 /target
+
+# env
+.env
+.env.*
