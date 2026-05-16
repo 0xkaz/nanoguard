@@ -1,4 +1,4 @@
-> **Status:** proposed (2026-05-16)
+> **Status:** partial — Stage 1 enforcement shipped (commit 6ed6ac5, 2026-05-16). Token format, storage, verification middleware, and admin CRUD endpoints are in place. Open: in-memory verification cache (currently a per-request SQLite read), TTL + broadcast invalidation, per-token `pii_overrides`, integration with the user-management work that introduces the real `users` table (`user_id` defaults to 0 today).
 
 # Client Authentication
 

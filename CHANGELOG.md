@@ -4,6 +4,20 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — client-token authentication (Stage 1, opt-in)
+
+Bearer client-token verification on the proxy endpoints, gated behind `[auth] enabled = false` by default so existing deployments are unaffected. When enabled, requests to `/v1/chat/completions`, `/v1/messages`, and `/v1/models` must carry `Authorization: Bearer ng_<env>_<24 char secret>` or get a 401. `/health` stays unauthenticated for load-balancer probes; `/v1/admin/*` keeps its existing `ADMIN_API_KEY` gate.
+
+Tokens are stored as `(prefix, sha256(wire))` in the `client_tokens` SQLite table (same file as `[budget].db_path`). The full wire form is shown exactly once on creation and never persisted. Verification is constant-time (`subtle::ConstantTimeEq`) to defeat timing side-channels.
+
+New admin endpoints (gated by the same `ADMIN_API_KEY` Bearer):
+
+- `POST /v1/admin/clients` mints a token, returning the wire form once.
+- `GET /v1/admin/clients?user_id=N` lists by prefix only.
+- `DELETE /v1/admin/clients/:id` revokes (idempotent).
+
+10 new e2e assertions in scenario 23 cover the full mint → use → list → revoke → re-reject cycle. `docs/design/client-auth.md` moves from `proposed` to `partial` (Stage 1 done; in-memory cache + per-token PII overrides + user-management integration remain).
+
 ### Docs — provider matrix expansion entered the roadmap
 
 `docs/roadmap.md` gains a "Provider matrix expansion (post-v1, opt-in)" entry covering when and how nanoguard might grow its adapter set beyond the current OpenAI / Anthropic / Ollama trio. The entry codifies four design lines that any future Gemini / Bedrock / Cohere / Vertex adapter must hold: pluggable behind Cargo features so the default binary stays small, OpenAI-shaped IR so the translation layer stays at N+N rather than N², guardrails stay first-class (every adapter must be audit-symmetric with the OpenAI path), and the README continues to recommend LiteLLM downstream as the default deployment for 100+-provider needs. `docs/design/multi-backend-routing.md > Open questions` gains a back-reference so the design-doc reader sees the same bounds.
