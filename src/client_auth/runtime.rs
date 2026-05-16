@@ -85,11 +85,23 @@ impl ClientAuth {
     /// Acquire the SQLite connection. Held under a Mutex; callers should
     /// release it quickly. Used by the verification path and by admin
     /// endpoints for create/list/revoke.
+    ///
+    /// Recovers from a poisoned mutex by taking the inner connection
+    /// anyway. Poisoning means another thread panicked while holding the
+    /// lock; propagating it would brick every subsequent verification
+    /// and admin call — one bad request would lock the whole table for
+    /// the rest of the process lifetime. The SQLite connection state
+    /// itself is fine across panics (rusqlite does not mutate it under
+    /// our closures), so the recovery is safe.
     pub fn with_conn<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Connection) -> R,
     {
-        let conn = self.inner.conn.lock().expect("client_auth conn poisoned");
+        let conn = self
+            .inner
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&conn)
     }
 }
@@ -143,6 +155,10 @@ mod tests {
         let ca = in_memory(cfg);
         assert!(ca.enabled());
         assert_eq!(ca.env_marker(), 't');
+        // Without this assertion the test was setting `require_https = true`
+        // and silently never reading it back — a regression in the
+        // accessor would have slipped through.
+        assert!(ca.require_https());
     }
 
     #[test]
@@ -177,5 +193,33 @@ mod tests {
             let _ca = ClientAuth::open(":memory:", cfg)
                 .unwrap_or_else(|e| panic!("env_marker {:?} should succeed: {e}", good));
         }
+    }
+
+    #[test]
+    fn with_conn_recovers_from_poisoned_mutex() {
+        // Deliberately poison the inner mutex by panicking on a thread
+        // that holds the lock. After the thread joins (with a panic),
+        // with_conn must still serve queries — otherwise one bad request
+        // would brick the entire client-auth subsystem for the rest of
+        // the process lifetime.
+        let ca = in_memory(AuthConfig::default());
+        let ca_for_thread = ca.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = ca_for_thread.inner.conn.lock().unwrap();
+            panic!("simulate a panic while holding the client_auth lock");
+        })
+        .join(); // joining the panicked thread returns Err(...), which we discard
+        assert!(
+            ca.inner.conn.is_poisoned(),
+            "test setup: the mutex should be poisoned at this point"
+        );
+
+        // The point of the fix: with_conn should still work despite the
+        // poisoned mutex.
+        let n: i64 = ca.with_conn(|c| {
+            c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+                .expect("SELECT 1 succeeds after poison")
+        });
+        assert_eq!(n, 1);
     }
 }
