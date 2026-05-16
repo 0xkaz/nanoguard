@@ -741,6 +741,38 @@ else
     ng "22c. expected [backend].endpoint in the warn; tail: $(tail -5 "$S22_LOG")"
 fi
 
+# Behavior contract for Greptile finding #1 (split routing fix):
+# Before the fix, AppState::backend_endpoint() read state.config.backend.endpoint
+# (= the reloaded "http://unreachable.example:9999") while Backend::forward_chat
+# kept reading from the preserved RuntimeHandles.backend.cfg. Both paths must
+# now agree.
+#
+# /v1/models can't tell them apart — the mock only handles POST, so a GET
+# returns 502 either way (mock returns 405 → nanoguard fails to parse JSON →
+# 502). Use POST /v1/chat/completions instead: the mock handles it and
+# returns 200 iff the request reached the original mock endpoint. If
+# forward_chat had silently switched to unreachable.example:9999, the call
+# would timeout / connection-refused and surface as 502.
+CHAT_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    --max-time 5 \
+    -d '{"model":"test","messages":[{"role":"user","content":"post-reload check"}]}')
+if [ "$CHAT_CODE" = "200" ]; then
+    ok "22d. /v1/chat/completions still reaches preserved Backend after SIGHUP (200)"
+else
+    ng "22d. /v1/chat/completions returned $CHAT_CODE — Backend may have switched to the edited endpoint"
+fi
+
+# Inverse smoke check: confirm the audit log doesn't accidentally contain
+# the original endpoint string. The error-sanitizer fix in commit c73ca3c
+# maps reload errors to bounded labels; if a future change starts logging
+# the raw config into the audit JSONL this would catch it.
+if ! grep -F "$ORIG_ENDPOINT" "$S22_AUDIT" 2>/dev/null > /dev/null; then
+    ok "22e. audit log does not leak the original backend endpoint string"
+else
+    ng "22e. audit log contains the original endpoint string — error sanitizer regression?"
+fi
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

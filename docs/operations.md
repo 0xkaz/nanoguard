@@ -139,7 +139,7 @@ nanoguard holds the audit file open in append mode for the process
 lifetime. It does not rotate the file itself. Use `logrotate` with
 `copytruncate`:
 
-```
+```conf
 # /etc/logrotate.d/nanoguard
 /var/lib/nanoguard/nanoguard-audit.jsonl {
     daily
@@ -243,8 +243,12 @@ the admin Bearer never reaches the backend.
 
 `GET /health` is unauthenticated and returns `ok` when the process
 is alive. Use it as a Kubernetes liveness probe / load-balancer
-health check. It does NOT verify backend connectivity — that
-happens at startup and per-request.
+health check. It does NOT verify backend connectivity — nanoguard
+does not probe the backend at startup either (see "Backend
+configuration" above), so backend reachability surfaces only when
+a real request is forwarded (502 on failure). Pair `/health` with
+a synthetic chat-completion call against a known model if you
+need backend-aware health.
 
 For deeper monitoring, watch the audit log:
 
