@@ -361,3 +361,24 @@ unhelpful "permission denied for some reason" experience.
 - **Quota partitioning by backend**: a token's budget is currently
   global. A "max $X/day on OpenAI specifically" cap is sometimes
   asked for. Defer to a follow-up budget doc.
+- **Provider matrix beyond OpenAI / Anthropic / Ollama**: the
+  current adapter set covers OpenAI-compatible servers and
+  Anthropic. Adding Google Gemini, AWS Bedrock, Cohere, Vertex,
+  etc. is technically straightforward — the `provider` field on
+  `[backends.*]` is exactly the extension point — but each new
+  adapter doubles the surface area of the translation layer, the
+  audit trail, and the dependency tree. Direction: if/when this
+  work proceeds, gate each new provider behind a new Cargo feature
+  added at that time (the crate has no `[features]` section today;
+  the gate is a future constraint on how providers will be added,
+  not a description of shipped behavior). The default binary
+  continues to ship the three built-in providers it has today
+  (openai, anthropic, ollama) so the
+  `CLAUDE.md > Performance Targets > Memory: < 10MB` bar holds.
+  Funnel all adapters through an OpenAI-shaped IR so we stay at
+  N+N adapters instead of an N² translation matrix, and continue
+  to recommend LiteLLM downstream as the default story for
+  deployments that want 100+ providers. See
+  [`docs/roadmap.md` → "Provider matrix expansion (post-v1,
+  opt-in)"](../roadmap.md#provider-matrix-expansion-post-v1-opt-in)
+  for the full design lines.
