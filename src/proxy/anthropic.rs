@@ -10,7 +10,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::{
@@ -20,7 +19,7 @@ use crate::{
     },
     matcher::InputVerdict,
     proxy::redact,
-    AppState,
+    SharedState,
 };
 
 #[derive(Debug, Deserialize)]
@@ -67,9 +66,10 @@ impl AnthropicContent {
 }
 
 pub async fn messages(
-    State(state): State<Arc<AppState>>,
+    State(shared): State<SharedState>,
     Json(mut req): Json<AnthropicRequest>,
 ) -> Response {
+    let state = shared.load_full();
     // Streaming is not yet supported on /v1/messages. Refuse early with a
     // 400 rather than half-handling the SSE response from the backend
     // (which would surface as an opaque 502 to the caller).

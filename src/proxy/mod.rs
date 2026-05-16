@@ -20,14 +20,17 @@ use crate::{
         vault::{LocalVault, Vault},
     },
     matcher::InputVerdict,
-    AppState,
+    AppState, SharedState,
 };
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
-    State(state): State<Arc<AppState>>,
+    State(shared): State<SharedState>,
     Json(mut body): Json<Value>,
 ) -> Response {
+    // Snapshot the live config-derived state for the lifetime of this
+    // request. A reload mid-request affects the next request, not this one.
+    let state = shared.load_full();
     let t0 = std::time::Instant::now();
     let request_id = crate::audit::new_request_id();
 
@@ -491,7 +494,8 @@ pub async fn chat_completions(
 }
 
 /// GET /v1/models — proxy to backend
-pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
+pub async fn list_models(State(shared): State<SharedState>) -> Response {
+    let state = shared.load_full();
     let url = format!("{}/v1/models", state.backend_endpoint());
     match state.http_client.get(&url).send().await {
         Ok(r) => {
