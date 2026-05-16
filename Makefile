@@ -1,6 +1,6 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
-        bench coverage miri audit ci push release-patch release-minor release-major \
+        bench coverage miri audit geiger ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight install-trivy trivy trivy-image
 
 MODEL ?= qwen3:0.6b
@@ -88,15 +88,32 @@ miri:
 audit:
 	cargo audit
 
-TRIVY_VERSION ?= 0.50.1 # This makes it easy to override locally or in CI
+# ── Geiger security audit (requires: cargo install cargo-geiger) ──────────
+# Checks for unsafe code usage in dependencies
+
+geiger:
+	cargo geiger --update-advisories
+
+# ── Trivy vulnerability scanner (installed on demand under Debian/Ubuntu) ────
+# Pinned via TRIVY_VERSION so local runs match CI; override with
+# `make trivy TRIVY_VERSION=X.Y.Z` if you need a different release.
+
+TRIVY_VERSION ?= 0.50.1
 
 install-trivy:
-	@if ! command -v trivy >/dev/null 2>&1 || [[ "$$(trivy --version | head -n 1 | cut -d ' ' -f 3)" != "$(TRIVY_VERSION)" ]]; then \
+	@installed=""; \
+	if command -v trivy >/dev/null 2>&1; then \
+		installed=$$(trivy --version | head -n 1 | cut -d ' ' -f 2); \
+	fi; \
+	if [ "$$installed" != "$(TRIVY_VERSION)" ]; then \
 		echo "Installing Trivy $(TRIVY_VERSION)..."; \
 		sudo apt-get update; \
-		sudo apt-get install -y wget apt-transport-https gnupg; \
-		wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -; \
-		echo "deb https://aquasecurity.github.io/trivy-repo/deb stable main" | sudo tee /etc/apt/sources.list.d/trivy.list; \
+		sudo apt-get install -y wget apt-transport-https gnupg lsb-release; \
+		sudo install -d -m 0755 /usr/share/keyrings; \
+		wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+			| sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg; \
+		echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $$(lsb_release -sc) main" \
+			| sudo tee /etc/apt/sources.list.d/trivy.list; \
 		sudo apt-get update; \
 		sudo apt-get install -y trivy=$(TRIVY_VERSION); \
 	fi

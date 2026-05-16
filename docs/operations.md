@@ -290,3 +290,37 @@ the OS). nanoguard does not retry; that's the client's
 responsibility. A configurable `[backend] timeout_secs` is in the
 `multi-backend-routing.md` proposed design and will land with that
 work.
+
+## External CI scans
+
+The repo ships an opt-in Aikido SCA workflow at
+`.github/workflows/aikido.yml`. It does not run by default — the
+job is gated on the repo variable `AIKIDO_ENABLED == 'true'` so
+forks and unconfigured repos don't get failing checks.
+
+To enable on this repo (one-time setup):
+
+1. Create an account at https://www.aikido.dev (free tier covers
+   open-source dependency scanning).
+2. In the Aikido dashboard, go to **Settings → Integrations →
+   CI/CD** and generate a secret key.
+3. Add the secret to GitHub: **Settings → Secrets and variables →
+   Actions → New repository secret**, name `AIKIDO_SECRET_KEY`,
+   value the key from step 2.
+4. Flip the variable: **Settings → Secrets and variables → Actions
+   → Variables → New repository variable**, name `AIKIDO_ENABLED`,
+   value `true`.
+
+Once enabled, every push to `main` and every PR runs the scan.
+The workflow is set to `continue-on-error: true` so a real finding
+shows up as a yellow advisory check, not a red merge-blocker. After
+a release cycle of clean runs you can promote it to a required
+status check in the branch ruleset if it's pulling its weight.
+
+The scan is complementary to the existing review bots:
+
+- **CodeRabbit / Greptile / Qodo** read the diff and reason about
+  code-level issues.
+- **Aikido** scans the dependency tree against CVE feeds.
+
+Different signals, different bot. Don't expect overlap.
