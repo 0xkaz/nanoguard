@@ -1,4 +1,4 @@
-> **Status:** partial (commit cdc795c, 2026-05-17 — Stage 1 ships token format, storage, verification middleware, admin CRUD, and cache; the integration glue with budget / audit / `users` / config / `last_used_at` / shadow mode is still open. See "Still open" below.)
+> **Status:** partial (commit cdc795c, 2026-05-16 — Stage 1 ships token format, storage, verification middleware, admin CRUD, and cache; the integration glue with budget / audit / `users` / config / `last_used_at` / shadow mode is still open. See "Still open" below.)
 
 # Client Authentication
 
