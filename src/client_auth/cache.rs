@@ -300,7 +300,7 @@ mod tests {
     fn insert_on_existing_key_refreshes_ttl_in_place() {
         // Re-inserting the same key should reset `inserted_at`, so the
         // entry is not considered expired right after the refresh. The
-        // windows are deliberately wide (TTL = 2s, sleeps 750ms + 1s)
+        // windows are deliberately wide (TTL = 2s, sleeps 750ms + 1500ms)
         // so that scheduler jitter on slow CI runners — macOS GH
         // runners in particular have shown >200ms `thread::sleep`
         // overshoot — cannot land the second lookup outside the
@@ -320,10 +320,11 @@ mod tests {
         );
 
         // Now wait past the *original* TTL window but inside the
-        // refreshed one. 1s after the refresh = 1.75s after the
-        // original insert: well past 2s original TTL only after the
-        // refresh extended it — the refreshed window runs to 2.75s,
-        // leaving a 1s margin against jitter.
+        // refreshed one. 1500ms after the refresh = 2250ms after the
+        // original insert: well past the 2s original TTL only because
+        // the refresh extended the deadline — the refreshed window
+        // runs to 2750ms after the original insert, leaving roughly
+        // a 500ms margin against jitter at the lookup point.
         std::thread::sleep(Duration::from_millis(1500));
         assert!(
             cache.get("a").is_some(),
