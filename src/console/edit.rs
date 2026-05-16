@@ -5,6 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
 /// Maximum backups per file (default).
@@ -275,7 +276,7 @@ fn prune_backups(dir: &Path, stem: &str, limit: usize) -> Result<()> {
         })
         .collect();
 
-    entries.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+    entries.sort_by_key(|a| Reverse(a.1)); // newest first
 
     for (path, _) in entries.iter().skip(limit) {
         let _ = std::fs::remove_file(path);
@@ -328,7 +329,7 @@ pub fn list_backups(path: impl AsRef<Path>) -> Result<Vec<BackupInfo>> {
         }
     }
 
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    entries.sort_by_key(|a| Reverse(a.created_at));
     Ok(entries)
 }
 
