@@ -419,6 +419,53 @@ See [`docs/operations.md`](docs/operations.md) for systemd integration, log rota
 
 ---
 
+## Web Configuration UI
+
+A separate binary, `nanoguard-console`, ships an optional read-only operator console and self-service proxy-token UI. It shares `nanoguard.toml` and the budget SQLite database with the proxy but runs in its own process with its own listener. **The proxy itself never exposes a mutation HTTP surface** — see [`docs/design/web-config-ui.md`](docs/design/web-config-ui.md) for the rationale.
+
+Phase 1 (in `main`) is read-only browsing of audit log, budget state, and the current config, plus self-service proxy-token issue/revoke for the logged-in user and admin user CRUD (allowed models, budget limit, role, enable/disable). File-based config editing, CSRF tokens, reload trigger, and `console-audit.jsonl` are Phase 2 and not yet implemented.
+
+### 1. Add `[console]` to `nanoguard.toml`
+
+The default `nanoguard.toml` ships with the section commented out. Uncomment it (or paste the minimal form below) before starting `nanoguard-console`:
+
+```toml
+[console]
+listen         = "127.0.0.1:8081"          # loopback only; non-loopback auto-enables Secure cookies
+session_secret = "${CONSOLE_SESSION_SECRET}"
+session_ttl_hours = 24
+
+[console.auth]
+mode = "local"                              # Phase 1 supports "local" only; OIDC is Phase 4
+
+[console.auth.local]
+allow_signup    = false
+bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
+```
+
+`session_secret` is **required**; `nanoguard-console` refuses to start if it is empty. If `listen` is non-loopback, cookies are automatically marked `Secure` — terminate TLS in front of the console in that case.
+
+### 2. Set the env vars and start the console
+
+```bash
+export CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)"
+export BOOTSTRAP_PASSWORD='your-initial-admin-password'
+
+cargo run --bin nanoguard-console
+# or, after `make`:
+./target/release/nanoguard-console
+```
+
+`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell** — the bootstrap is one-shot and the variable is no longer needed.
+
+### 3. Open the console
+
+Browse to `http://127.0.0.1:8081/` and log in as the bootstrap admin.
+
+The proxy and the console are independent processes; you can run the console without the proxy and vice versa. They share `[budget].db_path` (default `nanoguard.db`), so run both from the same working directory.
+
+---
+
 ## Configuration
 
 `nanoguard.toml`:
@@ -471,6 +518,8 @@ db_path = "nanoguard.db"
 enabled = false
 path = "nanoguard-audit.jsonl"
 hash_only = true
+
+# [console]                          — see "Web Configuration UI" above; read by `nanoguard-console`, ignored by the proxy
 ```
 
 ### Environment variables
@@ -484,6 +533,8 @@ hash_only = true
 | `BACKEND_MODEL` | — | Default model name |
 | `RUST_LOG` | `info` | Log level |
 | `ADMIN_API_KEY` | — | Enables `/v1/admin/budget/*` endpoints |
+| `CONSOLE_SESSION_SECRET` | — | Required by `nanoguard-console`; referenced from `[console].session_secret` |
+| `BOOTSTRAP_PASSWORD` | — | One-shot plaintext password for the bootstrap admin user; unset after first start |
 
 ### Budget tracking
 

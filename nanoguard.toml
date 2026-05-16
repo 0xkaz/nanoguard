@@ -49,3 +49,30 @@ db_path = "nanoguard.db"
 enabled = true                         # set true to enable audit logging
 path = "nanoguard-audit.jsonl"
 hash_only = true                       # true = SHA-256 hash of prompt only (privacy-preserving)
+
+# ---------------------------------------------------------------------------
+# [console] — Web Configuration UI (Phase 1, run via `nanoguard-console`)
+# ---------------------------------------------------------------------------
+# The console is a separate binary that shares this config file. The proxy
+# itself ignores [console]; only `nanoguard-console` reads it. Uncomment and
+# fill in `session_secret` before starting `nanoguard-console`.
+#
+# Required env vars when this section is enabled:
+#   CONSOLE_SESSION_SECRET   - long random string (>= 32 bytes); rotates all
+#                              active sessions when changed
+#   BOOTSTRAP_PASSWORD       - plaintext password used once to provision the
+#                              bootstrap_admin user, then unset from the env
+#
+# See README ("Web Configuration UI") and docs/design/web-config-ui.md.
+#
+# [console]
+# listen         = "127.0.0.1:8081"          # loopback only by default; non-loopback auto-enables Secure cookies
+# session_secret = "${CONSOLE_SESSION_SECRET}"
+# session_ttl_hours = 24
+#
+# [console.auth]
+# mode = "local"                              # Phase 1 supports "local" only; OIDC is Phase 4
+#
+# [console.auth.local]
+# allow_signup    = false
+# bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
