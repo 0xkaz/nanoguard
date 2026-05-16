@@ -1,4 +1,4 @@
-> **Status:** partial (commit 8b2d8d2, 2026-05-17 — per-token `pii_overrides`, real `users` table integration, and shadow mode still open; see "Still open" below)
+> **Status:** partial (commit cdc795c, 2026-05-17 — Stage 1 ships token format, storage, verification middleware, admin CRUD, and cache; the integration glue with budget / audit / `users` / config / `last_used_at` / shadow mode is still open. See "Still open" below.)
 
 # Client Authentication
 
@@ -9,15 +9,36 @@ flag, and the in-memory verification cache with TTL + explicit
 invalidation on revoke. Existing deployments are not affected
 because the flag defaults to `false`.
 
-**Still open** (keeps the doc at `partial` rather than `shipped`):
+**Still open** (keeps the doc at `partial` rather than `shipped`).
+Sections below tagged *Stage 2* describe a target state that is
+**not wired** today; the verification middleware exists but does
+not yet feed budget, audit, or PII off it:
 
-- Per-token `pii_overrides`. The field is reserved on `ClientView`
-  but no PII action consults it yet.
-- Integration with the user-management work that introduces the real
-  `users` table (`user_id` defaults to 0 today as a single-tenant
-  placeholder).
-- Shadow mode (Stage 2 of the rollout). `[auth].enabled` is a strict
-  bool today; the `"shadow"` string is not yet recognized.
+- **Budget integration is not wired.** `extract_api_key` in
+  `src/proxy/mod.rs` still uses the request body's OpenAI `user`
+  field as the budget key. `ClientView` does not carry a
+  `budget_key` slot, and no `token:<id>` / `user:<id>` admin form
+  exists.
+- **Audit `user_id` / `token_id` not added.** `AuditEntry` has no
+  `user_id` or `token_id` field; the `api_key` column is still
+  populated from the request body, not from `ClientView`.
+- **`[auth].admin_api_key` not implemented.** `AuthConfig` has no
+  `admin_api_key` field. `require_admin` continues to read
+  `[budget].admin_api_key`. The migration described under
+  Configuration has not started.
+- **`last_used_at` flush not wired.** The column exists in the
+  schema but no `UPDATE client_tokens SET last_used_at` path
+  runs from the verifier, and there is no background flush task.
+  The value is always `NULL` in Stage 1.
+- **`users` table integration.** `user_id` defaults to 0 today as a
+  single-tenant placeholder; the "User disabled" failure mode lands
+  with the user-management work.
+- **Per-token `pii_overrides`.** No PII action consults a per-token
+  override yet. The `ClientView` slot for it has not been added.
+- **`allowed_models` on `ClientView`.** Reserved for the multi-
+  backend routing work; not on `ClientView` today.
+- **Shadow mode (Stage 2 of the rollout).** `[auth].enabled` is a
+  strict bool today; the `"shadow"` string is not yet recognized.
 
 Today the proxy endpoints (`/v1/chat/completions`, `/v1/messages`,
 `/v1/models`, `/health`) accept any caller on the network. Only
@@ -123,11 +144,17 @@ CREATE INDEX idx_client_tokens_user   ON client_tokens(user_id);
 compared in constant time after the row is found to defeat timing
 side-channels (`subtle::ConstantTimeEq` via the `subtle` crate).
 
-`last_used_at` is updated on a best-effort basis: not every
-request writes; the proxy buffers and flushes every N seconds
-(default 30) on a background task. Losing a few seconds of
-"last used" precision on crash is acceptable; making every request
-do a SQLite UPDATE is not.
+`last_used_at` is intended to be updated on a best-effort basis:
+not every request writes; the proxy buffers and flushes every N
+seconds (default 30) on a background task. Losing a few seconds
+of "last used" precision on crash is acceptable; making every
+request do a SQLite UPDATE is not.
+
+> **Stage 1 — not wired.** The schema carries the column and the
+> store/admin/console read it, but neither the verification
+> middleware nor any background task issues `UPDATE client_tokens
+> SET last_used_at`. The value is always `NULL` until Stage 2
+> lands.
 
 ## Verification path
 
@@ -163,7 +190,8 @@ callers get 401.
 
 ### ClientView
 
-The in-memory shape attached to each request:
+The in-memory shape attached to each request as it stands in
+Stage 1:
 
 ```rust
 struct ClientView {
@@ -171,14 +199,22 @@ struct ClientView {
     token_prefix:    String,         // "ng_p_a3k7"
     user_id:         i64,
     label:           Option<String>,
-    allowed_models:  AllowedModels,  // see multi-backend-routing.md
-    budget_key:      String,         // see Budget integration below
-    pii_overrides:   Option<Arc<PiiOverrides>>,  // future: per-user PII action
 }
 ```
 
-Cheap to clone (Arc-wrapped where applicable). Created at
-verification time, dropped at request end. Never serialized.
+The fields below are part of the longer-term design but are **not
+present today**. They are listed here for context, not as a current
+contract:
+
+- `allowed_models: AllowedModels` — Stage 2, lands with
+  `multi-backend-routing.md`.
+- `budget_key: String` — Stage 2, lands with the Budget integration
+  rewrite below.
+- `pii_overrides: Option<Arc<PiiOverrides>>` — future, see Open
+  questions.
+
+Cheap to clone. Created at verification time, dropped at request
+end. Never serialized.
 
 ## Caching
 
@@ -217,6 +253,14 @@ behavior — there is no persistent cache state to lose.
 
 ## Budget integration
 
+> **Stage 2 — not yet wired.** `src/proxy/mod.rs` still calls
+> `extract_api_key(&body)` and reads the request body's OpenAI
+> `user` field as the budget key; `ClientView` is not consulted
+> for budget accounting and carries no `budget_key` slot. The
+> `token:<id>` / `user:<id>` admin forms are not implemented.
+> The rest of this section describes the target contract, not
+> current behavior.
+
 The existing `[budget]` machinery uses the OpenAI `user` field
 from the request body as the budget key, falling back to
 `"default"`. That is a workable identifier today because there is
@@ -243,11 +287,17 @@ covered in the rollout section below.
 
 ## Audit integration
 
+> **Stage 2 — not yet applied.** `AuditEntry` (`src/audit/mod.rs`)
+> has no `user_id` or `token_id` field today, and the `api_key`
+> column is still sourced from `extract_api_key` against the
+> request body. The "After" column below is the proposed target
+> state, not what the audit log currently emits.
+
 The audit log's existing `api_key` field becomes the verified token
 prefix (e.g. `ng_p_a3k7`), not the OpenAI `user` field. The
 mapping is:
 
-| Audit field    | Before                             | After                             |
+| Audit field    | Before (current Stage 1)           | After (Stage 2, proposed)         |
 |----------------|------------------------------------|-----------------------------------|
 | `api_key`      | request body's `user` or `default` | `ClientView.token_prefix`         |
 | (new) `user_id`| absent                             | `ClientView.user_id` as a string  |
@@ -272,7 +322,7 @@ read `api_key` keep working; new consumers can filter by
 | Token found, hash mismatch                 | 401 (uniform body, constant time)                           |
 | Token expired                              | 401, body identifies "expired" (distinct from "unknown")    |
 | Token revoked                              | 401, body identifies "revoked"                              |
-| User disabled                              | 401, body identifies "user disabled"                        |
+| User disabled (Stage 2, with `users` table)| 401, body identifies "user disabled" — not implemented today, no `users` table to read from |
 | Cache lookup successful, hot path proceeds | 200 / normal proxy flow                                     |
 
 The split between "unknown" (uniform) and "expired/revoked/disabled"
@@ -287,25 +337,33 @@ client's perspective (different status messages), and there is no
 secret to leak from a timing difference between, say, an expired
 token and a revoked one.
 
+All 401 responses include a `WWW-Authenticate: Bearer …` header,
+not just the "no Authorization header" case — the table above
+lists the realm form only on the first row to avoid repetition.
+The malformed / unknown / expired / revoked branches add
+`error="invalid_token"` per RFC 6750.
+
 ## Configuration
 
 A new section in `nanoguard.toml`:
 
 ```toml
 [auth]
-enabled = true                    # default true once this lands
+enabled = false                   # Stage 1 default; flips to true at Stage 3
 env_marker = "p"                  # 'p' production, 't' test/dev
 cache_capacity = 10000
 cache_ttl_secs = 60
 require_https = false             # see Transport below
-admin_api_key = "${ADMIN_API_KEY}" # unchanged; moves here from [budget]
 ```
 
-The existing `[budget].admin_api_key` is preserved as a fallback
-for one release, with a deprecation warning, then removed.
-`[auth].admin_api_key` is the new home because admin authentication
-is now a peer of client authentication, not a sub-feature of
-budget.
+> **Stage 2 — `[auth].admin_api_key` not yet implemented.**
+> Stage 1 `AuthConfig` has no `admin_api_key` field; `require_admin`
+> in `src/admin/mod.rs` still reads `state.config.budget.admin_api_key`.
+> The plan, when this migrates, is to add an `admin_api_key` line to
+> the block above, preserve `[budget].admin_api_key` for one release
+> with a deprecation warning, then remove it. `[auth].admin_api_key`
+> is the right long-term home because admin authentication is a
+> peer of client authentication, not a sub-feature of budget.
 
 ### Transport
 
@@ -378,9 +436,10 @@ experience consistent.
   default, surface expiry as a per-token opt-in in the UI. Long-
   lived tokens are the common case; forcing expiry creates a
   rotation toil that operators will route around.
-- **Per-token PII overrides**: punted to a future doc. The
-  `ClientView.pii_overrides` slot is reserved so the request
-  pipeline can grow into it without another refactor.
+- **Per-token PII overrides**: punted to a future doc. A
+  `ClientView.pii_overrides` slot is intended to be added later so
+  the request pipeline can grow into it; it is not on `ClientView`
+  in Stage 1.
 - **Token rotation API**: should there be a "rotate token N"
   primitive that issues a new token, ties it to the same
   user/labels/quotas, and revokes the old one after a grace
