@@ -1,4 +1,4 @@
-> **Status:** shipped (commit 19fddf0, 2026-05-16)
+> **Status:** shipped (commit b217de5, 2026-05-17)
 
 # Audit Log Format
 
@@ -36,7 +36,7 @@ Written once per processed request that triggered a guardrail decision.
 
 | Field          | Type             | Always present | Description                                                                                                                                          |
 |----------------|------------------|----------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `request_id`   | string           | yes            | 32-char hex of the nanosecond timestamp at request receive.                                                                                          |
+| `request_id`   | string           | yes            | 48-char hex: 32 chars of nanosecond timestamp at request receive, plus a 16-char monotonic counter so two ids minted in the same nanosecond differ. |
 | `timestamp`    | string (RFC3339) | yes            | UTC timestamp when the audit entry was written.                                                                                                      |
 | `api_key`      | string           | yes            | The OpenAI `user` field from the request body, or `"default"`. Will become the verified client-token prefix once `feat/client-auth` lands.           |
 | `model`        | string           | yes            | The `model` field from the request body, or `"unknown"`.                                                                                             |
@@ -104,7 +104,7 @@ Written once per SIGHUP-triggered reload attempt (see
 
 | Field        | Type             | Always present | Description                                                                                                  |
 |--------------|------------------|----------------|--------------------------------------------------------------------------------------------------------------|
-| `request_id` | string           | yes            | Same 32-char-hex shape as request entries. Reloads are not requests, but they reuse the id generator.        |
+| `request_id` | string           | yes            | Same 48-char-hex shape as request entries. Reloads are not requests, but they reuse the id generator.        |
 | `timestamp`  | string (RFC3339) | yes            | UTC timestamp when the reload attempt completed.                                                             |
 | `verdict`    | string           | yes            | `"reload_ok"` or `"reload_failed"`.                                                                          |
 | `error`      | string           | on failure     | Bounded category label, **not** raw error text — see "Error label vocabulary" below. Omitted on `reload_ok`. |

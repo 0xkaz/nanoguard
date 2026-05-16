@@ -4,6 +4,14 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Fixed — `AuditLog::write` no longer drops failures silently (XKA-48)
+
+The audit writer previously hid I/O errors (the `writeln!` return value was discarded with `let _ =`) and skipped any write that landed on a poisoned mutex (`if let Ok(mut f) = self.file.lock()`). A disk-full condition, a read-only filesystem, an NFS write failure, or a single panic in another thread holding the audit lock would all silently disable the audit trail — exactly the failure mode where a security audit log most needs to stay visible.
+
+`write` and `write_reload` now share a `write_line` sink that recovers from `Mutex` poisoning via `poisoned.into_inner()` and emits `tracing::error!` so operators see the recovery, logs `writeln!` failures at `error` level instead of dropping them, and optionally calls `sync_all` after each write when `[audit] fsync_every_write = true` (default `false`, trading throughput for crash-durability of the most recent entries).
+
+`new_request_id` now mixes a process-wide `AtomicU64` counter into the id (32 hex chars timestamp + 16 hex chars counter), so two ids minted in the same nanosecond no longer collide. The counter half is a collision-prevention tie-breaker, not an unpredictability guarantee — request ids are not used for authentication or capability checks. Five new audit unit tests cover the JSONL append path, the poisoned-lock recovery, the `fsync_every_write` plumbing, the reload-verdict shape, and request-id uniqueness under a tight 10k-iteration loop.
+
 ### CI — tighten lint scope, pin MSRV, add macOS matrix, deny audit warnings (XKA-49)
 
 `.github/workflows/ci.yml` now mirrors `make preflight` instead of drifting from it: clippy runs against `--all-targets --all-features` so benches and integration tests are linted by CI, the `test` job runs as a fail-fast-disabled matrix over `ubuntu-latest` and `macos-14` so `rusqlite` (bundled) / `rustls` build breakage surfaces before release, and `cargo audit --deny warnings` so a future advisory that only emits a warning still fails CI. A new `msrv` job parses `rust-version` out of `Cargo.toml` and `cargo build --tests` on that exact toolchain — the pin now has CI enforcement instead of being a comment. `Cargo.toml` gains `rust-version = "1.82"` as the declared MSRV — the existing `src/matcher/mod.rs` uses `std::iter::repeat_n` (stabilized in 1.82), and the new `msrv` job catches exactly that drift via clippy's `incompatible_msrv` lint; `make lint` and `make preflight` are bumped to `--all-targets --all-features` and `cargo audit --deny warnings` so local and CI stay in lockstep. Windows runners are intentionally left for a follow-up — a couple of bundled deps need separate investigation under MSVC before a green matrix run is realistic.
