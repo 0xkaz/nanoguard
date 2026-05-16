@@ -2,7 +2,7 @@ use std::{
     io::Write,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -48,6 +48,11 @@ pub struct AuditLog {
     file: Mutex<std::fs::File>,
     hash_only: bool,
     fsync_every_write: bool,
+    // `Mutex::into_inner` on a `PoisonError` does not clear the poison flag,
+    // so every subsequent `lock()` will return `Err(poisoned)` for the rest
+    // of the process lifetime. We log the recovery exactly once and silently
+    // recover thereafter to avoid flooding the operator log on every write.
+    poison_logged: AtomicBool,
 }
 
 impl AuditLog {
@@ -66,6 +71,7 @@ impl AuditLog {
             file: Mutex::new(file),
             hash_only: cfg.hash_only,
             fsync_every_write: cfg.fsync_every_write,
+            poison_logged: AtomicBool::new(false),
         }))
     }
 
@@ -128,7 +134,16 @@ impl AuditLog {
         let mut guard = match self.file.lock() {
             Ok(g) => g,
             Err(poisoned) => {
-                tracing::error!("audit lock was poisoned ({kind}); recovering and continuing");
+                // `into_inner` does not clear the poison flag, so every
+                // future `lock()` returns `Err(poisoned)` too. Log the
+                // recovery once per process to avoid flooding the operator
+                // log; the subsequent recoveries are silent but still
+                // succeed.
+                if !self.poison_logged.swap(true, Ordering::Relaxed) {
+                    tracing::error!(
+                        "audit lock was poisoned ({kind}); recovering and continuing (further recoveries on this log will be silent)"
+                    );
+                }
                 poisoned.into_inner()
             }
         };
@@ -162,8 +177,10 @@ struct ReloadEntry {
 }
 
 // Monotonic counter mixed into request ids so two ids minted in the same
-// nanosecond (or on platforms with coarse clocks) still differ, and so an
-// observer cannot trivially predict the next id from a previous one.
+// nanosecond (or on platforms with coarse clocks) still differ. This is a
+// collision-prevention measure, not an unpredictability guarantee — the
+// counter component is sequential and trivially predictable from a prior id.
+// Request ids are not used for authentication or capability checks.
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn new_request_id() -> String {
@@ -173,7 +190,9 @@ pub fn new_request_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    // 32 hex chars of timestamp + 16 hex chars of counter. No uuid dep.
+    // 32 hex chars of timestamp + 16 hex chars of a monotonic counter.
+    // The counter half is purely a collision-prevention tie-breaker for
+    // same-nanosecond ids; it is not unpredictable. No uuid dep.
     format!("{ns:032x}{seq:016x}")
 }
 
@@ -265,15 +284,28 @@ mod tests {
             log.file.is_poisoned(),
             "precondition: the mutex must be poisoned after the panic"
         );
+        assert!(
+            !log.poison_logged.load(Ordering::Relaxed),
+            "precondition: recovery has not been logged yet"
+        );
 
-        // The next write must still land in the file (and must not panic).
+        // Subsequent writes must still land in the file (and must not panic).
+        // `into_inner` does not clear the poison flag, so every write after
+        // this point will hit the poisoned arm — they must all succeed.
         log.write(&sample_entry());
+        log.write(&sample_entry());
+        log.write(&sample_entry());
+
+        assert!(
+            log.poison_logged.load(Ordering::Relaxed),
+            "recovery must be marked as logged after the first poisoned write"
+        );
 
         let lines = read_lines(&path);
         assert_eq!(
             lines.len(),
-            1,
-            "write after lock poison should still append the entry"
+            3,
+            "every write after lock poison should still append the entry"
         );
 
         let _ = std::fs::remove_file(path);

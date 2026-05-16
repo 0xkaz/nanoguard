@@ -10,7 +10,7 @@ The audit writer previously hid I/O errors (the `writeln!` return value was disc
 
 `write` and `write_reload` now share a `write_line` sink that recovers from `Mutex` poisoning via `poisoned.into_inner()` and emits `tracing::error!` so operators see the recovery, logs `writeln!` failures at `error` level instead of dropping them, and optionally calls `sync_all` after each write when `[audit] fsync_every_write = true` (default `false`, trading throughput for crash-durability of the most recent entries).
 
-`new_request_id` now mixes a process-wide `AtomicU64` counter into the id (32 hex chars timestamp + 16 hex chars counter), so two ids minted in the same nanosecond no longer collide and the next id is not trivially predictable from the previous one. Five new audit unit tests cover the JSONL append path, the poisoned-lock recovery, the `fsync_every_write` plumbing, the reload-verdict shape, and request-id uniqueness under a tight 10k-iteration loop.
+`new_request_id` now mixes a process-wide `AtomicU64` counter into the id (32 hex chars timestamp + 16 hex chars counter), so two ids minted in the same nanosecond no longer collide. The counter half is a collision-prevention tie-breaker, not an unpredictability guarantee — request ids are not used for authentication or capability checks. Five new audit unit tests cover the JSONL append path, the poisoned-lock recovery, the `fsync_every_write` plumbing, the reload-verdict shape, and request-id uniqueness under a tight 10k-iteration loop.
 
 ### Fixed — `filter_output` now case-insensitive (silent PII leak on LLM responses)
 

@@ -1,4 +1,4 @@
-> **Status:** shipped (XKA-48, 2026-05-17)
+> **Status:** shipped (commit b217de5, 2026-05-17)
 
 # Audit Log Format
 
