@@ -63,17 +63,16 @@ jobs:
 
       - name: Install Trivy
         env:
-          TRIVY_VERSION: "0.50.1"
+          TRIVY_VERSION: "0.70.0"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-          sudo install -d -m 0755 /usr/share/keyrings
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
-            | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
-            | sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy=${TRIVY_VERSION}
+          # Use the upstream installer pinned to TRIVY_VERSION so CI and
+          # `make trivy` resolve to the same binary. The Aqua apt repo only
+          # carries a short window of recent versions (~last 6 months), so
+          # pinning to an older release via `apt-get install trivy=X.Y.Z`
+          # silently fails on the GitHub runner.
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"
+          trivy --version
 
       - name: Cache Trivy DB
         id: cache-trivy-db

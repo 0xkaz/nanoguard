@@ -60,14 +60,22 @@ alternatives considered:
 
 ## Pinning and reproducibility
 
-The Trivy version is pinned to `TRIVY_VERSION = 0.50.1` in both
-the Makefile and the CI workflow. Local `make trivy` and the CI
-`trivy scan` job therefore install and run the same binary, so a
-finding that appears in CI can be reproduced locally with the
-same SARIF output. Override locally with
-`make trivy TRIVY_VERSION=X.Y.Z` when investigating a regression
-in a newer release; do not bump the version in `main` without
-re-confirming the SARIF schema is stable against
+The Trivy version is pinned to `TRIVY_VERSION = 0.70.0` in both
+the Makefile and the CI workflow. Both code paths install via the
+upstream `contrib/install.sh` installer rather than `apt`, because
+the Aqua apt repo only retains a short rolling window of recent
+versions and pinning to anything older than ~6 months silently
+fails with `Version 'X.Y.Z' for 'trivy' was not found`. The
+installer drops the binary under `/usr/local/bin` (overridable via
+`TRIVY_INSTALL_DIR` in the Makefile), which is on `$PATH` for both
+the GitHub-hosted runner and a default local shell.
+
+Local `make trivy` and the CI `trivy scan` job therefore install
+and run the same binary, so a finding that appears in CI can be
+reproduced locally with the same SARIF output. Override locally
+with `make trivy TRIVY_VERSION=X.Y.Z` when investigating a
+regression in a newer release; do not bump the version in `main`
+without re-confirming the SARIF schema is stable against
 `github/codeql-action/upload-sarif@v3`.
 
 ## DB caching

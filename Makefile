@@ -94,11 +94,14 @@ audit:
 geiger:
 	cargo geiger --update-advisories
 
-# ── Trivy vulnerability scanner (installed on demand under Debian/Ubuntu) ────
+# ── Trivy vulnerability scanner (installed via upstream installer) ──────────
 # Pinned via TRIVY_VERSION so local runs match CI; override with
-# `make trivy TRIVY_VERSION=X.Y.Z` if you need a different release.
+# `make trivy TRIVY_VERSION=X.Y.Z` if you need a different release. The
+# installer drops the binary under TRIVY_INSTALL_DIR (default /usr/local/bin)
+# which is on $PATH for both CI and most local shells.
 
-TRIVY_VERSION ?= 0.50.1
+TRIVY_VERSION ?= 0.70.0
+TRIVY_INSTALL_DIR ?= /usr/local/bin
 
 install-trivy:
 	@installed=""; \
@@ -106,16 +109,9 @@ install-trivy:
 		installed=$$(trivy --version | head -n 1 | cut -d ' ' -f 2); \
 	fi; \
 	if [ "$$installed" != "$(TRIVY_VERSION)" ]; then \
-		echo "Installing Trivy $(TRIVY_VERSION)..."; \
-		sudo apt-get update; \
-		sudo apt-get install -y wget apt-transport-https gnupg lsb-release; \
-		sudo install -d -m 0755 /usr/share/keyrings; \
-		wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
-			| sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg; \
-		echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $$(lsb_release -sc) main" \
-			| sudo tee /etc/apt/sources.list.d/trivy.list; \
-		sudo apt-get update; \
-		sudo apt-get install -y trivy=$(TRIVY_VERSION); \
+		echo "Installing Trivy $(TRIVY_VERSION) into $(TRIVY_INSTALL_DIR)..."; \
+		curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+			| sudo sh -s -- -b $(TRIVY_INSTALL_DIR) "v$(TRIVY_VERSION)"; \
 	fi
 
 trivy: install-trivy
