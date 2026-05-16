@@ -1,7 +1,7 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
-        release-tag pr pr-web preflight install-trivy trivy trivy-image
+        release-tag pr pr-web preflight install-trivy trivy trivy-image mirai preflight-mirai
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -81,6 +81,28 @@ watch-coverage:
 
 miri:
 	cargo +nightly miri test $(TEST)
+
+# ── Static analysis (requires MIRAI) ─────────────────────────────────────────
+# Install:
+#   git clone https://github.com/endorlabs/MIRAI.git
+#   cd MIRAI
+#   cargo install --locked --path ./checker
+# Optional flags:
+#   MIRAI_FLAGS="--diag=verify --body_analysis_timeout 60" make mirai
+
+mirai:
+	@command -v cargo-mirai >/dev/null 2>&1 || { \
+	    echo ""; \
+	    echo "error: cargo-mirai not installed."; \
+	    echo "       install once with:"; \
+	    echo "           git clone https://github.com/endorlabs/MIRAI.git"; \
+	    echo "           cd MIRAI"; \
+	    echo "           cargo install --locked --path ./checker"; \
+	    echo ""; \
+	    echo "       MIRAI is an optional deep static-analysis pass."; \
+	    exit 1; \
+	}
+	cargo mirai --tests $(MIRAI_FLAGS)
 
 # ── Security audit (requires: cargo install cargo-audit) ─────────────────────
 # Checks dependencies against RustSec advisory database
@@ -281,3 +303,8 @@ preflight:
 	@echo "→ tools/e2e.sh"
 	./tools/e2e.sh
 	@echo "✓ preflight passed"
+
+preflight-mirai: preflight
+	@echo "→ cargo mirai --tests"
+	$(MAKE) mirai
+	@echo "✓ preflight + MIRAI passed"
