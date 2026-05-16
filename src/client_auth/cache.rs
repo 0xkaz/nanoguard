@@ -299,28 +299,32 @@ mod tests {
     #[test]
     fn insert_on_existing_key_refreshes_ttl_in_place() {
         // Re-inserting the same key should reset `inserted_at`, so the
-        // entry is not considered expired right after the refresh. Use
-        // a comfortably wide TTL so the assertion does not depend on
-        // tight scheduling — what we are actually checking is the
-        // refresh, not the parser's reaction to wall clock jitter.
-        let cache = TokenCache::new(4, Duration::from_millis(400));
+        // entry is not considered expired right after the refresh. The
+        // windows are deliberately wide (TTL = 2s, sleeps 750ms + 1s)
+        // so that scheduler jitter on slow CI runners — macOS GH
+        // runners in particular have shown >200ms `thread::sleep`
+        // overshoot — cannot land the second lookup outside the
+        // refreshed TTL window. What we are checking is the refresh
+        // semantics, not the OS's sleep accuracy.
+        let cache = TokenCache::new(4, Duration::from_secs(2));
         cache.insert("a".to_string(), token("a", 1));
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(750));
         cache.insert("a".to_string(), token("a", 1));
         // Lookup immediately after the refresh: definitely inside the
-        // 400ms window. If the refresh failed to update `inserted_at`
-        // the entry would still appear fresh too (150ms < 400ms), so we
-        // need a separate longer wait below.
+        // 2s window. If the refresh failed to update `inserted_at` the
+        // entry would still appear fresh too (750ms < 2s), so we need
+        // a separate longer wait below.
         assert!(
             cache.get("a").is_some(),
             "refresh keeps the entry available"
         );
 
         // Now wait past the *original* TTL window but inside the
-        // refreshed one. 300ms after the refresh = 450ms after the
-        // original insert: past 400ms original TTL, well inside the
-        // refreshed 400ms window (100ms margin).
-        std::thread::sleep(Duration::from_millis(300));
+        // refreshed one. 1s after the refresh = 1.75s after the
+        // original insert: well past 2s original TTL only after the
+        // refresh extended it — the refreshed window runs to 2.75s,
+        // leaving a 1s margin against jitter.
+        std::thread::sleep(Duration::from_millis(1500));
         assert!(
             cache.get("a").is_some(),
             "refresh resets the TTL clock — entry past original TTL still cached"
