@@ -14,11 +14,10 @@ use crate::{audit, backend, budget, client_auth, config, AppState};
 /// keep-alive pools). Reload reuses them as-is and only rebuilds the
 /// matcher / redactor / guards / policy index on top.
 ///
-/// Client-auth lives here too because its SQLite connection and (in a
-/// later commit) its in-memory verification cache + invalidation
-/// broadcast channel must persist across reloads — operators editing
-/// `[auth]` keys other than `enabled` get a "restart-only" warning,
-/// same pattern as `[backend]`.
+/// Client-auth lives here too because its SQLite connection and its
+/// in-memory verification cache must persist across reloads —
+/// operators editing `[auth]` keys get a "restart-only" warning, same
+/// pattern as `[backend]`.
 #[derive(Clone)]
 pub struct RuntimeHandles {
     pub backend: backend::Backend,
@@ -351,11 +350,10 @@ fn warn_on_restart_only_drift(live: &crate::config::Config, new: &crate::config:
         ignored.push("[audit].hash_only");
     }
     // [auth].* is restart-only in v1: the SQLite handle for client_tokens
-    // and (in a later commit) the verification cache + invalidation
-    // broadcast channel are runtime state owned by RuntimeHandles. Live
-    // toggling of `enabled` is plausible but easy to misuse (flip on
-    // before any tokens exist → lock everyone out), so we keep all of
-    // [auth] behind a restart for the first iteration.
+    // and the verification cache are runtime state owned by
+    // RuntimeHandles. Live toggling of `enabled` is plausible but easy
+    // to misuse (flip on before any tokens exist → lock everyone out),
+    // so we keep all of [auth] behind a restart for the first iteration.
     if live.auth.enabled != new.auth.enabled {
         ignored.push("[auth].enabled");
     }

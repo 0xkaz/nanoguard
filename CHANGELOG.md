@@ -4,6 +4,14 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — client-auth verification cache (TTL + LRU + revoke-driven invalidation)
+
+The middleware no longer hits SQLite on every authed request. `ClientAuth::lookup` is a read-through cache keyed by token prefix: cache hit on the hot path, SQLite read + populate on miss. Bounded by `[auth].cache_capacity` (default 10_000) with `[auth].cache_ttl_secs` (default 60s) eviction. Negative results (unknown prefixes) are intentionally not cached so a flood of bogus prefixes cannot grow the cache and a newly-minted token is visible immediately.
+
+`DELETE /v1/admin/clients/:id` resolves the row's prefix and calls `invalidate_cached` before returning, so a revoked token stops working on the very next request instead of waiting up to `cache_ttl_secs`. The TTL remains the fallback for any revocation that bypasses the admin endpoint (e.g., a direct SQLite edit).
+
+`docs/design/client-auth.md > Caching` updates to describe what was actually built — explicit in-process invalidation rather than a tokio broadcast channel, since both producer (admin handler) and consumer (verifier) share the same `Arc<TokenCache>`. 8 new cache unit tests, 4 new runtime tests, and an updated e2e assertion at 23j (revoke now takes effect "immediately" rather than "on the next request after up to 60s").
+
 ### Fixed — `filter_output` now case-insensitive (silent PII leak on LLM responses)
 
 `Matchers::filter_output` was running iword's `Dictionary::filter` in case-sensitive mode against raw LLM output. The output dictionary entries are lowercase (`ssn`, `social security`, `credit card`), but LLMs almost always emit these capitalized (`SSN`, `Social Security`, `Credit Card`), so the last-line-of-defence PII mask was silently bypassed for the common shape. The filter now scans a lowercased copy of the response and projects matched byte ranges back onto the original text, preserving user-visible casing / whitespace / NFKC form everywhere except the masked spans. Vault placeholders such as `[SSN_1]` are explicitly skipped so the existing PII round-trip restoration still works. Five new matcher tests cover the uppercase and capitalized variants plus the placeholder skip.

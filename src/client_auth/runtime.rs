@@ -1,14 +1,17 @@
 //! Runtime handle for the client-auth subsystem.
 //!
-//! Owns the SQLite connection that backs the `client_tokens` table and (in
-//! a later commit) the in-memory verification cache. Threaded through
-//! `RuntimeHandles` so hot reload preserves it across SIGHUP.
+//! Owns the SQLite connection that backs the `client_tokens` table and
+//! the in-memory verification cache. Threaded through `RuntimeHandles`
+//! so hot reload preserves it across SIGHUP.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::client_auth::cache::{CachedToken, TokenCache};
+use crate::client_auth::store;
 use crate::config::AuthConfig;
 
 /// Shared handle to the client-auth backing store + cache.
@@ -28,6 +31,10 @@ struct Inner {
     /// safe through its file lock). Kept separate so the budget code
     /// does not have to learn about client-auth, and vice versa.
     conn: Mutex<Connection>,
+    /// In-memory verification cache. Lookups go through this before
+    /// touching SQLite; admin revoke calls `invalidate` to evict the
+    /// affected prefix immediately.
+    cache: TokenCache,
     config: AuthConfig,
 }
 
@@ -56,9 +63,14 @@ impl ClientAuth {
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening client_tokens DB at {db_path}"))?;
         super::store::migrate(&conn).context("applying client_tokens migration")?;
+        let cache = TokenCache::new(
+            config.cache_capacity,
+            Duration::from_secs(config.cache_ttl_secs),
+        );
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
+                cache,
                 config,
             }),
         })
@@ -80,6 +92,45 @@ impl ClientAuth {
     /// https` from the trusted reverse proxy).
     pub fn require_https(&self) -> bool {
         self.inner.config.require_https
+    }
+
+    /// Look up a token by its 10-char prefix. Hits the in-memory cache
+    /// first; on miss reads SQLite and populates the cache.
+    ///
+    /// Returns the cached `(row, hash)` pair so the caller can do the
+    /// constant-time hash compare and the expiry/revoke check. Returns
+    /// `Ok(None)` when no row exists in either the cache or SQLite.
+    ///
+    /// The cache is never populated with a `None` result: a flood of
+    /// 401-with-unknown-prefix requests must not get a cache hit and
+    /// must continue to hit SQLite each time. Caching negative results
+    /// would also make it impossible to see a newly-minted token until
+    /// the next TTL window.
+    pub fn lookup(&self, prefix: &str) -> rusqlite::Result<Option<CachedToken>> {
+        if let Some(cached) = self.inner.cache.get(prefix) {
+            return Ok(Some(cached));
+        }
+        let row_and_hash = self.with_conn(|conn| store::lookup_by_prefix(conn, prefix))?;
+        let Some((row, hash)) = row_and_hash else {
+            return Ok(None);
+        };
+        let cached = CachedToken { row, hash };
+        self.inner.cache.insert(prefix.to_string(), cached.clone());
+        Ok(Some(cached))
+    }
+
+    /// Drop a specific prefix from the cache. Called from the admin
+    /// revoke path so the revoke takes effect on the next request
+    /// rather than waiting for TTL.
+    pub fn invalidate_cached(&self, prefix: &str) {
+        self.inner.cache.invalidate(prefix);
+    }
+
+    /// Test-only accessor for the cache, used to assert hit/miss
+    /// behavior end-to-end without exposing the internal type publicly.
+    #[cfg(test)]
+    pub(crate) fn cache(&self) -> &TokenCache {
+        &self.inner.cache
     }
 
     /// Acquire the SQLite connection. Held under a Mutex; callers should
@@ -193,6 +244,78 @@ mod tests {
             let _ca = ClientAuth::open(":memory:", cfg)
                 .unwrap_or_else(|e| panic!("env_marker {:?} should succeed: {e}", good));
         }
+    }
+
+    #[test]
+    fn lookup_caches_first_hit_and_serves_second_without_db() {
+        // Insert directly via the store, then call lookup twice. The
+        // first hit populates the cache; the second must return the
+        // same data even after the row is deleted out from under us —
+        // proving the second hit did not touch SQLite.
+        let ca = in_memory(AuthConfig::default());
+        let token = Token::generate('p');
+        ca.with_conn(|c| store::insert(c, &token.prefix, &token.hash, 1, Some("x"), None).unwrap());
+
+        let first = ca.lookup(&token.prefix).unwrap().expect("first lookup");
+        assert_eq!(first.row.user_id, 1);
+
+        // Wipe the DB row. If lookup were not cached, the next call
+        // would return None.
+        ca.with_conn(|c| {
+            c.execute(
+                "DELETE FROM client_tokens WHERE prefix = ?",
+                [&token.prefix],
+            )
+            .unwrap();
+        });
+
+        let second = ca
+            .lookup(&token.prefix)
+            .unwrap()
+            .expect("cache must serve the second lookup despite DB deletion");
+        assert_eq!(second.row.user_id, 1);
+    }
+
+    #[test]
+    fn invalidate_cached_forces_db_reread() {
+        let ca = in_memory(AuthConfig::default());
+        let token = Token::generate('p');
+        ca.with_conn(|c| store::insert(c, &token.prefix, &token.hash, 7, None, None).unwrap());
+
+        // Prime the cache.
+        let _ = ca.lookup(&token.prefix).unwrap();
+        // Drop the DB row, then invalidate. The next lookup re-reads
+        // SQLite and sees the absence.
+        ca.with_conn(|c| {
+            c.execute(
+                "DELETE FROM client_tokens WHERE prefix = ?",
+                [&token.prefix],
+            )
+            .unwrap();
+        });
+        ca.invalidate_cached(&token.prefix);
+
+        assert!(
+            ca.lookup(&token.prefix).unwrap().is_none(),
+            "invalidate must force a fresh DB read"
+        );
+    }
+
+    #[test]
+    fn lookup_miss_does_not_pollute_cache() {
+        // An attacker hammering bogus prefixes should not be able to
+        // grow the cache. Each miss must hit SQLite, but never insert
+        // a negative entry.
+        let ca = in_memory(AuthConfig::default());
+        for i in 0..32 {
+            let p = format!("ng_p_zz{:03}", i);
+            assert!(ca.lookup(&p).unwrap().is_none());
+        }
+        assert_eq!(
+            ca.cache().len(),
+            0,
+            "negative lookups must not populate the cache"
+        );
     }
 
     #[test]

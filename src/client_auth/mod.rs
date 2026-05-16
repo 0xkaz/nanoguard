@@ -1,26 +1,31 @@
 //! Client token model — Bearer credentials nanoguard issues for use against
 //! the proxy endpoints. See `docs/design/client-auth.md`.
 //!
-//! This module is the standalone data layer:
+//! Submodules:
 //!
-//! - [`Token`] generation with prefix + secret + at-rest hash.
+//! - [`Token`] generation with prefix + secret + at-rest hash (this file).
 //! - [`PrefixedToken::parse`] for splitting a wire string into prefix +
 //!   secret components for verification.
 //! - [`verify`] for constant-time hash comparison.
-//!
-//! It deliberately knows nothing about HTTP, axum, or `AppState`. The proxy
-//! wiring (the in-memory cache, the request-extension threading, the admin
-//! endpoints) lands in a follow-up commit.
+//! - [`cache`] for the in-memory verification cache (TTL + LRU + explicit
+//!   invalidation on revoke).
+//! - [`store`] for the SQLite-backed `client_tokens` table.
+//! - [`runtime::ClientAuth`] for the runtime handle that wires the store
+//!   and the cache together and exposes the lookup path.
+//! - [`middleware::verify_request`] for the axum middleware that consumes
+//!   the above to gate the proxy endpoints.
 
 use rand::{rngs::OsRng, TryRngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+pub mod cache;
 pub mod middleware;
 pub mod runtime;
 pub mod store;
 
 pub use crate::config::AuthConfig;
+pub use cache::{CachedToken, TokenCache};
 pub use middleware::{verify_request, ClientView};
 pub use runtime::ClientAuth;
 
