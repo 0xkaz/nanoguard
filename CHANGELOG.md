@@ -7,6 +7,12 @@ All notable changes to nanoguard are documented in this file. The format is loos
 - **`docs/design/release-strategy.md` (new)** — Reviews the current release process and proposes a three-phase strategy for distribution hardening and workflow automation.
 - **CI/CD: Automated GitHub Releases** — `release.yml` now builds multi-arch binaries for Linux and macOS and uploads them to a GitHub Release automatically when a tag is pushed.
 
+### Added — console-audit.jsonl for admin mutations (XKA-61)
+
+Every mutation that flows through the console — login, logout, token create/revoke, user create/update, role change, force-revoke-all-tokens, and the existing file edit/revert — now writes a structured record to `[console].audit_path` (default `console-audit.jsonl`). Each entry carries the common envelope `{ request_id, timestamp, actor, actor_id, action, target, before, after, summary }`. `before` / `after` are JSON objects scoped to the fields the action actually changed, and are omitted entirely when an action carries neither (login, logout). The existing Phase 1 `EditRecord` shape is still accepted by the viewer so on-disk files written by older binaries continue to read cleanly.
+
+A new admin endpoint `POST /api/users/:id/force-revoke-tokens` walks every live `client_tokens` row for the target user, marks them revoked atomically, and emits a `user_force_revoke_all` audit record with the revoked count. The viewer endpoint `GET /api/console-audit` accepts new `actor` and `target` query parameters (in addition to `action`, with `verdict` retained as a legacy alias for `action`) so operators can answer "what did admin alice do" and "what was done to user carol" without a separate jq pass. The proxy still never writes to this file; the console still never writes to the proxy audit log.
+
 ### Added — client-auth verification cache (TTL + LRU + revoke-driven invalidation)
 
 The middleware no longer hits SQLite on every authed request. `ClientAuth::lookup` is a read-through cache keyed by token prefix: cache hit on the hot path, SQLite read + populate on miss. Bounded by `[auth].cache_capacity` (default 10_000) with `[auth].cache_ttl_secs` (default 60s) eviction. Negative results (unknown prefixes) are intentionally not cached so a flood of bogus prefixes cannot grow the cache and a newly-minted token is visible immediately.

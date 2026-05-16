@@ -254,6 +254,20 @@ audit/budget dashboards, admin users see:
    separate from the proxy's audit log; it documents administrative
    actions, not LLM traffic.
 
+   Each line is a JSON object with the common envelope
+   `{ request_id, timestamp, actor, actor_id, action, target,
+   before, after, summary }`. The `action` field is what
+   distinguishes shapes: `login`, `logout`, `token_create`,
+   `token_revoke`, `user_create`, `user_update`,
+   `user_role_change`, `user_force_revoke_all`, `edit`, `revert`.
+   `before` and `after` are JSON objects scoped to the fields the
+   action actually changed; both are omitted entirely (not
+   serialized as `null`) when an action has neither (e.g. `login`).
+   The proxy never writes to this file; the console never writes to
+   the proxy audit log. The viewer endpoint accepts `action`,
+   `actor`, `target`, and `limit` query parameters; `verdict` is
+   accepted as a legacy alias for `action`.
+
 ## Auth
 
 The console is authenticated. There is no anonymous mode.

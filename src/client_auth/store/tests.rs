@@ -93,6 +93,52 @@ fn revoke_sets_timestamp_and_is_idempotent() {
 }
 
 #[test]
+fn revoke_all_for_user_revokes_only_live_rows_for_that_user() {
+    let conn = fresh_db();
+    let a = Token::generate('p');
+    let b = Token::generate('p');
+    let c = Token::generate('p');
+    let d = Token::generate('p');
+    let _id_a = insert(&conn, &a.prefix, &a.hash, 1, Some("a"), None).unwrap();
+    let _id_b = insert(&conn, &b.prefix, &b.hash, 1, Some("b"), None).unwrap();
+    let _id_c = insert(&conn, &c.prefix, &c.hash, 2, Some("c"), None).unwrap();
+    let id_d = insert(
+        &conn,
+        &d.prefix,
+        &d.hash,
+        1,
+        Some("d-already-revoked"),
+        None,
+    )
+    .unwrap();
+    // Revoke d first so it is already in the revoked state.
+    revoke(&conn, id_d).unwrap();
+
+    let affected = revoke_all_for_user(&conn, 1).expect("force revoke user 1");
+    // a and b move from live → revoked; d was already revoked so it is not
+    // counted again. c belongs to user 2 and is untouched.
+    assert_eq!(affected, 2);
+
+    let alice_rows = list_for_user(&conn, 1).unwrap();
+    for row in alice_rows {
+        assert!(
+            row.revoked_at.is_some(),
+            "every alice token should be revoked after force revoke (id={})",
+            row.id
+        );
+    }
+    let bob_rows = list_for_user(&conn, 2).unwrap();
+    assert!(
+        bob_rows.iter().all(|r| r.revoked_at.is_none()),
+        "bob's tokens must not be touched by force revoke for alice"
+    );
+
+    // Second call is a no-op — no live rows remain for user 1.
+    let again = revoke_all_for_user(&conn, 1).unwrap();
+    assert_eq!(again, 0);
+}
+
+#[test]
 fn hash_blob_corruption_is_caught() {
     // Insert a deliberately wrong-length blob and check that lookup
     // surfaces a clear error rather than silently accepting it.

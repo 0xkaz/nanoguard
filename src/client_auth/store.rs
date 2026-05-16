@@ -173,3 +173,15 @@ pub fn revoke(conn: &Connection, id: i64) -> rusqlite::Result<usize> {
         params![now, id],
     )
 }
+
+/// Revoke every live token for a user. Returns the number of rows updated.
+/// Already-revoked rows are skipped, so a repeat call is a no-op.
+pub fn revoke_all_for_user(conn: &Connection, user_id: i64) -> rusqlite::Result<usize> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE client_tokens
+         SET revoked_at = ?
+         WHERE user_id = ? AND revoked_at IS NULL",
+        params![now, user_id],
+    )
+}

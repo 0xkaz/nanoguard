@@ -141,6 +141,10 @@ pub async fn run(
             get(handlers::api_list_users).post(handlers::api_create_user),
         )
         .route("/api/users/:id", put(handlers::api_update_user))
+        .route(
+            "/api/users/:id/force-revoke-tokens",
+            post(handlers::api_force_revoke_user_tokens),
+        )
         .route("/api/edit", post(handlers::api_edit_file))
         .route("/api/validate", post(handlers::api_validate_file))
         .route("/api/backups", get(handlers::api_list_backups))

@@ -8,13 +8,14 @@ use axum::{
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::client_auth::{store as token_store, Token};
 
 use super::{
+    audit::MutationRecord,
     auth::{build_logout_cookie, build_session_cookie, verify_password, CurrentUser, MaybeUser},
     db::{self, User},
     ConsoleState,
@@ -63,6 +64,25 @@ pub struct UpdateUserRequest {
 pub struct AuditQuery {
     #[serde(default)]
     pub verdict: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ConsoleAuditQuery {
+    /// Filter by action kind (e.g. "login", "user_update", "edit"). For
+    /// backward compat the `verdict` query param is also accepted with the
+    /// same meaning.
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    /// Filter by `actor` field (the admin or user who performed the action).
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Filter by `target` field (the user / file the action was performed on).
+    #[serde(default)]
+    pub target: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -249,6 +269,18 @@ pub async fn api_login(
             .into_response();
     }
 
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &user.username,
+                user.id,
+                "login",
+                format!("{} logged in", user.username),
+            )
+            .with_target(user.username.clone()),
+        );
+    }
+
     let cookie = session_cookie(&state, &session_id);
     (
         StatusCode::OK,
@@ -262,10 +294,21 @@ pub async fn api_logout(
     State(state): State<Arc<ConsoleState>>,
     MaybeUser(user): MaybeUser,
 ) -> Response {
-    if let Some(u) = user {
+    if let Some(ref u) = user {
         let _ = state
             .db
             .with_conn(|conn| db::delete_user_sessions(conn, u.id));
+        if let Some(ref log) = state.audit_log {
+            log.record_mutation(
+                &MutationRecord::new(
+                    &u.username,
+                    u.id,
+                    "logout",
+                    format!("{} logged out", u.username),
+                )
+                .with_target(u.username.clone()),
+            );
+        }
     }
 
     let cookie = logout_cookie(&state);
@@ -396,6 +439,24 @@ pub async fn api_create_token(
         }
     };
 
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &user.username,
+                user.id,
+                "token_create",
+                format!("{} created token \"{}\"", user.username, label_trimmed),
+            )
+            .with_target(user.username.clone())
+            .with_after(json!({
+                "id": id,
+                "prefix": token.prefix,
+                "label": label_trimmed,
+                "expires_at": body.expires_at,
+            })),
+        );
+    }
+
     (
         StatusCode::CREATED,
         Json(json!({
@@ -415,14 +476,14 @@ pub async fn api_revoke_token(
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Response {
-    let belongs = state.db.with_conn(|conn| {
+    let owned_row = state.db.with_conn(|conn| {
         let rows = token_store::list_for_user(conn, user.id)?;
-        Ok(rows.into_iter().any(|r| r.id == id))
+        Ok(rows.into_iter().find(|r| r.id == id))
     });
 
-    match belongs {
-        Ok(true) => {}
-        Ok(false) => {
+    let row = match owned_row {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": "token does not belong to you"})),
@@ -437,18 +498,47 @@ pub async fn api_revoke_token(
             )
                 .into_response();
         }
-    }
+    };
 
     match state
         .db
         .with_conn(|conn| Ok(token_store::revoke(conn, id)?))
     {
-        Ok(affected) => Json(json!({
-            "id": id,
-            "status": "revoked",
-            "affected": affected,
-        }))
-        .into_response(),
+        Ok(affected) => {
+            if let Some(ref log) = state.audit_log {
+                log.record_mutation(
+                    &MutationRecord::new(
+                        &user.username,
+                        user.id,
+                        "token_revoke",
+                        format!(
+                            "{} revoked token \"{}\"",
+                            user.username,
+                            row.label.as_deref().unwrap_or(&row.prefix)
+                        ),
+                    )
+                    .with_target(user.username.clone())
+                    .with_before(json!({
+                        "id": row.id,
+                        "prefix": row.prefix,
+                        "label": row.label,
+                        "revoked_at": row.revoked_at,
+                    }))
+                    .with_after(json!({
+                        "id": row.id,
+                        "prefix": row.prefix,
+                        "label": row.label,
+                        "revoked": true,
+                    })),
+                );
+            }
+            Json(json!({
+                "id": id,
+                "status": "revoked",
+                "affected": affected,
+            }))
+            .into_response()
+        }
         Err(e) => {
             tracing::warn!("revoke_token: {}", e);
             (
@@ -705,15 +795,33 @@ pub async fn api_create_user(
         .db
         .with_conn(|conn| db::insert_user(conn, username, None, None, role, Some(&hash)))
     {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "id": id,
-                "username": username,
-                "role": role,
-            })),
-        )
-            .into_response(),
+        Ok(id) => {
+            if let Some(ref log) = state.audit_log {
+                log.record_mutation(
+                    &MutationRecord::new(
+                        &admin.username,
+                        admin.id,
+                        "user_create",
+                        format!("{} created user {} ({})", admin.username, username, role),
+                    )
+                    .with_target(username.to_string())
+                    .with_after(json!({
+                        "id": id,
+                        "username": username,
+                        "role": role,
+                    })),
+                );
+            }
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": id,
+                    "username": username,
+                    "role": role,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             let msg = format!("{e}");
             if msg.contains("UNIQUE constraint failed") {
@@ -743,6 +851,16 @@ pub async fn api_update_user(
         return *e;
     }
 
+    // Snapshot the target user before the update so the audit record can
+    // include a before/after diff for every changed field. A failed lookup
+    // is non-fatal — the update will still run, but the audit entry will
+    // omit the `before` block.
+    let before_user = state
+        .db
+        .with_conn(|conn| db::user_by_id(conn, id))
+        .ok()
+        .flatten();
+
     match state.db.with_conn(|conn| {
         db::update_user(
             conn,
@@ -757,7 +875,119 @@ pub async fn api_update_user(
             },
         )
     }) {
-        Ok(n) => Json(json!({ "affected": n })).into_response(),
+        Ok(n) => {
+            if let Some(ref log) = state.audit_log {
+                let target_name = before_user
+                    .as_ref()
+                    .map(|u| u.username.clone())
+                    .unwrap_or_else(|| format!("user#{id}"));
+
+                // Role changes are emitted as their own action so an
+                // operator filtering by `action=user_role_change` can find
+                // every privilege escalation/de-escalation without scanning
+                // every user_update.
+                let role_changed = match (&body.role, &before_user) {
+                    (Some(new), Some(b)) => new != &b.role,
+                    _ => false,
+                };
+                if role_changed {
+                    log.record_mutation(
+                        &MutationRecord::new(
+                            &admin.username,
+                            admin.id,
+                            "user_role_change",
+                            format!(
+                                "{} changed role for {} from {} to {}",
+                                admin.username,
+                                target_name,
+                                before_user.as_ref().map(|u| u.role.as_str()).unwrap_or("?"),
+                                body.role.as_deref().unwrap_or("?"),
+                            ),
+                        )
+                        .with_target(target_name.clone())
+                        .with_before(json!({
+                            "role": before_user.as_ref().map(|u| u.role.clone()),
+                        }))
+                        .with_after(json!({
+                            "role": body.role.clone(),
+                        })),
+                    );
+                }
+
+                // Build a before/after pair that only includes fields the
+                // caller actually touched.
+                let mut before = serde_json::Map::new();
+                let mut after = serde_json::Map::new();
+                if let Some(ref v) = body.display_name {
+                    before.insert(
+                        "display_name".into(),
+                        json!(before_user.as_ref().and_then(|u| u.display_name.clone())),
+                    );
+                    after.insert("display_name".into(), json!(v));
+                }
+                if let Some(ref v) = body.email {
+                    before.insert(
+                        "email".into(),
+                        json!(before_user.as_ref().and_then(|u| u.email.clone())),
+                    );
+                    after.insert("email".into(), json!(v));
+                }
+                if let Some(ref v) = body.role {
+                    before.insert(
+                        "role".into(),
+                        json!(before_user.as_ref().map(|u| u.role.clone())),
+                    );
+                    after.insert("role".into(), json!(v));
+                }
+                if let Some(v) = body.disabled {
+                    before.insert(
+                        "disabled".into(),
+                        json!(before_user.as_ref().map(|u| u.disabled)),
+                    );
+                    after.insert("disabled".into(), json!(v));
+                }
+                if let Some(ref v) = body.allowed_models {
+                    before.insert(
+                        "allowed_models".into(),
+                        json!(before_user.as_ref().map(|u| u.allowed_models.clone())),
+                    );
+                    after.insert("allowed_models".into(), json!(v));
+                }
+                if let Some(v) = body.budget_limit {
+                    before.insert(
+                        "budget_limit".into(),
+                        json!(before_user.as_ref().and_then(|u| u.budget_limit)),
+                    );
+                    after.insert("budget_limit".into(), json!(v));
+                }
+
+                let summary = if before.is_empty() {
+                    format!(
+                        "{} updated {} (no fields changed)",
+                        admin.username, target_name
+                    )
+                } else {
+                    format!(
+                        "{} updated {} ({} field{})",
+                        admin.username,
+                        target_name,
+                        before.len(),
+                        if before.len() == 1 { "" } else { "s" }
+                    )
+                };
+
+                let mut rec =
+                    MutationRecord::new(&admin.username, admin.id, "user_update", summary)
+                        .with_target(target_name);
+                if !before.is_empty() {
+                    rec = rec
+                        .with_before(JsonValue::Object(before))
+                        .with_after(JsonValue::Object(after));
+                }
+                log.record_mutation(&rec);
+            }
+            Json(json!({ "affected": n })).into_response()
+        }
         Err(e) => {
             tracing::warn!("update_user: {}", e);
             (
@@ -767,6 +997,73 @@ pub async fn api_update_user(
                 .into_response()
         }
     }
+}
+
+pub async fn api_force_revoke_user_tokens(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(admin): CurrentUser,
+    Path(id): Path<i64>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let target = match state.db.with_conn(|conn| db::user_by_id(conn, id)) {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "user not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!("force_revoke_user_tokens: lookup failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal error"})),
+            )
+                .into_response();
+        }
+    };
+
+    let revoked = match state
+        .db
+        .with_conn(|conn| Ok(token_store::revoke_all_for_user(conn, id)?))
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("force_revoke_user_tokens: revoke failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to revoke tokens"})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &admin.username,
+                admin.id,
+                "user_force_revoke_all",
+                format!(
+                    "{} force-revoked all tokens for {} ({} affected)",
+                    admin.username, target.username, revoked
+                ),
+            )
+            .with_target(target.username.clone())
+            .with_after(json!({ "revoked_count": revoked })),
+        );
+    }
+
+    Json(json!({
+        "user_id": id,
+        "username": target.username,
+        "revoked": revoked,
+    }))
+    .into_response()
 }
 
 // ── API: File editing (admin only) ──────────────────────────────────────────
@@ -862,22 +1159,20 @@ pub async fn api_edit_file(
         }
     };
 
-    // Audit log.
+    // Audit log. Uses the richer MutationRecord shape so file edits live in
+    // the same envelope as user/token mutations — actor, actor_id, target
+    // (the file path), and before/after carry the hashes.
     if let Some(ref log) = state.audit_log {
-        let record = super::audit::EditRecord {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            actor: admin.username.clone(),
-            action: "edit".to_string(),
-            file: path.to_string(),
-            before_hash: before_hash.clone(),
-            after_hash: after_hash.clone(),
-            summary: body
-                .summary
-                .unwrap_or_else(|| "edited via console".to_string()),
-        };
-        if let Err(e) = log.write_edit(&record) {
-            tracing::warn!("edit_file: audit log failed: {}", e);
-        }
+        let summary = body
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("edited {}", path));
+        log.record_mutation(
+            &MutationRecord::new(&admin.username, admin.id, "edit", summary)
+                .with_target(path.to_string())
+                .with_before(json!({ "hash": before_hash.clone() }))
+                .with_after(json!({ "hash": after_hash.clone() })),
+        );
     }
 
     // Trigger reload.
@@ -1001,18 +1296,18 @@ pub async fn api_revert_file(
     };
 
     if let Some(ref log) = state.audit_log {
-        let record = super::audit::EditRecord {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            actor: admin.username.clone(),
-            action: "revert".to_string(),
-            file: path.to_string(),
-            before_hash,
-            after_hash: super::edit::hash_content(&content),
-            summary: format!("reverted to backup {}", body.backup),
-        };
-        if let Err(e) = log.write_edit(&record) {
-            tracing::warn!("revert_file: audit log failed: {}", e);
-        }
+        let after_hash = super::edit::hash_content(&content);
+        log.record_mutation(
+            &MutationRecord::new(
+                &admin.username,
+                admin.id,
+                "revert",
+                format!("reverted {} to backup {}", path, body.backup),
+            )
+            .with_target(path.to_string())
+            .with_before(json!({ "hash": before_hash }))
+            .with_after(json!({ "hash": after_hash, "backup": body.backup.clone() })),
+        );
     }
 
     let reload = super::reload::trigger_reload(&state.config.reload);
@@ -1090,7 +1385,7 @@ pub async fn api_reload_status(
 pub async fn api_console_audit(
     State(state): State<Arc<ConsoleState>>,
     CurrentUser(user): CurrentUser,
-    Query(q): Query<AuditQuery>,
+    Query(q): Query<ConsoleAuditQuery>,
 ) -> Response {
     if let Err(e) = require_admin(&user) {
         return *e;
@@ -1112,20 +1407,65 @@ pub async fn api_console_audit(
         }
     };
 
-    let limit = q.limit.unwrap_or(100);
+    let entries = filter_console_audit_entries(
+        &content,
+        q.action.as_deref().or(q.verdict.as_deref()),
+        q.actor.as_deref(),
+        q.target.as_deref(),
+        q.limit.unwrap_or(100),
+    );
+    Json(json!({ "data": entries })).into_response()
+}
+
+/// Walk the console audit JSONL tail-first and return up to `limit` entries
+/// matching every supplied filter. Pure over the file content so it can be
+/// unit-tested without a live filesystem or HTTP request.
+///
+/// `verdict` is kept as an alias for `action` for backward compat with the
+/// original Phase 1 viewer query string.
+pub(crate) fn filter_console_audit_entries(
+    content: &str,
+    action: Option<&str>,
+    actor: Option<&str>,
+    target: Option<&str>,
+    limit: usize,
+) -> Vec<JsonValue> {
     let mut entries = Vec::new();
 
-    for line in content.lines().rev().take(limit * 2) {
+    // When a narrow filter is set we cannot bound the scan by `limit * 2`
+    // — the matching entries might all live further back in the file.
+    let scan_lines: Vec<&str> = content.lines().rev().collect();
+    let cap = if action.is_some() || actor.is_some() || target.is_some() {
+        scan_lines.len()
+    } else {
+        (limit.saturating_mul(2)).min(scan_lines.len())
+    };
+
+    for line in scan_lines.into_iter().take(cap) {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(obj) = serde_json::from_str::<JsonValue>(line) else {
             continue;
         };
 
-        if let Some(ref v) = q.verdict {
+        if let Some(v) = action {
             if obj.get("action").and_then(|x| x.as_str()) != Some(v) {
+                continue;
+            }
+        }
+        if let Some(v) = actor {
+            if obj.get("actor").and_then(|x| x.as_str()) != Some(v) {
+                continue;
+            }
+        }
+        if let Some(v) = target {
+            // The legacy EditRecord shape used `file` instead of `target` for
+            // file edits. Match either so a single filter covers both shapes.
+            let matches = obj.get("target").and_then(|x| x.as_str()) == Some(v)
+                || obj.get("file").and_then(|x| x.as_str()) == Some(v);
+            if !matches {
                 continue;
             }
         }
@@ -1136,5 +1476,115 @@ pub async fn api_console_audit(
         }
     }
 
-    Json(json!({ "data": entries })).into_response()
+    entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(action: &str, actor: &str, target: &str) -> String {
+        serde_json::to_string(&json!({
+            "request_id": "deadbeef",
+            "timestamp": "2026-05-17T00:00:00Z",
+            "actor": actor,
+            "actor_id": "1",
+            "action": action,
+            "target": target,
+            "summary": format!("{actor} {action} {target}"),
+        }))
+        .unwrap()
+    }
+
+    fn legacy_edit_line(file: &str, actor: &str) -> String {
+        serde_json::to_string(&json!({
+            "timestamp": "2026-05-17T00:00:00Z",
+            "actor": actor,
+            "action": "edit",
+            "file": file,
+            "before_hash": "aa",
+            "after_hash": "bb",
+            "summary": "legacy edit",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn filter_returns_tail_first_without_filters() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            line("login", "alice", "alice"),
+            line("user_create", "alice", "carol"),
+            line("logout", "alice", "alice"),
+        );
+        let out = filter_console_audit_entries(&content, None, None, None, 10);
+        // Tail-first: newest entry (logout) is first.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["action"], "logout");
+        assert_eq!(out[2]["action"], "login");
+    }
+
+    #[test]
+    fn filter_by_actor_returns_only_that_actor() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            line("login", "alice", "alice"),
+            line("login", "bob", "bob"),
+            line("logout", "alice", "alice"),
+        );
+        let out = filter_console_audit_entries(&content, None, Some("alice"), None, 10);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|e| e["actor"] == "alice"));
+    }
+
+    #[test]
+    fn filter_by_target_matches_target_or_legacy_file_field() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            line("user_update", "alice", "carol"),
+            legacy_edit_line("dicts/test.txt", "alice"),
+            line("user_update", "alice", "dave"),
+        );
+
+        let by_target = filter_console_audit_entries(&content, None, None, Some("carol"), 10);
+        assert_eq!(by_target.len(), 1);
+        assert_eq!(by_target[0]["target"], "carol");
+
+        // The same `target` filter also pulls the legacy file-edit record so
+        // operators don't have to know about the on-disk schema migration.
+        let by_file =
+            filter_console_audit_entries(&content, None, None, Some("dicts/test.txt"), 10);
+        assert_eq!(by_file.len(), 1);
+        assert_eq!(by_file[0]["file"], "dicts/test.txt");
+    }
+
+    #[test]
+    fn filter_by_action_and_actor_combines_with_and_semantics() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            line("login", "alice", "alice"),
+            line("token_create", "alice", "alice"),
+            line("token_create", "bob", "bob"),
+        );
+        let out =
+            filter_console_audit_entries(&content, Some("token_create"), Some("alice"), None, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["actor"], "alice");
+        assert_eq!(out[0]["action"], "token_create");
+    }
+
+    #[test]
+    fn filter_respects_limit_and_skips_blank_and_malformed_lines() {
+        let mut s = String::new();
+        for i in 0..50 {
+            s.push_str(&line("login", "alice", &format!("u{i}")));
+            s.push('\n');
+            s.push('\n'); // blank line — should be skipped
+            s.push_str("{not-json}\n"); // malformed — should be skipped
+        }
+        let out = filter_console_audit_entries(&s, Some("login"), None, None, 5);
+        assert_eq!(out.len(), 5);
+        // Tail-first ordering: the newest login (u49) shows up first.
+        assert_eq!(out[0]["target"], "u49");
+    }
 }
