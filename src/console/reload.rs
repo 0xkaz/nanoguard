@@ -81,9 +81,16 @@ fn trigger_via_pid_file(_pid_file: &str) -> Result<()> {
 fn trigger_via_socket(socket_path: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::time::Duration;
 
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("connecting to reload socket {}", socket_path))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .with_context(|| "setting read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .with_context(|| "setting write timeout")?;
     stream
         .write_all(b"RELOAD\n")
         .with_context(|| "writing RELOAD to socket")?;

@@ -355,6 +355,11 @@ pub fn revert_to_backup(file_path: impl AsRef<Path>, backup_name: &str) -> Resul
         PathBuf::from(".nanoguard-backups")
     };
 
+    // Reject path traversal in backup_name.
+    if backup_name.contains("..") || backup_name.contains('/') || backup_name.contains('\\') {
+        bail!("invalid backup name: {}", backup_name);
+    }
+
     let backup_path = backup_dir.join(backup_name);
     if !backup_path.exists() {
         bail!("backup not found: {}", backup_name);
@@ -377,6 +382,10 @@ pub fn revert_to_backup(file_path: impl AsRef<Path>, backup_name: &str) -> Resul
     let tmp_path = dir.join(tmp_name);
 
     std::fs::write(&tmp_path, &content)?;
+    {
+        let file = std::fs::File::open(&tmp_path)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp_path, file_path)?;
 
     Ok(content)

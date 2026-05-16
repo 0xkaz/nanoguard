@@ -796,6 +796,18 @@ pub struct BackupQuery {
     pub path: String,
 }
 
+/// Validate that a path is safe for editing/backup/revert.
+fn is_safe_editable_path(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    // Reject any path with parent directory components.
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    path.starts_with("dicts/") || path.starts_with("policies/") || path == "nanoguard.toml"
+}
+
 pub async fn api_edit_file(
     State(state): State<Arc<ConsoleState>>,
     CurrentUser(admin): CurrentUser,
@@ -815,9 +827,7 @@ pub async fn api_edit_file(
     }
 
     // Security: restrict to known file families.
-    let allowed =
-        path.starts_with("dicts/") || path.starts_with("policies/") || path == "nanoguard.toml";
-    if !allowed {
+    if !is_safe_editable_path(path) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "editing this file is not allowed"})),
@@ -917,6 +927,14 @@ pub async fn api_list_backups(
             .into_response();
     }
 
+    if !is_safe_editable_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "editing this file is not allowed"})),
+        )
+            .into_response();
+    }
+
     match super::edit::list_backups(path) {
         Ok(backups) => Json(json!({ "data": backups })).into_response(),
         Err(e) => {
@@ -948,6 +966,17 @@ pub async fn api_revert_file(
             .into_response();
     }
 
+    if !is_safe_editable_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "editing this file is not allowed"})),
+        )
+            .into_response();
+    }
+
+    let before_content = std::fs::read_to_string(path).unwrap_or_default();
+    let before_hash = super::edit::hash_content(&before_content);
+
     let content = match super::edit::revert_to_backup(path, &body.backup) {
         Ok(c) => c,
         Err(e) => {
@@ -966,7 +995,7 @@ pub async fn api_revert_file(
             actor: admin.username.clone(),
             action: "revert".to_string(),
             file: path.to_string(),
-            before_hash: super::edit::hash_content(&content),
+            before_hash,
             after_hash: super::edit::hash_content(&content),
             summary: format!("reverted to backup {}", body.backup),
         };
@@ -1006,8 +1035,13 @@ pub struct ReloadStatusQuery {
 
 pub async fn api_reload_status(
     State(state): State<Arc<ConsoleState>>,
+    CurrentUser(admin): CurrentUser,
     Query(q): Query<ReloadStatusQuery>,
 ) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
     let since = q.since.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1015,6 +1049,11 @@ pub async fn api_reload_status(
             .as_secs_f64()
             - 30.0
     });
+    let since = if since.is_finite() && since >= 0.0 {
+        since
+    } else {
+        0.0
+    };
     let after = std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(since);
     let result = super::reload::poll_reload_status(&state.config.audit.path, after, 200);
     match result {

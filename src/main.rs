@@ -135,6 +135,15 @@ async fn main() -> Result<()> {
 
     // Write PID file if configured, so the console can send SIGHUP.
     if let Some(ref pid_file) = cfg.reload.pid_file {
+        if let Some(parent) = std::path::Path::new(pid_file).parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(
+                    "failed to create pid file parent directory {:?}: {}",
+                    parent,
+                    e
+                );
+            }
+        }
         if let Err(e) = std::fs::write(pid_file, format!("{}\n", std::process::id())) {
             tracing::warn!("failed to write pid file {}: {}", pid_file, e);
         } else {

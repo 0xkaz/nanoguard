@@ -233,6 +233,7 @@ let editOriginal = '';
 async function loadConfig() {
   editingPath = null;
   $('#config-editor').classList.add('hidden');
+  $('#config-list').classList.remove('hidden');
   try {
     const res = await api('/api/config');
     const container = $('#config-list');
@@ -362,9 +363,16 @@ async function loadBackups(path) {
             method: 'POST',
             body: JSON.stringify({ path, backup: btn.dataset.revert }),
           });
+          const config = await api('/api/config');
+          const revertedContent = config.files?.[path] ?? '';
+          $('#edit-content').value = revertedContent;
+          editOriginal = revertedContent;
+          $('#edit-status').className = 'status';
           $('#edit-status').textContent = `Reverted. Reload: ${result.reload?.triggered ? 'triggered' : 'not triggered'}`;
           $('#edit-status').classList.add('success');
-          editOriginal = $('#edit-content').value;
+          if (result.reload?.triggered) {
+            pollReloadStatus();
+          }
           loadBackups(path);
         } catch (err) {
           $('#edit-status').textContent = err.message;
