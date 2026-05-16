@@ -110,6 +110,79 @@ mod tests {
         assert!(!filtered.contains("ssn"), "ssn should be masked");
     }
 
+    #[test]
+    fn output_filter_masks_uppercase_ssn() {
+        // LLMs commonly emit "SSN" in uppercase. The lowercase dictionary
+        // entry must still match — see XKA-46.
+        let m = default_matchers();
+        let filtered = m.filter_output("your SSN is 123-45-6789");
+        assert!(
+            !filtered.contains("SSN"),
+            "uppercase SSN should be masked, got `{filtered}`"
+        );
+    }
+
+    #[test]
+    fn output_filter_masks_capitalized_social_security() {
+        let m = default_matchers();
+        let filtered = m.filter_output("Your Social Security number is 123-45-6789");
+        assert!(
+            !filtered.contains("Social Security"),
+            "capitalized `Social Security` should be masked, got `{filtered}`"
+        );
+    }
+
+    #[test]
+    fn output_filter_masks_capitalized_credit_card() {
+        let m = default_matchers();
+        let filtered = m.filter_output("Your Credit Card is 4111-1111-1111-1111");
+        assert!(
+            !filtered.contains("Credit Card"),
+            "capitalized `Credit Card` should be masked, got `{filtered}`"
+        );
+    }
+
+    #[test]
+    fn output_filter_preserves_non_matching_text_casing() {
+        // Filtering must not flatten the surrounding casing — only matched
+        // ranges are replaced. Anything else passes through byte-for-byte.
+        let m = default_matchers();
+        let filtered = m.filter_output("Hello World, no PII here.");
+        assert_eq!(filtered, "Hello World, no PII here.");
+    }
+
+    #[test]
+    fn output_filter_leaves_vault_placeholders_intact() {
+        // The output filter runs before deanonymize in the proxy pipeline.
+        // Vault placeholders like `[SSN_1]` and `[EMAIL_1]` reuse PII
+        // keyword names; masking inside them would corrupt the token and
+        // break PII round-trip restoration (see XKA-46 e2e regression).
+        let m = default_matchers();
+        let filtered = m.filter_output("You said: My email is [EMAIL_1] and SSN is [SSN_1]");
+        assert!(
+            filtered.contains("[SSN_1]"),
+            "vault placeholder must be preserved, got `{filtered}`"
+        );
+        assert!(
+            filtered.contains("[EMAIL_1]"),
+            "vault placeholder must be preserved, got `{filtered}`"
+        );
+        // The bare `SSN` keyword outside the placeholder must still be masked.
+        let bare_ssn_position = filtered.find("and ").map(|i| &filtered[i..i + 7]);
+        assert_eq!(bare_ssn_position, Some("and ***"));
+    }
+
+    #[test]
+    fn output_filter_handles_non_ascii_prefix() {
+        // A multi-byte prefix must not shift the masked range. The
+        // lowered-buffer byte map exists specifically to keep this honest
+        // when char-level lowercasing expands a char (e.g. `İ` → `i\u{0307}`).
+        let m = default_matchers();
+        let filtered = m.filter_output("こんにちは — your SSN is 123-45-6789");
+        assert!(filtered.starts_with("こんにちは — your "));
+        assert!(!filtered.contains("SSN"));
+    }
+
     // ── aho-corasick engine — same behaviour contract ─────────────────────────
 
     #[test]

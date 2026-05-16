@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Fixed — `filter_output` now case-insensitive (silent PII leak on LLM responses)
+
+`Matchers::filter_output` was running iword's `Dictionary::filter` in case-sensitive mode against raw LLM output. The output dictionary entries are lowercase (`ssn`, `social security`, `credit card`), but LLMs almost always emit these capitalized (`SSN`, `Social Security`, `Credit Card`), so the last-line-of-defence PII mask was silently bypassed for the common shape. The filter now scans a lowercased copy of the response and projects matched byte ranges back onto the original text, preserving user-visible casing / whitespace / NFKC form everywhere except the masked spans. Vault placeholders such as `[SSN_1]` are explicitly skipped so the existing PII round-trip restoration still works. Five new matcher tests cover the uppercase and capitalized variants plus the placeholder skip.
+
 ### Docs — provider matrix expansion entered the roadmap
 
 `docs/roadmap.md` gains a "Provider matrix expansion (post-v1, opt-in)" entry covering when and how nanoguard might grow its adapter set beyond the current OpenAI / Anthropic / Ollama trio. The entry codifies four design lines that any future Gemini / Bedrock / Cohere / Vertex adapter must hold: pluggable behind Cargo features so the default binary stays small, OpenAI-shaped IR so the translation layer stays at N+N rather than N², guardrails stay first-class (every adapter must be audit-symmetric with the OpenAI path), and the README continues to recommend LiteLLM downstream as the default deployment for 100+-provider needs. `docs/design/multi-backend-routing.md > Open questions` gains a back-reference so the design-doc reader sees the same bounds.
