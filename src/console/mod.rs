@@ -28,7 +28,16 @@ pub struct ConsoleState {
 }
 
 /// Run the console server. This function blocks until shutdown.
-pub async fn run(config: Config) -> anyhow::Result<()> {
+///
+/// `bootstrap_password` is an optional plaintext password wrapped in
+/// [`Zeroizing`] so it is cleared from memory after hashing. It must be
+/// read from the environment **before** the tokio runtime starts so it
+/// does not remain visible in `/proc/<pid>/environ` for the process
+/// lifetime.
+pub async fn run(
+    config: Config,
+    bootstrap_password: Option<zeroize::Zeroizing<String>>,
+) -> anyhow::Result<()> {
     if config.console.session_secret.is_empty() {
         anyhow::bail!(
             "console.session_secret is required. Set CONSOLE_SESSION_SECRET or add it to nanoguard.toml"
@@ -45,22 +54,23 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     })?;
 
     // Bootstrap admin if configured and no users exist.
-    if let Some(ref bootstrap) = config.console.auth.local.bootstrap_admin {
-        if let Ok(pw) = std::env::var(&bootstrap.password_env) {
-            let hash = auth::hash_password(&pw)?;
-            let created =
-                db.with_conn(|conn| db::maybe_bootstrap_admin(conn, &bootstrap.username, &hash))?;
-            if created {
-                tracing::info!(
-                    "Bootstrap admin '{}' provisioned. Clear ${} from the environment.",
-                    bootstrap.username,
-                    bootstrap.password_env
-                );
-            }
-            // NOTE: We cannot reliably unset the env var from the process
-            // image in a portable way. The operator must clear it from the
-            // shell / service definition after first start.
+    if let (Some(ref bootstrap), Some(pw)) = (
+        &config.console.auth.local.bootstrap_admin,
+        bootstrap_password,
+    ) {
+        let hash = auth::hash_password(&pw)?;
+        let created =
+            db.with_conn(|conn| db::maybe_bootstrap_admin(conn, &bootstrap.username, &hash))?;
+        if created {
+            tracing::info!(
+                "Bootstrap admin '{}' provisioned. Clear ${} from the environment.",
+                bootstrap.username,
+                bootstrap.password_env
+            );
         }
+        // `pw` is a Zeroizing<String>; its buffer is overwritten with zeros
+        // when it drops here. The plaintext is no longer in memory or in
+        // the process environment image.
     }
 
     // Determine if cookies should be marked Secure.
