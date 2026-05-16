@@ -50,13 +50,20 @@ unless they opt in, the project gains a complementary signal.
 
 ## Alternatives considered
 
-- **Snyk**: comparable SCA coverage. Free tier exists for OSS.
-  Snyk's GitHub Action requires `SNYK_TOKEN` and a snyk.io
-  account — same operator-friction shape as Aikido. We did not
-  set up both because two SCA scanners reporting the same CVEs is
-  duplicate noise; pick one. The decision between the two is
-  largely about which dashboard the operator prefers. Easy to
-  switch later if Aikido turns out to be the wrong choice.
+- **Snyk**: comparable SCA coverage. Neither Snyk nor Aikido has
+  an OSS-specific tier — both ship a unified free plan that
+  applies equally to public and private repos. Snyk's free plan
+  (verified 2026-05-17) allows unlimited contributors with 200
+  SCA tests/month and 100 SAST tests/month; Aikido's free plan
+  has no published per-test limit but caps contributors at a
+  similar order of magnitude. Either is comfortably within the
+  budget of a single-maintainer project running CI on a handful
+  of PRs per week. Snyk's GitHub Action requires `SNYK_TOKEN` and
+  a snyk.io account — same operator-friction shape as Aikido. We
+  did not set up both because two SCA scanners reporting the
+  same CVEs is duplicate noise; pick one. The decision between
+  the two is largely about which dashboard the operator prefers.
+  Easy to switch later if Aikido turns out to be the wrong choice.
 - **Dependabot alerts**: GitHub-native, zero setup, but reports
   only against the dependency graph GitHub itself parses (Cargo
   is supported but the depth of analysis varies). Useful as a
