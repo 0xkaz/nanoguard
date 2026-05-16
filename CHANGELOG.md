@@ -4,9 +4,14 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
-### Docs — web config UI proposal
+### Docs — multi-user auth & routing design set
 
-New file `docs/design/web-config-ui.md` (status: proposed) describes an optional, out-of-process `nanoguard-console` binary. The console serves a read-only audit / budget dashboard and edits `nanoguard.toml`, `dicts/*.txt`, and `policies/*.yaml` through validated forms; on submit it atomically renames the file, writes an edit-audit entry, and sends SIGHUP to the proxy to trigger hot reload. The core proxy keeps its narrow surface — no mutation endpoint on the proxy itself. Loopback + static-token auth is the default; OIDC and CSRF hardening are later-phase. No implementation yet.
+Four new / revised design docs that together describe how nanoguard becomes a real policy boundary for multi-user deployments. All status `proposed`; no implementation yet.
+
+- **`docs/design/client-auth.md` (new)** — Bearer client token model for the proxy endpoints. Tokens are `ng_<env>_<rand24>` with prefix+hash storage, verified on the hot path through an in-memory cache with explicit invalidation. The audit log's `api_key` field becomes the verified token prefix rather than a self-asserted body field. A three-stage rollout (off → shadow → enforced) avoids breaking existing deployments.
+- **`docs/design/multi-backend-routing.md` (new)** — replaces single `[backend]` with `[backends.*]` + `[routing]` so one proxy can fan out to OpenAI, Anthropic, Ollama, DeepSeek, etc. Per-user `allowed_models` enforces the admin-controlled "which user can hit which model" matrix. Migration from `[backend]` is backwards-compatible for one release.
+- **`docs/design/user-management.md` (new)** — user data model, OIDC-first / local-password-fallback console login, self-service token issuance lifecycle (create / list / revoke / relabel), per-user admin actions (allowed_models, budget_limit, role, force-revoke). Sessions are cookie-based and separate from proxy Bearer tokens.
+- **`docs/design/web-config-ui.md` (revised)** — incorporates the three above: user self-service token UI, admin per-user policy editor, model-allowlist editor backed by `[routing]`. Phase plan re-ordered to land own-token self-service first (Phase 1), then file editing (Phase 2), then OIDC (Phase 4). Static-token mode dropped in favor of local password + OIDC.
 
 ### Docs — hot-reload proposal
 
