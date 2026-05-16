@@ -140,7 +140,7 @@ Never tag inside `tools/release.sh`. Never push tags before the release PR has m
 
 A PR with a red lint check forces a second push, a second CI run, and (worst case) a re-review. The lint job runs against `cargo clippy --all-targets -- -D warnings`, which surfaces a stricter set than `cargo test`: future-incompat lints, `should_implement_trait`, `manual_div_ceil`, `module_inception`, and so on. Adopt the habit of running `make preflight` once before pushing a feature branch the first time, and once again before flipping the PR to ready-for-review. The release scripts run preflight automatically; manual flows do not, which is why this rule exists.
 
-PR CI is optimized for quick feedback: documentation-only PRs keep the required check names green but skip Rust build/test/lint, MSRV, audit, and coverage work. Code PRs still run the platform matrix, MSRV, Trivy, and Semgrep. `security audit` and `test coverage` stay in CI for protected-branch pushes and the scheduled/manual `Nightly` workflow, while local `make preflight` remains the stricter gate before pushing.
+PR CI is optimized for quick feedback: documentation-only PRs keep the required check names green but skip Rust build/test/lint, MSRV, audit, and coverage work. Code PRs still run the platform matrix, MSRV, Trivy, and Semgrep. `security audit` and `test coverage` run in the scheduled/manual `Nightly` workflow instead of the merge-to-main critical path, while local `make preflight` remains the stricter gate before pushing.
 
 ### Agent autonomy: commits, pushes, and PRs
 
