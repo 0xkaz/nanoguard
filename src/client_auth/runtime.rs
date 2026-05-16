@@ -60,6 +60,13 @@ impl ClientAuth {
         self.inner.config.env_marker
     }
 
+    /// When true, the verification middleware rejects non-loopback
+    /// requests that arrive over plain HTTP (lack `X-Forwarded-Proto:
+    /// https` from the trusted reverse proxy).
+    pub fn require_https(&self) -> bool {
+        self.inner.config.require_https
+    }
+
     /// Acquire the SQLite connection. Held under a Mutex; callers should
     /// release it quickly. Used by the verification path and by admin
     /// endpoints for create/list/revoke.

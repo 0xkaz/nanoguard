@@ -231,24 +231,98 @@ pub async fn create_client(
             .into_response();
     };
 
-    let token = crate::client_auth::Token::generate(auth.env_marker());
+    // Validate label up front. The middleware's prefix is short enough
+    // (10 chars) that operators rely on `label` to tell tokens apart in
+    // the list view, so a blank label is essentially a misconfiguration
+    // — reject 400 instead of persisting a NULL.
+    let label_trimmed = body.label.trim();
+    if label_trimmed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "label is required and cannot be empty"})),
+        )
+            .into_response();
+    }
 
-    let label = if body.label.is_empty() {
-        None
-    } else {
-        Some(body.label.as_str())
-    };
+    // Validate expires_at as RFC3339 at mint time. The verification path
+    // is deliberately conservative on a parse failure (treats it as
+    // not-expired so a corrupt timestamp does not lock anyone out), but
+    // that turns a typo here into a non-expiring token — exactly the
+    // false sense of security the operator was trying to avoid by
+    // setting an expiry. Fail fast on the way in.
+    if let Some(s) = body.expires_at.as_deref() {
+        if chrono::DateTime::parse_from_rfc3339(s).is_err() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "expires_at must be RFC3339 (e.g. 2026-12-31T23:59:59Z)"
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let expires = body.expires_at.as_deref();
     let user_id = body.user_id.unwrap_or(0);
 
-    let insert_result = auth.with_conn(|conn| {
-        crate::client_auth::store::insert(conn, &token.prefix, &token.hash, user_id, label, expires)
-    });
-
-    let id = match insert_result {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!("admin/clients: insert failed: {}", e);
+    // Prefix-collision retry. The lookup prefix is 10 chars total
+    // ("ng_<env>_" + 5 from the secret) which is ~24 bits of entropy;
+    // by the birthday paradox, collisions become statistically expected
+    // at thousands of tokens. The DB enforces UNIQUE(prefix), so the
+    // mint path retries with a freshly-generated token on a uniqueness
+    // failure. 3 attempts is overkill: each attempt's collision
+    // probability is bounded by (active_tokens / 24M), so 3 consecutive
+    // failures at any realistic scale is vanishingly small.
+    const MAX_MINT_ATTEMPTS: usize = 3;
+    let mut last_err: Option<String> = None;
+    let mut minted: Option<(i64, crate::client_auth::Token)> = None;
+    for attempt in 1..=MAX_MINT_ATTEMPTS {
+        let token = crate::client_auth::Token::generate(auth.env_marker());
+        let insert_result = auth.with_conn(|conn| {
+            crate::client_auth::store::insert(
+                conn,
+                &token.prefix,
+                &token.hash,
+                user_id,
+                Some(label_trimmed),
+                expires,
+            )
+        });
+        match insert_result {
+            Ok(id) => {
+                minted = Some((id, token));
+                break;
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                // SQLite UNIQUE constraint violations on `prefix` come
+                // back as SqliteFailure with extended code 2067 or
+                // similar. We don't pattern-match on the code (it
+                // changes across versions); we look for the constraint
+                // name in the message and retry. Other failures bail
+                // immediately.
+                let is_collision = msg.contains("UNIQUE constraint failed")
+                    && msg.contains("client_tokens.prefix");
+                if is_collision && attempt < MAX_MINT_ATTEMPTS {
+                    tracing::warn!(
+                        "admin/clients: prefix collision on attempt {}, retrying",
+                        attempt
+                    );
+                    continue;
+                }
+                last_err = Some(msg);
+                break;
+            }
+        }
+    }
+    let (id, token) = match minted {
+        Some(pair) => pair,
+        None => {
+            tracing::warn!(
+                "admin/clients: insert failed after {} attempts: {:?}",
+                MAX_MINT_ATTEMPTS,
+                last_err
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "failed to persist token"})),
@@ -268,7 +342,7 @@ pub async fn create_client(
             "token": token.wire,
             "warning": "Store this token now — it is not recoverable from any later API call.",
             "user_id": user_id,
-            "label": body.label,
+            "label": label_trimmed,
             "expires_at": body.expires_at,
         })),
     )

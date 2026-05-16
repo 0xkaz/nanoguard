@@ -879,6 +879,115 @@ REVOKED_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completio
     -d '{"model":"test","messages":[{"role":"user","content":"after revoke"}]}')
 assert_eq "23j. revoked token is rejected (401)" "$REVOKED_CODE" "401"
 
+# 23k. Admin rejects an empty label at mint time (Greptile-flagged
+# inconsistency: previously stored as NULL, response echoed "").
+EMPTY_LABEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"","user_id":1}')
+assert_eq "23k. POST /v1/admin/clients rejects empty label (400)" "$EMPTY_LABEL_CODE" "400"
+
+# 23l. Admin rejects a malformed expires_at (Qodo-flagged: bad format
+# previously stored verbatim, made the token effectively non-expiring).
+BAD_EXP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"x","user_id":1,"expires_at":"not-a-timestamp"}')
+assert_eq "23l. POST /v1/admin/clients rejects malformed expires_at (400)" "$BAD_EXP_CODE" "400"
+
+# 23m. A valid RFC3339 expires_at IS accepted.
+GOOD_EXP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"x","user_id":1,"expires_at":"2099-12-31T23:59:59Z"}')
+assert_eq "23m. POST /v1/admin/clients accepts RFC3339 expires_at (201)" "$GOOD_EXP_CODE" "201"
+
+# --- 24. Hot reload — restart-only [auth].* drift -------------------------
+info "scenario 24: changing [auth].* on reload warns and is ignored"
+# Reuse the auth-enabled proxy from scenario 23. Edit [auth].env_marker
+# and SIGHUP; the live state should keep env_marker=t.
+sed -i.bak 's|env_marker = "t"|env_marker = "x"|' "$S23_TOML"
+kill -HUP "$NG_PID" 2>/dev/null || true
+sleep 0.5  # give the reload task a moment
+
+if grep -q "\[auth\].env_marker" "$S23_LOG" 2>/dev/null; then
+    ok "24a. proxy log warns about ignored [auth].env_marker change"
+else
+    ng "24a. expected [auth].env_marker in warn; tail: $(tail -10 "$S23_LOG")"
+fi
+
+# Confirm the live env_marker is still 't': mint a new token, check prefix.
+NEW_MINT=$(curl -s "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s23-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"post-reload","user_id":1}')
+NEW_PREFIX=$(echo "$NEW_MINT" | jq -r '.prefix // empty')
+case "$NEW_PREFIX" in
+    ng_t_*) ok "24b. live env_marker unchanged after SIGHUP (still ng_t_)" ;;
+    *)      ng "24b. env_marker drifted: prefix=$NEW_PREFIX" ;;
+esac
+
+# --- 25. require_https enforcement ----------------------------------------
+info "scenario 25: [auth].require_https rejects plain-HTTP requests"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+S25_DB="$LOGDIR/e2e.s25.db"
+S25_TOML="$LOGDIR/e2e.s25.toml"
+S25_LOG="$LOGDIR/ng.s25.log"
+rm -f "$S25_DB"
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S25_TOML"
+cat >> "$S25_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S25_DB"
+admin_api_key = "s25-admin"
+
+[auth]
+enabled = true
+env_marker = "t"
+require_https = true
+EOF
+
+NANOGUARD_CONFIG="$S25_TOML" "$BIN" > "$S25_LOG" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# Mint a token to use as a valid bearer in the next checks.
+MINT_S25=$(curl -s "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s25-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"s25","user_id":1}')
+TOKEN_S25=$(echo "$MINT_S25" | jq -r '.token // empty')
+
+# Without X-Forwarded-Proto, the request is rejected 403 even with a
+# valid bearer — transport check happens before token verification.
+NO_PROTO_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_S25" \
+    -d '{"model":"test","messages":[{"role":"user","content":"no proto"}]}')
+assert_eq "25a. require_https rejects without X-Forwarded-Proto (403)" "$NO_PROTO_CODE" "403"
+
+# X-Forwarded-Proto: http is also rejected.
+HTTP_PROTO_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_S25" \
+    -H "X-Forwarded-Proto: http" \
+    -d '{"model":"test","messages":[{"role":"user","content":"http proto"}]}')
+assert_eq "25b. require_https rejects X-Forwarded-Proto: http (403)" "$HTTP_PROTO_CODE" "403"
+
+# X-Forwarded-Proto: https + valid bearer = success.
+HTTPS_OK_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN_S25" \
+    -H "X-Forwarded-Proto: https" \
+    -d '{"model":"test","messages":[{"role":"user","content":"https proto"}]}')
+assert_eq "25c. require_https accepts X-Forwarded-Proto: https (200)" "$HTTPS_OK_CODE" "200"
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

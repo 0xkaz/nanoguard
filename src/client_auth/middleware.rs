@@ -59,6 +59,29 @@ pub async fn verify_request(
         return next.run(req).await;
     }
 
+    // Optional transport check. When `[auth].require_https = true`, the
+    // request must arrive with `X-Forwarded-Proto: https` (set by a
+    // trusted upstream TLS terminator). The check defends against a
+    // misconfiguration where bearer tokens travel plaintext.
+    //
+    // Loopback note: this check has no concept of "the client is on
+    // localhost so skip" — that would require ConnectInfo plumbing
+    // that the server isn't currently set up for. Operators running on
+    // loopback should leave `require_https = false`. The config field
+    // doc covers this.
+    if auth.require_https()
+        && req
+            .headers()
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            != Some("https")
+    {
+        return forbidden(
+            "https required",
+            "this nanoguard requires X-Forwarded-Proto: https from a trusted TLS terminator",
+        );
+    }
+
     let header_val = req.headers().get(header::AUTHORIZATION);
     let Some(bearer) = extract_bearer(header_val) else {
         return unauthorized("missing bearer", "Bearer realm=\"nanoguard\"");
@@ -137,6 +160,14 @@ fn unauthorized(detail: &'static str, www_authenticate: &'static str) -> Respons
         resp.headers_mut().insert(header::WWW_AUTHENTICATE, val);
     }
     resp
+}
+
+fn forbidden(error: &'static str, hint: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": error, "hint": hint })),
+    )
+        .into_response()
 }
 
 fn internal_error(detail: &'static str) -> Response {

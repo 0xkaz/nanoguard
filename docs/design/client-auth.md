@@ -1,6 +1,25 @@
-> **Status:** partial — Stage 1 enforcement shipped (commit 6ed6ac5, 2026-05-16). Token format, storage, verification middleware, and admin CRUD endpoints are in place. Open: in-memory verification cache (currently a per-request SQLite read), TTL + broadcast invalidation, per-token `pii_overrides`, integration with the user-management work that introduces the real `users` table (`user_id` defaults to 0 today).
+> **Status:** partial (commit 6ed6ac5, 2026-05-16)
 
 # Client Authentication
+
+**Stage 1 of the rollout is shipped:** token format, SQLite storage,
+the axum verification middleware, the admin CRUD endpoints
+(`/v1/admin/clients` POST/GET/DELETE), and an opt-in `[auth].enabled`
+flag are all in place. Existing deployments are not affected because
+the flag defaults to `false`.
+
+**Still open** (keeps the doc at `partial` rather than `shipped`):
+
+- In-memory verification cache. Each authed request currently does
+  one SQLite read under a mutex. Fine for v1; the next perf target.
+- TTL + broadcast invalidation, paired with the cache.
+- Per-token `pii_overrides`. The field is reserved on `ClientView`
+  but no PII action consults it yet.
+- Integration with the user-management work that introduces the real
+  `users` table (`user_id` defaults to 0 today as a single-tenant
+  placeholder).
+- Shadow mode (Stage 2 of the rollout). `[auth].enabled` is a strict
+  bool today; the `"shadow"` string is not yet recognized.
 
 Today the proxy endpoints (`/v1/chat/completions`, `/v1/messages`,
 `/v1/models`, `/health`) accept any caller on the network. Only
