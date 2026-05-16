@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "make check 2>&1 | tail -80",
+            "command": "bash -lc 'set -o pipefail; make check 2>&1 | tail -80'",
             "timeout": 180,
             "statusMessage": "make check"
           }
