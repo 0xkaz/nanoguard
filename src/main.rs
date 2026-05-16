@@ -133,6 +133,15 @@ async fn main() -> Result<()> {
     tracing::info!("nanoguard listening on http://{addr}");
     tracing::info!("backend: {provider} → {endpoint}");
 
+    // Write PID file if configured, so the console can send SIGHUP.
+    if let Some(ref pid_file) = cfg.reload.pid_file {
+        if let Err(e) = std::fs::write(pid_file, format!("{}\n", std::process::id())) {
+            tracing::warn!("failed to write pid file {}: {}", pid_file, e);
+        } else {
+            tracing::info!("pid file written to {}", pid_file);
+        }
+    }
+
     // SIGHUP-driven hot reload (Unix only). On Ctrl+C / SIGTERM we let the
     // axum graceful shutdown drain instead.
     #[cfg(unix)]

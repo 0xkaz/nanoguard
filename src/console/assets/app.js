@@ -105,25 +105,17 @@ $('#logout-btn').addEventListener('click', async () => {
 
 async function loadOverview() {
   try {
-    const audit = await api('/api/audit?limit=1');
-    $('#audit-count').textContent = (audit.data?.length ?? 0) ? 'available' : 'empty';
-  } catch { $('#audit-count').textContent = 'unavailable'; }
-
-  try {
-    const budget = await api('/api/budget');
-    $('#budget-count').textContent = budget.data?.length ?? 0;
-  } catch { $('#budget-count').textContent = 'unavailable'; }
-
-  try {
     const cfg = await api('/api/config');
-    $('#cfg-count').textContent = Object.keys(cfg.files ?? {}).length;
-  } catch { $('#cfg-count').textContent = 'unavailable'; }
+    $('#cfg-count').textContent = Object.keys(cfg.files || {}).length;
+    const audit = await api('/api/audit?limit=1');
+    $('#audit-count').textContent = (audit.data || []).length > 0 ? 'yes' : 'none';
+    const budget = await api('/api/budget');
+    $('#budget-count').textContent = (budget.data || []).length;
+  } catch {}
 }
 
 $$('[data-tab]').forEach(btn => {
-  if (!btn.closest('nav')) {
-    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
-  }
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
 
 // ── Tokens ──────────────────────────────────────────────────
@@ -135,17 +127,16 @@ async function loadTokens() {
     tbody.innerHTML = (res.data || []).map(t => `
       <tr>
         <td><code>${esc(t.prefix)}</code></td>
-        <td>${esc(t.label || '')}</td>
+        <td>${esc(t.label)}</td>
         <td>${fmtDate(t.created_at)}</td>
-        <td>${t.expires_at ? fmtDate(t.expires_at) : '—'}</td>
-        <td>${t.revoked_at ? fmtDate(t.revoked_at) : '—'}</td>
-        <td>${t.last_used_at ? fmtDate(t.last_used_at) : '—'}</td>
+        <td>${fmtDate(t.last_used_at)}</td>
+        <td>${fmtDate(t.expires_at)}</td>
+        <td>${t.revoked_at ? 'Yes' : 'No'}</td>
         <td>${t.revoked_at ? '' : `<button class="btn small danger" data-revoke="${t.id}">Revoke</button>`}</td>
       </tr>
     `).join('');
     $$('#tokens-table [data-revoke]').forEach(btn => {
       btn.addEventListener('click', async () => {
-        if (!confirm('Revoke this token?')) return;
         await api(`/api/tokens/${btn.dataset.revoke}`, { method: 'DELETE' });
         loadTokens();
       });
@@ -160,7 +151,7 @@ $('#create-token-btn').addEventListener('click', () => {
   $('#token-label').value = '';
   $('#token-expires').value = '';
   $('#token-result').classList.add('hidden');
-  $('#token-submit').classList.remove('hidden');
+  $('#token-secret').value = '';
 });
 
 $('#token-close').addEventListener('click', () => $('#token-modal').close());
@@ -177,7 +168,6 @@ $('#token-submit').addEventListener('click', async (e) => {
     });
     $('#token-secret').value = res.token;
     $('#token-result').classList.remove('hidden');
-    $('#token-submit').classList.add('hidden');
     loadTokens();
   } catch (err) {
     alert(err.message);
@@ -185,11 +175,8 @@ $('#token-submit').addEventListener('click', async (e) => {
 });
 
 $('#copy-token-btn').addEventListener('click', () => {
-  const el = $('#token-secret');
-  el.select();
+  $('#token-secret').select();
   document.execCommand('copy');
-  $('#copy-token-btn').textContent = 'Copied!';
-  setTimeout(() => $('#copy-token-btn').textContent = 'Copy', 1500);
 });
 
 // ── Budget ──────────────────────────────────────────────────
@@ -240,18 +227,154 @@ $('#audit-verdict').addEventListener('change', loadAudit);
 
 // ── Config ──────────────────────────────────────────────────
 
+let editingPath = null;
+let editOriginal = '';
+
 async function loadConfig() {
+  editingPath = null;
+  $('#config-editor').classList.add('hidden');
   try {
     const res = await api('/api/config');
     const container = $('#config-list');
     container.innerHTML = Object.entries(res.files || {}).map(([name, content]) => `
       <div class="config-file">
-        <h4>${esc(name)}</h4>
+        <h4>${esc(name)} ${currentUser?.role === 'admin' ? `<button class="btn small" data-edit="${esc(name)}">Edit</button>` : ''}</h4>
         <pre><code>${esc(content)}</code></pre>
       </div>
     `).join('');
+    $$('.config-file [data-edit]').forEach(btn => {
+      btn.addEventListener('click', () => startEdit(btn.dataset.edit, res.files[btn.dataset.edit]));
+    });
   } catch (err) {
     $('#config-list').innerHTML = `<p class="error">${esc(err.message)}</p>`;
+  }
+}
+
+function startEdit(path, content) {
+  editingPath = path;
+  editOriginal = content;
+  $('#edit-path').textContent = path;
+  $('#edit-content').value = content;
+  $('#edit-error').textContent = '';
+  $('#edit-status').textContent = '';
+  $('#edit-status').className = 'status';
+  $('#config-list').classList.add('hidden');
+  $('#config-editor').classList.remove('hidden');
+  loadBackups(path);
+}
+
+function cancelEdit() {
+  editingPath = null;
+  $('#config-editor').classList.add('hidden');
+  $('#config-list').classList.remove('hidden');
+}
+
+$('#edit-cancel').addEventListener('click', cancelEdit);
+
+$('#edit-validate').addEventListener('click', async () => {
+  $('#edit-error').textContent = '';
+  $('#edit-status').textContent = '';
+  $('#edit-status').className = 'status';
+  try {
+    const res = await api('/api/validate', {
+      method: 'POST',
+      body: JSON.stringify({ path: editingPath, content: $('#edit-content').value }),
+    });
+    if (res.valid) {
+      $('#edit-status').textContent = 'Valid';
+      $('#edit-status').classList.add('success');
+    } else {
+      $('#edit-status').textContent = res.error || 'Invalid';
+      $('#edit-status').classList.add('error');
+    }
+  } catch (err) {
+    $('#edit-status').textContent = err.message;
+    $('#edit-status').classList.add('error');
+  }
+});
+
+$('#edit-save').addEventListener('click', async () => {
+  $('#edit-error').textContent = '';
+  $('#edit-status').textContent = '';
+  $('#edit-status').className = 'status';
+  try {
+    const res = await api('/api/edit', {
+      method: 'POST',
+      body: JSON.stringify({ path: editingPath, content: $('#edit-content').value, summary: 'edited via console' }),
+    });
+    $('#edit-status').textContent = `Saved. Reload: ${res.reload?.triggered ? 'triggered via ' + res.reload.method : 'not triggered'}`;
+    $('#edit-status').classList.add('success');
+    if (res.reload?.error) {
+      $('#edit-status').textContent += ` — ${res.reload.error}`;
+    }
+    editOriginal = $('#edit-content').value;
+    // Poll reload status if triggered.
+    if (res.reload?.triggered) {
+      pollReloadStatus();
+    }
+    loadBackups(editingPath);
+  } catch (err) {
+    $('#edit-status').textContent = err.message;
+    $('#edit-status').classList.add('error');
+  }
+});
+
+async function pollReloadStatus() {
+  const since = Date.now() / 1000 - 5;
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const status = await api(`/api/reload/status?since=${since}`);
+      if (status.ready) {
+        if (status.ok) {
+          $('#edit-status').textContent = 'Reload successful.';
+          $('#edit-status').classList.add('success');
+        } else {
+          $('#edit-status').textContent = 'Reload failed. See proxy audit log for details.';
+          $('#edit-status').classList.add('error');
+        }
+        return;
+      }
+    } catch {}
+  }
+  $('#edit-status').textContent = 'Reload status: timeout waiting for proxy.';
+  $('#edit-status').classList.add('error');
+}
+
+async function loadBackups(path) {
+  try {
+    const res = await api(`/api/backups?path=${encodeURIComponent(path)}`);
+    const tbody = $('#backups-table tbody');
+    const rows = res.data || [];
+    tbody.innerHTML = rows.map(b => `
+      <tr>
+        <td>${esc(b.name)}</td>
+        <td>${b.size}</td>
+        <td>${fmtDate(new Date(b.created_at * 1000).toISOString())}</td>
+        <td><button class="btn small" data-revert="${esc(b.name)}">Revert</button></td>
+      </tr>
+    `).join('');
+    $$('#backups-table [data-revert]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm(`Revert ${path} to ${btn.dataset.revert}?`)) return;
+        try {
+          const result = await api('/api/revert', {
+            method: 'POST',
+            body: JSON.stringify({ path, backup: btn.dataset.revert }),
+          });
+          $('#edit-status').textContent = `Reverted. Reload: ${result.reload?.triggered ? 'triggered' : 'not triggered'}`;
+          $('#edit-status').classList.add('success');
+          editOriginal = $('#edit-content').value;
+          loadBackups(path);
+        } catch (err) {
+          $('#edit-status').textContent = err.message;
+          $('#edit-status').classList.add('error');
+        }
+      });
+    });
+    $('#backups-section').classList.toggle('hidden', rows.length === 0);
+  } catch {
+    $('#backups-section').classList.add('hidden');
   }
 }
 

@@ -92,7 +92,7 @@ input, select, textarea {
   color: var(--text);
   font-size: 1rem;
 }
-input:focus, select:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
 
 /* Buttons */
 .btn {
@@ -140,6 +140,11 @@ input:focus, select:focus { outline: 2px solid var(--accent); border-color: var(
 /* Errors */
 .error { color: var(--danger); font-size: .875rem; margin: .25rem 0 0; }
 
+/* Status */
+.status { font-size: .875rem; margin: .25rem 0; min-height: 1.25rem; }
+.status.success { color: var(--success); }
+.status.error { color: var(--danger); }
+
 /* Modal */
 dialog {
   background: var(--surface);
@@ -155,7 +160,7 @@ dialog::backdrop { background: rgba(0,0,0,.6); }
 
 /* Config viewer */
 .config-file { margin-bottom: 1.25rem; }
-.config-file h4 { margin: 0 0 .25rem; font-size: .95rem; }
+.config-file h4 { margin: 0 0 .25rem; font-size: .95rem; display: flex; justify-content: space-between; align-items: center; }
 .config-file pre {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -167,6 +172,11 @@ dialog::backdrop { background: rgba(0,0,0,.6); }
   max-height: 480px;
 }
 
+/* Editor */
+#edit-content { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: .9rem; }
+.actions { display: flex; gap: .5rem; margin: .5rem 0; }
+
 /* Misc */
 h2 { margin-top: 0; font-size: 1.25rem; }
 h3 { margin-top: 0; font-size: 1.05rem; }
+h4 { margin-top: 0; font-size: .95rem; }

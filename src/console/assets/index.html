@@ -96,6 +96,26 @@
 
       <section id="tab-config" class="tab hidden">
         <h2>Configuration</h2>
+        <div id="config-editor" class="hidden">
+          <div class="field">
+            <label>Editing <code id="edit-path"></code></label>
+            <textarea id="edit-content" rows="20"></textarea>
+          </div>
+          <div id="edit-error" class="error"></div>
+          <div id="edit-status" class="status"></div>
+          <div class="actions">
+            <button id="edit-validate" class="btn">Validate</button>
+            <button id="edit-save" class="btn primary">Save &amp; Reload</button>
+            <button id="edit-cancel" class="btn">Cancel</button>
+          </div>
+          <div id="backups-section" class="hidden">
+            <h4>Backups</h4>
+            <table class="table" id="backups-table">
+              <thead><tr><th>Name</th><th>Size</th><th>Created</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
         <div id="config-list"></div>
       </section>
 
