@@ -151,7 +151,7 @@ async function loadTokens() {
       });
     });
   } catch (err) {
-    $('#tokens-table tbody').innerHTML = `<tr><td colspan="6" class="error">${esc(err.message)}</td></tr>`;
+    $('#tokens-table tbody').innerHTML = `<tr><td colspan="7" class="error">${esc(err.message)}</td></tr>`;
   }
 }
 

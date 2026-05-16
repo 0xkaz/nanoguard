@@ -49,7 +49,15 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_client_tokens_user
             ON client_tokens(user_id);
         "#,
-    )
+    )?;
+    // Idempotently add last_used_at for databases created before this column.
+    let has_col: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('client_tokens') WHERE name = 'last_used_at'")?
+        .exists([])?;
+    if !has_col {
+        conn.execute("ALTER TABLE client_tokens ADD COLUMN last_used_at TEXT", [])?;
+    }
+    Ok(())
 }
 
 /// Insert a freshly-generated token. Returns the row id.

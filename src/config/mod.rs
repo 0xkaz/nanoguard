@@ -460,6 +460,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ConsoleConfig {
+    #[serde(default = "default_listen")]
     pub listen: String,
     pub session_secret: String,
     #[serde(default = "default_session_ttl_hours")]
@@ -468,9 +469,13 @@ pub struct ConsoleConfig {
     pub auth: ConsoleAuthConfig,
 }
 
+fn default_listen() -> String {
+    "127.0.0.1:8081".to_string()
+}
+
 impl ConsoleConfig {
     pub fn default_listen() -> String {
-        "127.0.0.1:8081".to_string()
+        default_listen()
     }
 }
 
