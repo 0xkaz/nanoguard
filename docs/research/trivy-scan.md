@@ -43,8 +43,9 @@ the GitHub Security tab after the PR has already run.
 ## Adopt / reject decision
 
 **Adopted.** Trivy is free, runs in <30s on this repo, pins
-cleanly to a specific version via `apt`, and emits SARIF that
-GitHub Advanced Security renders inline on the PR diff. The
+cleanly to a specific version via the upstream installer, and
+emits SARIF that GitHub Advanced Security renders inline on the
+PR diff. The
 alternatives considered:
 
 - **Grype + Syft** (Anchore): comparable scan quality, but two

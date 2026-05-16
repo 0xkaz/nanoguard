@@ -110,8 +110,15 @@ install-trivy:
 	fi; \
 	if [ "$$installed" != "$(TRIVY_VERSION)" ]; then \
 		echo "Installing Trivy $(TRIVY_VERSION) into $(TRIVY_INSTALL_DIR)..."; \
-		curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-			| sudo sh -s -- -b $(TRIVY_INSTALL_DIR) "v$(TRIVY_VERSION)"; \
+		installer_url="https://raw.githubusercontent.com/aquasecurity/trivy/v$(TRIVY_VERSION)/contrib/install.sh"; \
+		installer_path=$$(mktemp); \
+		trap 'rm -f "$$installer_path"' EXIT; \
+		curl -fsSL "$$installer_url" -o "$$installer_path"; \
+		if [ -w "$(TRIVY_INSTALL_DIR)" ]; then \
+			sh "$$installer_path" -b $(TRIVY_INSTALL_DIR) "v$(TRIVY_VERSION)"; \
+		else \
+			sudo sh "$$installer_path" -b $(TRIVY_INSTALL_DIR) "v$(TRIVY_VERSION)"; \
+		fi; \
 	fi
 
 trivy: install-trivy
