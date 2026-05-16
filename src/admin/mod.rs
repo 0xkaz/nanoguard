@@ -20,31 +20,28 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Respon
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    // Constant-time comparison to prevent timing attacks.
-    // When admin is disabled, expected is empty, so any non-empty
-    // provided token will fail.  This prevents leaking whether admin
-    // is enabled via timing or status code.
-    if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
-        return Err(Box::new(
+    // If admin is disabled (None) or configured with an empty key
+    // (Some("") from TOML), expected == "" and an unauthenticated
+    // caller (provided == "") would otherwise pass ct_eq.  Reject
+    // both cases uniformly so neither enables unauthenticated access
+    // and the status code does not leak whether admin is enabled.
+    let unauthorized = || {
+        Box::new(
             (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "unauthorized"})),
             )
                 .into_response(),
-        ));
+        )
+    };
+
+    if expected.is_empty() {
+        return Err(unauthorized());
     }
 
-    // If admin is disabled, expected == "" and provided == "" (no
-    // Authorization header) would pass ct_eq.  Reject uniformly so
-    // the status code does not leak whether admin is enabled.
-    if state.config.budget.admin_api_key.is_none() {
-        return Err(Box::new(
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "unauthorized"})),
-            )
-                .into_response(),
-        ));
+    // Constant-time comparison to prevent timing attacks.
+    if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
+        return Err(unauthorized());
     }
 
     Ok(())
@@ -491,9 +488,7 @@ mod tests {
             matchers: std::sync::Arc::new(
                 crate::matcher::Matchers::build(&Default::default()).unwrap(),
             ),
-            redactor: std::sync::Arc::new(
-                crate::proxy::redact::Redactor::build(&[], &[]).unwrap(),
-            ),
+            redactor: std::sync::Arc::new(crate::proxy::redact::Redactor::build(&[], &[]).unwrap()),
             pii_actions: std::sync::Arc::new(crate::proxy::redact::ActionPartition {
                 mask: std::collections::HashSet::new(),
                 reject: std::collections::HashSet::new(),
@@ -545,6 +540,25 @@ mod tests {
     fn require_admin_rejects_when_disabled() {
         let state = dummy_state(None);
         let headers = HeaderMap::new();
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_empty_string_key() {
+        // admin_api_key = "" in TOML produces Some(""), which must behave
+        // identically to None (admin disabled) — not grant access.
+        let state = dummy_state(Some(String::new()));
+        let headers = HeaderMap::new(); // no Authorization header => provided == ""
+        let resp = *require_admin(&state, &headers).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_admin_rejects_empty_string_key_with_any_token() {
+        let state = dummy_state(Some(String::new()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer any-token".parse().unwrap());
         let resp = *require_admin(&state, &headers).unwrap_err();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
