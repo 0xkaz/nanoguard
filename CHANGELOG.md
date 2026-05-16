@@ -17,6 +17,24 @@ Every mutation that flows through the console — login, logout, token create/re
 
 A new admin endpoint `POST /api/users/:id/force-revoke-tokens` walks every live `client_tokens` row for the target user, marks them revoked atomically, and emits a `user_force_revoke_all` audit record with the revoked count. The viewer endpoint `GET /api/console-audit` accepts new `actor` and `target` query parameters (in addition to `action`, with `verdict` retained as a legacy alias for `action`) so operators can answer "what did admin alice do" and "what was done to user carol" without a separate jq pass. The proxy still never writes to this file; the console still never writes to the proxy audit log.
 
+### Added — `nanoguard-console` Phase 2: file editing + reload trigger (XKA-53, XKA-58)
+
+`nanoguard-console` can now edit the proxy's on-disk configuration through the same files the proxy reads on reload. Every write follows the contract from `docs/design/web-config-ui.md > File-write contract`: validate with the proxy's own parser, write to `.<name>.tmp.<pid>.<nonce>.<ts>` in the same directory, `fsync` the file and the parent directory, then `rename` over the target. Editable surfaces are `nanoguard.toml` (reload-safe keys), `dicts/*.txt` (keyword and PII-regex formats), and `policies/*.yaml` (rule bundles). Restart-only keys — `listen`, `log_level`, `[backends.*]`, `[budget].db_path`, `[audit].path` — remain rejected at the path-allowlist layer.
+
+Before every rename, the prior file content is copied to `<parent>/.nanoguard-backups/<stem>.bak.<UTC-nanos>[.<ext>]`; retention is a per-file count, default 20, configurable via the new `[console] backup_limit` key (set to `0` to keep every backup). The console exposes the backups for revert through `GET /api/backups?path=…` and `POST /api/revert`, both gated by the admin role.
+
+A successful or attempted edit emits a JSONL line to `[console] audit_path` (default `console-audit.jsonl`) with `{timestamp, actor, action, file, before_hash, after_hash, summary}` — `action` is `edit` for writes and `revert` for backup restores. This log is separate from the proxy audit log and is never written to by the proxy.
+
+After the write, the console triggers a reload via the proxy's hot-reload surface (already shipped, commit `19fddf0`): SIGHUP through `[reload] pid_file` by default, or a `RELOAD\n` line over `[reload] socket` when set. `GET /api/reload/status?since=<epoch-seconds>` polls the proxy audit log for a `reload_ok` or `reload_failed` entry newer than the trigger, surfacing the outcome to the UI.
+
+New REST endpoints (admin-only): `POST /api/edit`, `POST /api/validate`, `GET /api/backups`, `POST /api/revert`, `POST /api/reload/trigger`, `GET /api/reload/status`, `GET /api/console-audit`. Plus a new unit suite covering atomic writes, dict / PII / policy / TOML validators, backup retention pruning (including `backup_limit = 0` no-prune behavior), reload-status polling, and console-audit JSONL append. `docs/design/web-config-ui.md` graduates from `proposed` to `partial`; Phase 3 (remaining reloadable TOML sections) and Phase 4 (OIDC + CSRF) stay on the roadmap.
+
+### Added — `nanoguard-console` Phase 1: read-only console + own-token self-service
+
+Initial cut of the optional Web Configuration UI as a separate binary, `nanoguard-console`, sharing `nanoguard.toml` and the budget SQLite database with the proxy but running in its own process with its own listener. Phase 1 is read-only against the on-disk config and the budget database (opened with `SQLITE_OPEN_READ_ONLY` so a console crash can never corrupt budget state).
+
+Authentication is local-password only: an admin is bootstrapped from `BOOTSTRAP_PASSWORD` on first start (read before the tokio runtime starts and wrapped in `Zeroizing<String>` so the plaintext is wiped from memory immediately after hashing). Sessions are cookie-based, signed with `CONSOLE_SESSION_SECRET`, default 24 h TTL, marked `Secure` automatically when the listener is non-loopback. Logged-in users see "My tokens" (create/list/revoke own proxy tokens; the wire secret is shown exactly once), "My budget", and "My audit slice". Admins additionally see user CRUD (`allowed_models`, `budget_limit`, `disabled`, `role`), an audit viewer, and a budget dashboard. The shipped binary serves a single static-asset bundle from `include_bytes!`; no Node runtime, no external auth provider. OIDC is Phase 4.
+
 ### Added — client-auth verification cache (TTL + LRU + revoke-driven invalidation)
 
 The middleware no longer hits SQLite on every authed request. `ClientAuth::lookup` is a read-through cache keyed by token prefix: cache hit on the hot path, SQLite read + populate on miss. Bounded by `[auth].cache_capacity` (default 10_000) with `[auth].cache_ttl_secs` (default 60s) eviction. Negative results (unknown prefixes) are intentionally not cached so a flood of bogus prefixes cannot grow the cache and a newly-minted token is visible immediately.

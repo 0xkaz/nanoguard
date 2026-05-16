@@ -421,9 +421,9 @@ See [`docs/operations.md`](docs/operations.md) for systemd integration, log rota
 
 ## Web Configuration UI
 
-A separate binary, `nanoguard-console`, ships an optional read-only operator console and self-service proxy-token UI. It shares `nanoguard.toml` and the budget SQLite database with the proxy but runs in its own process with its own listener. **The proxy itself never exposes a mutation HTTP surface** — see [`docs/design/web-config-ui.md`](docs/design/web-config-ui.md) for the rationale.
+A separate binary, `nanoguard-console`, ships an optional operator console and self-service proxy-token UI. It shares `nanoguard.toml` and the budget SQLite database with the proxy but runs in its own process with its own listener. **The proxy itself never exposes a mutation HTTP surface** — see [`docs/design/web-config-ui.md`](docs/design/web-config-ui.md) for the rationale.
 
-Phase 1 (in `main`) is read-only browsing of audit log, budget state, and the current config, plus self-service proxy-token issue/revoke for the logged-in user and admin user CRUD (allowed models, budget limit, role, enable/disable). File-based config editing, CSRF tokens, reload trigger, and `console-audit.jsonl` are Phase 2 and not yet implemented.
+Phase 1 (commit `cdc795c`) shipped read-only browsing of audit log, budget state, and the current config, plus self-service proxy-token issue/revoke for the logged-in user and admin user CRUD (allowed models, budget limit, role, enable/disable). Phase 2 (commit `ef5b188`) added file-based config editing for `nanoguard.toml`, `dicts/*.txt`, and `policies/*.yaml`: every write is validated server-side with the same parsers the proxy runs at reload time, atomically renamed into place, backed up under `.nanoguard-backups/` (per-file retention configurable via `[console] backup_limit`, default 20), audited to `console-audit.jsonl`, and followed by a reload trigger (`SIGHUP` via `[reload] pid_file`, or `RELOAD\n` over `[reload] socket`). OIDC login and per-session CSRF tokens are Phase 4 and remain on the roadmap.
 
 ### 1. Configure `nanoguard.toml`
 
@@ -431,8 +431,18 @@ The default `nanoguard.toml` ships with the `[console]` section already enabled.
 
 ```toml
 [console]
-listen         = "127.0.0.1:8081"
-# session_secret = "..."   # If empty, an ephemeral secret is generated at startup
+listen            = "127.0.0.1:8081"           # loopback only; non-loopback auto-enables Secure cookies
+# session_secret    = "${CONSOLE_SESSION_SECRET}"
+session_ttl_hours = 24
+# audit_path        = "console-audit.jsonl"    # Phase 2: where the admin-edit log is written
+# backup_limit      = 20                       # Phase 2: per-file cap under .nanoguard-backups/ (0 disables pruning)
+
+[console.auth]
+mode = "local"                              # Phase 1 supports "local" only; OIDC is Phase 4
+
+[console.auth.local]
+allow_signup    = false
+bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
 ```
 
 If you don't provide a `session_secret` in the TOML or via `CONSOLE_SESSION_SECRET`, `nanoguard-console` will generate a random ephemeral secret and print it to `stderr`. This is convenient for testing but will log all users out on restart.
