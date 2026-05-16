@@ -113,7 +113,10 @@ install-trivy:
 		installer_url="https://raw.githubusercontent.com/aquasecurity/trivy/v$(TRIVY_VERSION)/contrib/install.sh"; \
 		installer_path=$$(mktemp); \
 		trap 'rm -f "$$installer_path"' EXIT; \
-		curl -fsSL "$$installer_url" -o "$$installer_path"; \
+		curl -fsSL "$$installer_url" -o "$$installer_path" \
+		    || { echo "Failed to download Trivy installer from $$installer_url" >&2; exit 1; }; \
+		[ -s "$$installer_path" ] \
+		    || { echo "Trivy installer at $$installer_path is empty" >&2; exit 1; }; \
 		if [ -w "$(TRIVY_INSTALL_DIR)" ]; then \
 			sh "$$installer_path" -b $(TRIVY_INSTALL_DIR) "v$(TRIVY_VERSION)"; \
 		else \
