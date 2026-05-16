@@ -1,0 +1,31 @@
+# CodeRabbit configuration
+# https://docs.coderabbit.ai/getting-started/configure-coderabbit
+
+language: en
+
+reviews:
+  # Review PRs targeting any of our long-lived bases, not just main.
+  # CLAUDE.md > Branch Policy defines feat/* fix/* chore/* docs/* release/*
+  # as valid feature-branch prefixes; PRs can stack on any of those.
+  auto_review:
+    enabled: true
+    base_branches:
+      - main
+      - "feat/.*"
+      - "fix/.*"
+      - "chore/.*"
+      - "docs/.*"
+      - "release/.*"
+
+  # Suppress the "Review skipped" comment when auto-review doesn't apply.
+  # The skipped state was the original noise this config addresses.
+  review_status: false
+
+  # Quieter on docs-only PRs: still review, but skip the high-level
+  # summary block. Inline comments still appear when warranted.
+  high_level_summary: true
+
+  profile: chill   # less nit-picky than "assertive"; matches our small-team review style
+
+chat:
+  auto_reply: true
