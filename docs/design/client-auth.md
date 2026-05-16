@@ -74,7 +74,7 @@ The prefix is what surfaces in the UI and in audit entries for
 human identification; the hash is what verification compares
 against.
 
-Why prefix-+-hash rather than the bare token in DB:
+Why prefix+hash rather than the bare token in DB:
 
 - A DB dump does not leak live credentials.
 - Operators can still talk about "the `a3k7…` token" without
