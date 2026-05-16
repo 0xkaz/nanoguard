@@ -12,15 +12,19 @@ let csrfToken = null;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 async function api(path, opts = {}) {
+  // Pull headers out of opts so the final fetch spread can't accidentally
+  // overwrite our merged headers (and silently drop the CSRF token) if a
+  // future caller passes its own headers object.
+  const { headers: optHeaders, ...restOpts } = opts;
   const method = (opts.method || 'GET').toUpperCase();
-  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const headers = { 'Content-Type': 'application/json', ...(optHeaders || {}) };
   if (MUTATING_METHODS.has(method) && path !== '/api/login' && csrfToken) {
     headers['X-CSRF-Token'] = csrfToken;
   }
   const res = await fetch(path, {
     credentials: 'same-origin',
+    ...restOpts,
     headers,
-    ...opts,
   });
   // Pick up a rotated CSRF token before throwing on non-2xx so the next
   // request after a 403-on-rotate uses the fresh value.

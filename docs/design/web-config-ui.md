@@ -142,8 +142,8 @@ machine-to-machine API. The console is the human-to-files API.
 ### Mutating views
 
 Mutating views are gated by an auth check (see Auth) and a
-per-form CSRF token. Every successful submit follows the same
-contract:
+per-session double-submit CSRF token (see Auth § CSRF). Every
+successful submit follows the same contract:
 
 ```
 1. UI validates the form client-side (cheap rejection of
