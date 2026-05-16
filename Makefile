@@ -1,7 +1,7 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
-        release-tag pr pr-web preflight
+        release-tag pr pr-web preflight install-trivy trivy trivy-image mirai preflight-mirai
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -82,6 +82,28 @@ watch-coverage:
 miri:
 	cargo +nightly miri test $(TEST)
 
+# ── Static analysis (requires MIRAI) ─────────────────────────────────────────
+# Install:
+#   git clone https://github.com/endorlabs/MIRAI.git
+#   cd MIRAI
+#   cargo install --locked --path ./checker
+# Optional flags:
+#   MIRAI_FLAGS="--diag=verify --body_analysis_timeout 60" make mirai
+
+mirai:
+	@command -v cargo-mirai >/dev/null 2>&1 || { \
+	    echo ""; \
+	    echo "error: cargo-mirai not installed."; \
+	    echo "       install once with:"; \
+	    echo "           git clone https://github.com/endorlabs/MIRAI.git"; \
+	    echo "           cd MIRAI"; \
+	    echo "           cargo install --locked --path ./checker"; \
+	    echo ""; \
+	    echo "       MIRAI is an optional deep static-analysis pass."; \
+	    exit 1; \
+	}
+	cargo mirai --tests $(MIRAI_FLAGS)
+
 # ── Security audit (requires: cargo install cargo-audit) ─────────────────────
 # Checks dependencies against RustSec advisory database
 
@@ -93,6 +115,44 @@ audit:
 
 geiger:
 	cargo geiger --update-advisories
+
+# ── Trivy vulnerability scanner (installed via upstream installer) ──────────
+# Pinned via TRIVY_VERSION so local runs match CI; override with
+# `make trivy TRIVY_VERSION=X.Y.Z` if you need a different release. The
+# installer drops the binary under TRIVY_INSTALL_DIR (default /usr/local/bin)
+# which is on $PATH for both CI and most local shells.
+
+TRIVY_VERSION ?= 0.70.0
+TRIVY_INSTALL_DIR ?= /usr/local/bin
+
+install-trivy:
+	@installed=""; \
+	if command -v trivy >/dev/null 2>&1; then \
+		installed=$$(trivy --version | head -n 1 | cut -d ' ' -f 2); \
+	fi; \
+	if [ "$$installed" != "$(TRIVY_VERSION)" ]; then \
+		echo "Installing Trivy $(TRIVY_VERSION) into $(TRIVY_INSTALL_DIR)..."; \
+		installer_url="https://raw.githubusercontent.com/aquasecurity/trivy/v$(TRIVY_VERSION)/contrib/install.sh"; \
+		installer_path=$$(mktemp); \
+		trap 'rm -f "$$installer_path"' EXIT; \
+		curl -fsSL "$$installer_url" -o "$$installer_path" \
+		    || { echo "Failed to download Trivy installer from $$installer_url" >&2; exit 1; }; \
+		[ -s "$$installer_path" ] \
+		    || { echo "Trivy installer at $$installer_path is empty" >&2; exit 1; }; \
+		if [ -w "$(TRIVY_INSTALL_DIR)" ]; then \
+			sh "$$installer_path" -b $(TRIVY_INSTALL_DIR) "v$(TRIVY_VERSION)"; \
+		else \
+			sudo sh "$$installer_path" -b $(TRIVY_INSTALL_DIR) "v$(TRIVY_VERSION)"; \
+		fi; \
+	fi
+
+trivy: install-trivy
+	@echo "Scanning repository with Trivy..."
+	trivy fs --format table .
+
+trivy-image: install-trivy
+	@echo "Scanning Docker image with Trivy..."
+	trivy image --format table nanoguard:latest
 
 # ── Semgrep security scan (requires: docker) ────────────────────────────────
 # Runs Semgrep CE via the official container image — keeps Python tooling off
@@ -111,7 +171,7 @@ semgrep:
 
 # ── Full CI-equivalent check (build + test + clippy + fmt + audit) ───────────
 
-ci: check audit semgrep
+ci: check audit trivy semgrep
 	@echo "=== All CI checks passed ==="
 
 clean:
@@ -243,3 +303,8 @@ preflight:
 	@echo "→ tools/e2e.sh"
 	./tools/e2e.sh
 	@echo "✓ preflight passed"
+
+preflight-mirai: preflight
+	@echo "→ cargo mirai --tests"
+	$(MAKE) mirai
+	@echo "✓ preflight + MIRAI passed"

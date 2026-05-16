@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{audit, backend, budget, config, matcher, proxy};
+use crate::{audit, backend, budget, client_auth, config, matcher, proxy};
 
 pub struct AppState {
     pub config: config::Config,
@@ -21,6 +21,12 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,
     pub audit: Option<Arc<audit::AuditLog>>,
+    /// Client-auth runtime: SQLite-backed `client_tokens` table and (in a
+    /// later commit) the in-memory verification cache. `None` when
+    /// `[auth].enabled = false` AND the table was not opened at startup —
+    /// today the table is opened whenever budget is enabled so the admin
+    /// endpoints can issue tokens even before enforcement is turned on.
+    pub client_auth: Option<client_auth::ClientAuth>,
 }
 
 impl AppState {

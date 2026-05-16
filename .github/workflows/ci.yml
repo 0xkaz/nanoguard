@@ -51,6 +51,58 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  trivy:
+    name: trivy scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: "0.70.0"
+        run: |
+          # Use the upstream installer pinned to TRIVY_VERSION so CI and
+          # `make trivy` resolve to the same binary. The Aqua apt repo only
+          # carries a short window of recent versions (~last 6 months), so
+          # pinning to an older release via `apt-get install trivy=X.Y.Z`
+          # silently fails on the GitHub runner.
+          #
+          # Fetch the installer from the release tag (not /main/) so the
+          # script and the binary it installs come from the same auditable
+          # artifact, and download to a file first so a `curl` failure
+          # surfaces directly instead of being masked by the pipe.
+          set -euo pipefail
+          installer_url="https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/contrib/install.sh"
+          installer_path="$(mktemp)"
+          trap 'rm -f "${installer_path}"' EXIT
+          curl -fsSL "${installer_url}" -o "${installer_path}"
+          sudo sh "${installer_path}" -b /usr/local/bin "v${TRIVY_VERSION}"
+          trivy --version
+
+      - name: Cache Trivy DB
+        id: cache-trivy-db
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          # DB updates roughly every 6h on the Aqua side; refresh the cache
+          # daily and fall back to the most recent run-of-the-day if the
+          # exact key misses.
+          key: ${{ runner.os }}-trivy-db-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-trivy-db-
+
+      - name: Run Trivy vulnerability scan
+        run: trivy fs --format sarif --output trivy-results.sarif .
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
   semgrep:
     name: semgrep scan
     runs-on: ubuntu-latest
