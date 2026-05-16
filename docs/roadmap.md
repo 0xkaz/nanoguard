@@ -45,13 +45,18 @@ There is room to grow this if a deployment wants one binary
 instead of a downstream LiteLLM hop, **provided four design lines
 hold**:
 
-1. **Pluggable provider clients, gated behind Cargo features.** The
-   default release binary continues to ship `openai` + `anthropic` +
-   `ollama` only. Additional providers (`gemini`, `bedrock`,
-   `cohere`, etc.) live behind `--features <provider>` so the
-   default binary stays small and the audit surface stays narrow.
-   `CLAUDE.md > Performance Targets > Memory: < 10MB baseline`
-   remains the bar the default build is measured against.
+1. **Pluggable provider clients, gated behind Cargo features
+   (future).** The default release binary continues to ship the
+   three built-in providers it has today (openai, anthropic,
+   ollama). If/when this work proceeds, additional providers
+   (gemini, bedrock, cohere, etc.) will be added behind new Cargo
+   features so they are opt-in at build time — e.g. a hypothetical
+   `cargo build --features gemini` once the feature is defined. No
+   such features exist in `Cargo.toml` today; the constraint above
+   is a contract on how they will be added, not a description of
+   shipped behavior. `CLAUDE.md > Performance Targets > Memory:
+   < 10MB baseline` remains the bar the default build is measured
+   against.
 2. **OpenAI-shaped IR, not an N² translation matrix.** Provider
    adapters convert to/from a single internal representation
    (OpenAI's request / response shape, since it is already the

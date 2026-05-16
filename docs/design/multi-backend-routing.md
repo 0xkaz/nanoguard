@@ -367,11 +367,15 @@ unhelpful "permission denied for some reason" experience.
   etc. is technically straightforward — the `provider` field on
   `[backends.*]` is exactly the extension point — but each new
   adapter doubles the surface area of the translation layer, the
-  audit trail, and the dependency tree. Direction: keep this
-  opt-in via Cargo features (default binary stays
-  `openai`+`anthropic`+`ollama` so the
-  `CLAUDE.md > Performance Targets > Memory: < 10MB` bar holds),
-  funnel all adapters through an OpenAI-shaped IR so we stay at
+  audit trail, and the dependency tree. Direction: if/when this
+  work proceeds, gate each new provider behind a new Cargo feature
+  added at that time (the crate has no `[features]` section today;
+  the gate is a future constraint on how providers will be added,
+  not a description of shipped behavior). The default binary
+  continues to ship the three built-in providers it has today
+  (openai, anthropic, ollama) so the
+  `CLAUDE.md > Performance Targets > Memory: < 10MB` bar holds.
+  Funnel all adapters through an OpenAI-shaped IR so we stay at
   N+N adapters instead of an N² translation matrix, and continue
   to recommend LiteLLM downstream as the default story for
   deployments that want 100+ providers. See
