@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — operations runbook + audit log format
+
+Two new public docs that pair with the hot-reload feature: `docs/operations.md` is the operator-facing runbook (systemd unit, SIGHUP usage, logrotate snippet, common-issues section), and `docs/design/audit-log-format.md` is the JSONL schema reference for both request entries and the new reload entries. The audit-log doc enumerates the bounded `error` label vocabulary used in `reload_failed` entries so audit-pipeline consumers can match against a stable set.
+
 ### Added — hot reload via SIGHUP
 
 The proxy now picks up config / dict / policy bundle changes without a restart. SIGHUP triggers a rebuild of the matcher, redactor, spotlight, schema, tool gate, and policy index; on success the new state is atomically swapped in (lock-free via `arc-swap`). In-flight requests finish on the snapshot they acquired at handler entry, so a reload mid-request never produces a half-applied filter pass.
