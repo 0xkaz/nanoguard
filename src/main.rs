@@ -113,6 +113,18 @@ async fn main() -> Result<()> {
         .route(
             "/v1/admin/budget/:api_key/reset",
             axum::routing::delete(admin::reset_budget),
+        )
+        // Client token management (see docs/design/client-auth.md).
+        // Gated by the same ADMIN_API_KEY check as the budget endpoints,
+        // so bootstrap order is: configure [budget].admin_api_key first,
+        // then POST /v1/admin/clients to mint operator tokens.
+        .route(
+            "/v1/admin/clients",
+            post(admin::create_client).get(admin::list_clients),
+        )
+        .route(
+            "/v1/admin/clients/:id",
+            axum::routing::delete(admin::revoke_client),
         );
 
     let app = protected.merge(public_and_admin).with_state(shared.clone());
