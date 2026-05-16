@@ -51,6 +51,43 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  trivy:
+    name: trivy scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb stable main | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Cache Trivy DB
+        id: cache-trivy-db
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: ${{ runner.os }}-trivy-db-${{ hashFiles('~/.cache/trivy') }}
+          restore-keys: |
+            ${{ runner.os }}-trivy-db-
+
+      - name: Run Trivy vulnerability scan
+        run: trivy fs --format sarif --output trivy-results.sarif .
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          fail-on-unmatched-files: true
+
   coverage:
     name: test coverage
     runs-on: ubuntu-latest

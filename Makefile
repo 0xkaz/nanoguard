@@ -1,7 +1,7 @@
 .PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit ci push release-patch release-minor release-major \
-        release-tag pr pr-web preflight
+        release-tag pr pr-web preflight install-trivy trivy trivy-image
 
 MODEL ?= qwen3:0.6b
 OLLAMA_BASE_URL ?= http://localhost:11434
@@ -88,9 +88,30 @@ miri:
 audit:
 	cargo audit
 
+TRIVY_VERSION ?= 0.50.1 # This makes it easy to override locally or in CI
+
+install-trivy:
+	@if ! command -v trivy >/dev/null 2>&1 || [[ "$$(trivy --version | head -n 1 | cut -d ' ' -f 3)" != "$(TRIVY_VERSION)" ]]; then \
+		echo "Installing Trivy $(TRIVY_VERSION)..."; \
+		sudo apt-get update; \
+		sudo apt-get install -y wget apt-transport-https gnupg; \
+		wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -; \
+		echo "deb https://aquasecurity.github.io/trivy-repo/deb stable main" | sudo tee /etc/apt/sources.list.d/trivy.list; \
+		sudo apt-get update; \
+		sudo apt-get install -y trivy=$(TRIVY_VERSION); \
+	fi
+
+trivy: install-trivy
+	@echo "Scanning repository with Trivy..."
+	trivy fs --format table .
+
+trivy-image: install-trivy
+	@echo "Scanning Docker image with Trivy..."
+	trivy image --format table nanoguard:latest
+
 # ── Full CI-equivalent check (build + test + clippy + fmt + audit) ───────────
 
-ci: check test audit
+ci: check test audit trivy
 	@echo "=== All CI checks passed ==="
 
 clean:
