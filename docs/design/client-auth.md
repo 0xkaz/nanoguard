@@ -1,4 +1,4 @@
-> **Status:** partial (commit pending, 2026-05-17)
+> **Status:** partial (commit 8b2d8d2, 2026-05-17 — per-token `pii_overrides`, real `users` table integration, and shadow mode still open; see "Still open" below)
 
 # Client Authentication
 

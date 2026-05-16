@@ -450,13 +450,18 @@ pub async fn revoke_client(
     // matches the row we just updated, even if some other handler is
     // racing on the same id.
     let result = auth.with_conn(|conn| {
-        let prefix = conn
-            .query_row(
-                "SELECT prefix FROM client_tokens WHERE id = ?",
-                rusqlite::params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
+        // Only QueryReturnedNoRows is mapped to None — other rusqlite
+        // errors (I/O, lock contention) must propagate so the revoke
+        // bails out instead of silently skipping cache invalidation.
+        let prefix = match conn.query_row(
+            "SELECT prefix FROM client_tokens WHERE id = ?",
+            rusqlite::params![id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(p) => Some(p),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
         let affected = crate::client_auth::store::revoke(conn, id)?;
         Ok::<_, rusqlite::Error>((prefix, affected))
     });

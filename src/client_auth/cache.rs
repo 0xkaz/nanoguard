@@ -140,8 +140,8 @@ impl TokenCache {
         inner.map.remove(prefix);
     }
 
-    /// Clear the entire cache. Reserved for hot-reload or test setup.
-    #[allow(dead_code)]
+    /// Clear the entire cache. For test setup only.
+    #[cfg(test)]
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.clear();
