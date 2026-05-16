@@ -523,6 +523,7 @@ mod tests {
                 policies: Default::default(),
                 auth: Default::default(),
                 console: Default::default(),
+                reload: Default::default(),
             },
             matchers: std::sync::Arc::new(
                 crate::matcher::Matchers::build(&Default::default()).unwrap(),

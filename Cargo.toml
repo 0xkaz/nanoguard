@@ -54,6 +54,7 @@ rand = "0.8"
 argon2 = "0.5"
 cookie = { version = "0.18", features = ["signed", "percent-encode", "key-expansion"] }
 hex = "0.4"
+libc = "0.2"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 
 [dev-dependencies]

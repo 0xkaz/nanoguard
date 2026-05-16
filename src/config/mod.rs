@@ -23,6 +23,8 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub console: ConsoleConfig,
+    #[serde(default)]
+    pub reload: ReloadConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -465,6 +467,8 @@ pub struct ConsoleConfig {
     pub session_secret: String,
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: i64,
+    #[serde(default = "default_console_audit_path")]
+    pub audit_path: String,
     #[serde(default)]
     pub auth: ConsoleAuthConfig,
 }
@@ -485,6 +489,7 @@ impl Default for ConsoleConfig {
             listen: Self::default_listen(),
             session_secret: String::new(),
             session_ttl_hours: default_session_ttl_hours(),
+            audit_path: default_console_audit_path(),
             auth: ConsoleAuthConfig::default(),
         }
     }
@@ -492,6 +497,23 @@ impl Default for ConsoleConfig {
 
 fn default_session_ttl_hours() -> i64 {
     24
+}
+
+fn default_console_audit_path() -> String {
+    "console-audit.jsonl".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ReloadConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to a PID file written by the proxy. The console reads this
+    /// and sends SIGHUP to trigger reload.
+    #[serde(default)]
+    pub pid_file: Option<String>,
+    /// Optional Unix domain socket path for reload IPC.
+    #[serde(default)]
+    pub socket: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -527,7 +549,11 @@ impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config {:?}", path.as_ref()))?;
-        toml::from_str(&content).context("parsing config TOML")
+        Self::from_file_content(&content)
+    }
+
+    pub fn from_file_content(content: &str) -> Result<Self> {
+        toml::from_str(content).context("parsing config TOML")
     }
 
     pub fn from_env_or_default() -> Result<Self> {
@@ -563,6 +589,7 @@ impl Config {
                 tools: ToolsConfig::default(),
                 policies: PoliciesConfig::default(),
                 auth: AuthConfig::default(),
+                reload: ReloadConfig::default(),
                 console: ConsoleConfig::default(),
             })
         }

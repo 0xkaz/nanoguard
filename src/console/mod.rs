@@ -13,9 +13,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 pub mod assets;
+pub mod audit;
 pub mod auth;
 pub mod db;
+pub mod edit;
 pub mod handlers;
+pub mod reload;
 
 use crate::client_auth::store as token_store;
 use crate::config::Config;
@@ -25,6 +28,7 @@ pub struct ConsoleState {
     pub config: Config,
     pub db: db::ConsoleDb,
     pub secure_cookie: bool,
+    pub audit_log: Option<audit::ConsoleAuditLog>,
 }
 
 /// Run the console server. This function blocks until shutdown.
@@ -78,10 +82,26 @@ pub async fn run(
     let listen = config.console.listen.parse::<SocketAddr>()?;
     let secure_cookie = !listen.ip().is_loopback();
 
+    let audit_log = match audit::ConsoleAuditLog::open(&config.console.audit_path) {
+        Ok(log) => {
+            tracing::info!("console audit log: {}", config.console.audit_path);
+            Some(log)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "console audit log: failed to open {}: {}",
+                config.console.audit_path,
+                e
+            );
+            None
+        }
+    };
+
     let state = Arc::new(ConsoleState {
         config: config.clone(),
         db,
         secure_cookie,
+        audit_log,
     });
 
     // Spawn a background task to prune expired sessions every 5 minutes.
@@ -121,6 +141,13 @@ pub async fn run(
             get(handlers::api_list_users).post(handlers::api_create_user),
         )
         .route("/api/users/:id", put(handlers::api_update_user))
+        .route("/api/edit", post(handlers::api_edit_file))
+        .route("/api/validate", post(handlers::api_validate_file))
+        .route("/api/backups", get(handlers::api_list_backups))
+        .route("/api/revert", post(handlers::api_revert_file))
+        .route("/api/reload/trigger", post(handlers::api_trigger_reload))
+        .route("/api/reload/status", get(handlers::api_reload_status))
+        .route("/api/console-audit", get(handlers::api_console_audit))
         .with_state(state);
 
     tracing::info!("nanoguard-console listening on http://{}", listen);

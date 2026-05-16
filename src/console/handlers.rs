@@ -262,12 +262,7 @@ pub async fn api_logout(
     State(state): State<Arc<ConsoleState>>,
     MaybeUser(user): MaybeUser,
 ) -> Response {
-    // If we can extract the session, delete it from the DB.
-    // We do this by parsing the cookie manually since axum doesn't give us
-    // the raw cookie value in a convenient way here.
-    // Instead, we'll just let the client clear it and rely on the cookie expiry.
     if let Some(u) = user {
-        // Best-effort: delete all sessions for this user (aggressive logout).
         let _ = state
             .db
             .with_conn(|conn| db::delete_user_sessions(conn, u.id));
@@ -348,7 +343,6 @@ pub async fn api_create_token(
         }
     }
 
-    // Use the proxy's env marker from config. Default to 'p'.
     let env_marker = state.config.auth.env_marker;
 
     const MAX_ATTEMPTS: usize = 3;
@@ -421,7 +415,6 @@ pub async fn api_revoke_token(
     CurrentUser(user): CurrentUser,
     Path(id): Path<i64>,
 ) -> Response {
-    // Verify the token belongs to the current user (non-admins cannot revoke others' tokens).
     let belongs = state.db.with_conn(|conn| {
         let rows = token_store::list_for_user(conn, user.id)?;
         Ok(rows.into_iter().any(|r| r.id == id))
@@ -502,14 +495,12 @@ pub async fn api_audit(
             continue;
         };
 
-        // Filter by verdict if requested.
         if let Some(ref v) = q.verdict {
             if obj.get("verdict").and_then(|x| x.as_str()) != Some(v) {
                 continue;
             }
         }
 
-        // Non-admins only see entries where user_id matches their own id.
         if user.role != "admin" {
             let entry_user_id = obj.get("user_id").and_then(|x| x.as_str());
             let my_id = user.id.to_string();
@@ -535,7 +526,6 @@ pub async fn api_budget(
 ) -> Response {
     let db_path = &state.config.budget.db_path;
 
-    // Open a read-only connection for budget queries.
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -554,7 +544,6 @@ pub async fn api_budget(
     let mut items = Vec::new();
 
     if user.role == "admin" {
-        // Admin sees all api_keys with usage / limit.
         let mut stmt = match conn.prepare(
             "SELECT u.api_key, COALESCE(u.total_tokens, 0) as usage, l.token_limit
              FROM api_key_usage u
@@ -577,8 +566,6 @@ pub async fn api_budget(
             items = rows.filter_map(|r| r.ok()).collect();
         }
     } else {
-        // User sees their own token-based budgets.
-        // First get their token prefixes.
         let prefixes: Vec<String> = state
             .db
             .with_conn(|conn| {
@@ -619,12 +606,10 @@ pub async fn api_budget(
 pub async fn api_config(State(_state): State<Arc<ConsoleState>>) -> Response {
     let mut files: HashMap<String, String> = HashMap::new();
 
-    // nanoguard.toml
     if let Ok(content) = std::fs::read_to_string("nanoguard.toml") {
         files.insert("nanoguard.toml".to_string(), content);
     }
 
-    // dicts
     if let Ok(entries) = std::fs::read_dir("dicts") {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -637,7 +622,6 @@ pub async fn api_config(State(_state): State<Arc<ConsoleState>>) -> Response {
         }
     }
 
-    // policies
     if let Ok(entries) = std::fs::read_dir("policies") {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -783,4 +767,374 @@ pub async fn api_update_user(
                 .into_response()
         }
     }
+}
+
+// ── API: File editing (admin only) ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct EditFileRequest {
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ValidateFileRequest {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct RevertFileRequest {
+    pub path: String,
+    pub backup: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct BackupQuery {
+    pub path: String,
+}
+
+/// Validate that a path is safe for editing/backup/revert.
+fn is_safe_editable_path(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    // Reject absolute paths and parent directory traversal.
+    if p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return false;
+    }
+    path.starts_with("dicts/") || path.starts_with("policies/") || path == "nanoguard.toml"
+}
+
+pub async fn api_edit_file(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(admin): CurrentUser,
+    Json(body): Json<EditFileRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let path = body.path.trim();
+    if path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path is required"})),
+        )
+            .into_response();
+    }
+
+    // Security: restrict to known file families.
+    if !is_safe_editable_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "editing this file is not allowed"})),
+        )
+            .into_response();
+    }
+
+    let validator = |content: &str| super::edit::validate_by_path(path, content);
+    let write_result =
+        std::panic::catch_unwind(|| super::edit::atomic_write(path, &body.content, validator));
+
+    let (before_hash, after_hash) = match write_result {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::warn!("edit_file: {}: {}", path, e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{}", e)})),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            tracing::warn!("edit_file: panic during write");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "write failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Audit log.
+    if let Some(ref log) = state.audit_log {
+        let record = super::audit::EditRecord {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            actor: admin.username.clone(),
+            action: "edit".to_string(),
+            file: path.to_string(),
+            before_hash: before_hash.clone(),
+            after_hash: after_hash.clone(),
+            summary: body
+                .summary
+                .unwrap_or_else(|| "edited via console".to_string()),
+        };
+        if let Err(e) = log.write_edit(&record) {
+            tracing::warn!("edit_file: audit log failed: {}", e);
+        }
+    }
+
+    // Trigger reload.
+    let reload = super::reload::trigger_reload(&state.config.reload);
+
+    Json(json!({
+        "ok": true,
+        "before_hash": before_hash,
+        "after_hash": after_hash,
+        "reload": reload,
+    }))
+    .into_response()
+}
+
+pub async fn api_validate_file(
+    CurrentUser(admin): CurrentUser,
+    Json(body): Json<ValidateFileRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let path = body.path.trim();
+    if path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path is required"})),
+        )
+            .into_response();
+    }
+
+    if !is_safe_editable_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "validating this file is not allowed"})),
+        )
+            .into_response();
+    }
+
+    let result = super::edit::validate_by_path(path, &body.content);
+    Json(json!(result)).into_response()
+}
+
+pub async fn api_list_backups(
+    CurrentUser(admin): CurrentUser,
+    Query(q): Query<BackupQuery>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let path = q.path.trim();
+    if path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path is required"})),
+        )
+            .into_response();
+    }
+
+    if !is_safe_editable_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "editing this file is not allowed"})),
+        )
+            .into_response();
+    }
+
+    match super::edit::list_backups(path) {
+        Ok(backups) => Json(json!({ "data": backups })).into_response(),
+        Err(e) => {
+            tracing::warn!("list_backups: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to list backups"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn api_revert_file(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(admin): CurrentUser,
+    Json(body): Json<RevertFileRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let path = body.path.trim();
+    if path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path is required"})),
+        )
+            .into_response();
+    }
+
+    if !is_safe_editable_path(path) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "editing this file is not allowed"})),
+        )
+            .into_response();
+    }
+
+    let before_content = std::fs::read_to_string(path).unwrap_or_default();
+    let before_hash = super::edit::hash_content(&before_content);
+
+    let content = match super::edit::revert_to_backup(path, &body.backup) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("revert_file: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(ref log) = state.audit_log {
+        let record = super::audit::EditRecord {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            actor: admin.username.clone(),
+            action: "revert".to_string(),
+            file: path.to_string(),
+            before_hash,
+            after_hash: super::edit::hash_content(&content),
+            summary: format!("reverted to backup {}", body.backup),
+        };
+        if let Err(e) = log.write_edit(&record) {
+            tracing::warn!("revert_file: audit log failed: {}", e);
+        }
+    }
+
+    let reload = super::reload::trigger_reload(&state.config.reload);
+
+    Json(json!({
+        "ok": true,
+        "reload": reload,
+    }))
+    .into_response()
+}
+
+// ── API: Reload ─────────────────────────────────────────────────────────────
+
+pub async fn api_trigger_reload(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(admin): CurrentUser,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let outcome = super::reload::trigger_reload(&state.config.reload);
+    Json(json!(outcome)).into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub struct ReloadStatusQuery {
+    #[serde(default)]
+    pub since: Option<f64>,
+}
+
+pub async fn api_reload_status(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(admin): CurrentUser,
+    Query(q): Query<ReloadStatusQuery>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let since = q.since.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            - 30.0
+    });
+    if !since.is_finite() || since < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "since must be a non-negative finite number"})),
+        )
+            .into_response();
+    }
+    let after = std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(since);
+    let result = super::reload::poll_reload_status(&state.config.audit.path, after, 200);
+    match result {
+        Some(ok) => Json(json!({
+            "ready": true,
+            "ok": ok,
+            "error": null,
+        }))
+        .into_response(),
+        None => Json(json!({
+            "ready": false,
+            "ok": null,
+            "error": null,
+        }))
+        .into_response(),
+    }
+}
+
+// ── API: Console audit log ──────────────────────────────────────────────────
+
+pub async fn api_console_audit(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(user): CurrentUser,
+    Query(q): Query<AuditQuery>,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return *e;
+    }
+
+    let path = &state.config.console.audit_path;
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Json(json!({ "data": [] })).into_response();
+            }
+            tracing::warn!("console_audit: read failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to read console audit log"})),
+            )
+                .into_response();
+        }
+    };
+
+    let limit = q.limit.unwrap_or(100);
+    let mut entries = Vec::new();
+
+    for line in content.lines().rev().take(limit * 2) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if let Some(ref v) = q.verdict {
+            if obj.get("action").and_then(|x| x.as_str()) != Some(v) {
+                continue;
+            }
+        }
+
+        entries.push(obj);
+        if entries.len() >= limit {
+            break;
+        }
+    }
+
+    Json(json!({ "data": entries })).into_response()
 }

@@ -33,14 +33,11 @@ jobs:
   test:
     name: build + test + lint
     needs: changes
-    # Matrix expands the test job across linux + macOS so platform-specific
-    # build breakage in bundled deps (rusqlite, rustls) surfaces in CI rather
-    # than at release time. Windows is intentionally left for a follow-up.
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -57,6 +54,9 @@ jobs:
         with:
           components: clippy, rustfmt, llvm-tools-preview
 
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache cargo
         if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         uses: actions/cache@v4
@@ -64,7 +64,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Format check
@@ -77,18 +76,18 @@ jobs:
         if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build
-        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-        run: cargo build --tests
-
       - name: Test
         if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-        run: cargo test
+        run: cargo test --all-features
 
   msrv:
     name: MSRV check (Cargo.toml rust-version)
     needs: changes
     runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +113,9 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache cargo
         if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         uses: actions/cache@v4
@@ -121,14 +123,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
 
       # Build (not test) on the declared MSRV — proves the pinned rust-version
       # is honest. Tests stay on stable so the matrix doesn't double its cost.
       - name: Build on MSRV
         if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-        run: cargo build --tests
+        run: cargo build --tests --all-features
 
   audit:
     name: security audit
@@ -255,4 +256,4 @@ jobs:
 
       - name: Coverage summary
         if: github.event_name != 'pull_request'
-        run: cargo llvm-cov --summary-only
+        run: cargo llvm-cov --all-features --summary-only
