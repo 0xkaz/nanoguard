@@ -815,9 +815,8 @@ pub async fn api_edit_file(
     }
 
     // Security: restrict to known file families.
-    let allowed = path.starts_with("dicts/")
-        || path.starts_with("policies/")
-        || path == "nanoguard.toml";
+    let allowed =
+        path.starts_with("dicts/") || path.starts_with("policies/") || path == "nanoguard.toml";
     if !allowed {
         return (
             StatusCode::FORBIDDEN,
@@ -827,9 +826,8 @@ pub async fn api_edit_file(
     }
 
     let validator = |content: &str| super::edit::validate_by_path(path, content);
-    let write_result = std::panic::catch_unwind(|| {
-        super::edit::atomic_write(path, &body.content, validator)
-    });
+    let write_result =
+        std::panic::catch_unwind(|| super::edit::atomic_write(path, &body.content, validator));
 
     let (before_hash, after_hash) = match write_result {
         Ok(Ok(pair)) => pair,
@@ -860,7 +858,9 @@ pub async fn api_edit_file(
             file: path.to_string(),
             before_hash: before_hash.clone(),
             after_hash: after_hash.clone(),
-            summary: body.summary.unwrap_or_else(|| "edited via console".to_string()),
+            summary: body
+                .summary
+                .unwrap_or_else(|| "edited via console".to_string()),
         };
         if let Err(e) = log.write_edit(&record) {
             tracing::warn!("edit_file: audit log failed: {}", e);

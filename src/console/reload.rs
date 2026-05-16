@@ -79,17 +79,15 @@ fn trigger_via_pid_file(_pid_file: &str) -> Result<()> {
 
 #[cfg(unix)]
 fn trigger_via_socket(socket_path: &str) -> Result<()> {
-    use std::os::unix::net::UnixStream;
     use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("connecting to reload socket {}", socket_path))?;
     stream
         .write_all(b"RELOAD\n")
         .with_context(|| "writing RELOAD to socket")?;
-    stream
-        .flush()
-        .with_context(|| "flushing socket")?;
+    stream.flush().with_context(|| "flushing socket")?;
 
     let mut buf = [0u8; 256];
     let n = stream
@@ -114,11 +112,7 @@ fn trigger_via_socket(_socket_path: &str) -> Result<()> {
 ///
 /// Returns `Some(true)` for reload_ok, `Some(false)` for reload_failed,
 /// or `None` if no entry was found within the poll window.
-pub fn poll_reload_status(
-    audit_path: &str,
-    after: SystemTime,
-    max_lines: usize,
-) -> Option<bool> {
+pub fn poll_reload_status(audit_path: &str, after: SystemTime, max_lines: usize) -> Option<bool> {
     let content = match std::fs::read_to_string(audit_path) {
         Ok(c) => c,
         Err(e) => {

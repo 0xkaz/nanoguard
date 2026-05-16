@@ -88,7 +88,11 @@ pub async fn run(
             Some(log)
         }
         Err(e) => {
-            tracing::warn!("console audit log: failed to open {}: {}", config.console.audit_path, e);
+            tracing::warn!(
+                "console audit log: failed to open {}: {}",
+                config.console.audit_path,
+                e
+            );
             None
         }
     };

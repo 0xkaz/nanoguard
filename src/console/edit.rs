@@ -205,7 +205,8 @@ pub fn atomic_write(
     );
     let tmp_path = dir.join(tmp_name);
 
-    std::fs::write(&tmp_path, content).with_context(|| format!("writing temp file {:?}", tmp_path))?;
+    std::fs::write(&tmp_path, content)
+        .with_context(|| format!("writing temp file {:?}", tmp_path))?;
 
     // fsync the temp file.
     {
@@ -457,7 +458,10 @@ mod tests {
         let backup_name = &backups[0].name;
         let content = revert_to_backup(&path, backup_name).unwrap();
         assert_eq!(content, "original\t0\t1.0\n");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\t0\t1.0\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "original\t0\t1.0\n"
+        );
         cleanup(&dir);
     }
 
