@@ -498,6 +498,8 @@ make          # release binary → target/release/nanoguard
 make dev      # debug build + run
 make test     # cargo test
 make check    # clippy + fmt
+make geiger   # unsafe code audit
+make semgrep  # Semgrep CE security scan
 make bench    # criterion benchmarks → target/criterion/
 make mirai    # optional MIRAI static analysis
 ```

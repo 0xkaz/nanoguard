@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### CI — opt-in Aikido SCA scan
+
+New `.github/workflows/aikido.yml` runs Aikido's dependency vulnerability scan on push to `main` and on PRs. The job is gated by the repo variable `AIKIDO_ENABLED == 'true'` so it stays inert until an operator opts in (the repo also needs the `AIKIDO_SECRET_KEY` secret provisioned from the Aikido dashboard), and skips PRs from forks (which don't have access to the secret). Third-party actions are pinned to immutable commit SHAs with the matching tag in a comment — relevant supply-chain hygiene for a security scanner. `continue-on-error: true` means a real finding shows up as an advisory check, not a merge-blocker, until we have a release cycle of clean runs and promote it to required. Setup instructions live in `docs/operations.md > External CI scans`; the tool-decision write-up lives in `docs/research/aikido-sca.md`. The scan complements (does not duplicate) the existing CodeRabbit / Greptile / Qodo review bots — those reason about diffs, Aikido scans the dependency tree against CVE feeds.
+
 ### Docs — README catches up with v0.4 → present feature set
 
 README now advertises the features that landed across v0.4 / v0.5 / v0.6 / v0.7 / the in-flight hot-reload work: Tool gate (allow / deny / schema / entity scan), Output JSON Schema validation, Policy bundles (YAML rule sets with stable ids / severity / compliance tags), and Hot reload (SIGHUP-driven atomic config swap). The proxy architecture diagram at the top reflects the actual pipeline shape today instead of the v0.3 sketch. Cross-links to `docs/design/` and `docs/operations.md` for the deeper material.
