@@ -16,7 +16,10 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+pub mod runtime;
 pub mod store;
+
+pub use runtime::ClientAuth;
 
 #[cfg(test)]
 mod tests;

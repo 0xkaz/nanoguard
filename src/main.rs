@@ -46,11 +46,33 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Client-auth: opens the client_tokens table when [auth].enabled OR
+    // [budget].enabled (the admin-token-issuance endpoints will live on
+    // the budget DB and are useful even before enforcement is turned on,
+    // so the table exists as soon as there is a DB to put it in). When
+    // both are off, no table is opened — defaults stay zero-cost.
+    let client_auth = if cfg.auth.enabled || cfg.budget.enabled {
+        let db_path = &cfg.budget.db_path;
+        tracing::info!(
+            "client_auth: opening client_tokens on {} (enforcement={})",
+            db_path,
+            cfg.auth.enabled
+        );
+        Some(nanoguard::client_auth::ClientAuth::open(
+            db_path,
+            cfg.auth.clone(),
+        )?)
+    } else {
+        tracing::info!("client_auth: disabled (no DB)");
+        None
+    };
+
     let runtime = RuntimeHandles {
         backend,
         http_client,
         budget,
         audit: audit_log,
+        client_auth,
     };
 
     let initial_state = build_app_state(cfg.clone(), runtime.clone())?;

@@ -19,6 +19,8 @@ pub struct Config {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub policies: PoliciesConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -379,6 +381,69 @@ impl Default for BudgetConfig {
     }
 }
 
+/// Client-token authentication for the proxy endpoints.
+///
+/// Stage 1 of the `docs/design/client-auth.md` rollout: `enabled = false`
+/// by default. Even when on, the verification middleware lives behind
+/// this gate so existing deployments are not broken by the mere
+/// presence of the feature.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthConfig {
+    /// Master switch for the client-token verification middleware.
+    /// When false, the middleware short-circuits to "allow" without
+    /// looking at the Authorization header.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Single character embedded in the wire token shape (`ng_<env>_…`).
+    /// `p` for production, `t` for test/dev. Surfaces in audit logs so
+    /// operators can tell at a glance which environment a leaked token
+    /// belongs to.
+    #[serde(default = "default_env_marker")]
+    pub env_marker: char,
+
+    /// Upper bound on the in-memory token cache. Beyond this, the
+    /// cache evicts LRU.
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: usize,
+
+    /// TTL for cached `ClientView` entries. After this the next request
+    /// re-reads from SQLite. Bounds the maximum staleness window for
+    /// revocations that lose the broadcast invalidation.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+
+    /// When true and the proxy is not on loopback, requests are refused
+    /// unless `X-Forwarded-Proto: https` is present. See the design doc
+    /// `client-auth.md > Transport`.
+    #[serde(default)]
+    pub require_https: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            env_marker: 'p',
+            cache_capacity: 10_000,
+            cache_ttl_secs: 60,
+            require_https: false,
+        }
+    }
+}
+
+fn default_env_marker() -> char {
+    'p'
+}
+
+fn default_cache_capacity() -> usize {
+    10_000
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    60
+}
+
 fn default_true() -> bool {
     true
 }
@@ -422,6 +487,7 @@ impl Config {
                 audit: AuditConfig::default(),
                 tools: ToolsConfig::default(),
                 policies: PoliciesConfig::default(),
+                auth: AuthConfig::default(),
             })
         }
     }
