@@ -1,4 +1,4 @@
-> **Status:** shipped (v0.7.0, 2026-05-10)
+> **Status:** shipped (XKA-48, 2026-05-17)
 
 # Audit Log
 
@@ -50,6 +50,29 @@ This is a privacy-oriented audit mode:
 - enough to correlate events
 - enough to prove something happened
 - not enough to reconstruct sensitive content
+
+## Durability Posture
+
+Audit writes are **best-effort but never silent**.
+
+- I/O errors on `writeln!` (disk full, read-only filesystem, broken
+  fd, NFS write failure) are surfaced via `tracing::error!` instead of
+  being dropped. The entry that triggered the failure is lost, but the
+  operator sees a log line and can act on it.
+- A poisoned mutex — for example, after another thread panicked while
+  holding the audit lock — is **recovered** rather than skipped. The
+  next write logs an error and proceeds. Without this, a single panic
+  would silently disable the audit log for the rest of the process
+  lifetime.
+- Serialization failures are logged at `error` level and the entry is
+  dropped. This should not happen for the schema defined above; if it
+  does, the log line is the only signal.
+
+For crash-durability, opt into `[audit] fsync_every_write = true`.
+This calls `fsync` after each appended line, trading throughput for a
+guarantee that flushed entries survive a host crash. The default
+(`false`) lets the kernel flush on its own schedule, which is
+appropriate for normal compliance / troubleshooting use.
 
 ## Scope
 

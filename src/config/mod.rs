@@ -347,6 +347,13 @@ pub struct AuditConfig {
     /// When true, only a SHA-256 hash of the prompt is logged (not the raw text)
     #[serde(default = "default_true")]
     pub hash_only: bool,
+    /// When true, call `fsync` after every audit write. Trades throughput
+    /// for crash-durability of the most recent entries. Default `false`:
+    /// the audit log is best-effort and most deployments accept the small
+    /// loss window in exchange for not blocking the hot path on disk
+    /// flushes.
+    #[serde(default)]
+    pub fsync_every_write: bool,
 }
 
 impl Default for AuditConfig {
@@ -355,6 +362,7 @@ impl Default for AuditConfig {
             enabled: false,
             path: default_audit_path(),
             hash_only: true,
+            fsync_every_write: false,
         }
     }
 }

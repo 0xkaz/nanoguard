@@ -4,6 +4,14 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Fixed — `AuditLog::write` no longer drops failures silently (XKA-48)
+
+The audit writer previously hid I/O errors (the `writeln!` return value was discarded with `let _ =`) and skipped any write that landed on a poisoned mutex (`if let Ok(mut f) = self.file.lock()`). A disk-full condition, a read-only filesystem, an NFS write failure, or a single panic in another thread holding the audit lock would all silently disable the audit trail — exactly the failure mode where a security audit log most needs to stay visible.
+
+`write` and `write_reload` now share a `write_line` sink that recovers from `Mutex` poisoning via `poisoned.into_inner()` and emits `tracing::error!` so operators see the recovery, logs `writeln!` failures at `error` level instead of dropping them, and optionally calls `sync_all` after each write when `[audit] fsync_every_write = true` (default `false`, trading throughput for crash-durability of the most recent entries).
+
+`new_request_id` now mixes a process-wide `AtomicU64` counter into the id (32 hex chars timestamp + 16 hex chars counter), so two ids minted in the same nanosecond no longer collide and the next id is not trivially predictable from the previous one. Five new audit unit tests cover the JSONL append path, the poisoned-lock recovery, the `fsync_every_write` plumbing, the reload-verdict shape, and request-id uniqueness under a tight 10k-iteration loop.
+
 ### Fixed — `filter_output` now case-insensitive (silent PII leak on LLM responses)
 
 `Matchers::filter_output` was running iword's `Dictionary::filter` in case-sensitive mode against raw LLM output. The output dictionary entries are lowercase (`ssn`, `social security`, `credit card`), but LLMs almost always emit these capitalized (`SSN`, `Social Security`, `Credit Card`), so the last-line-of-defence PII mask was silently bypassed for the common shape. The filter now scans a lowercased copy of the response and projects matched byte ranges back onto the original text, preserving user-visible casing / whitespace / NFKC form everywhere except the masked spans. Vault placeholders such as `[SSN_1]` are explicitly skipped so the existing PII round-trip restoration still works. Five new matcher tests cover the uppercase and capitalized variants plus the placeholder skip.
