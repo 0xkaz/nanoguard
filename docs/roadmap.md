@@ -50,8 +50,8 @@ hold**:
    `ollama` only. Additional providers (`gemini`, `bedrock`,
    `cohere`, etc.) live behind `--features <provider>` so the
    default binary stays small and the audit surface stays narrow.
-   `# Performance Targets > Memory: < 10MB baseline` remains the
-   bar the default build is measured against.
+   `CLAUDE.md > Performance Targets > Memory: < 10MB baseline`
+   remains the bar the default build is measured against.
 2. **OpenAI-shaped IR, not an N² translation matrix.** Provider
    adapters convert to/from a single internal representation
    (OpenAI's request / response shape, since it is already the
