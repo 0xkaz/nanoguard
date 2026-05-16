@@ -59,7 +59,7 @@ make geiger   # unsafe code audit
 
 ## Dependency Policy
 
-Allowed: axum, tower-http, tokio, reqwest, rusqlite, rustls, serde, serde_json, serde_yaml, toml, aho-corasick, regex, jsonschema, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing, tracing-subscriber, arc-swap
+Allowed: axum, tower-http, tokio, reqwest, rusqlite, rustls, serde, serde_json, serde_yaml, toml, aho-corasick, regex, jsonschema, iword-rs (legacy), unicode-normalization, sha2, chrono, async-trait, async-stream, futures-util, bytes, once_cell, anyhow, thiserror, tracing, tracing-subscriber, arc-swap, subtle, rand
 Prohibited: openssl, pyo3, langchain, any LLM SDK in the core filter path
 
 ## Testing
