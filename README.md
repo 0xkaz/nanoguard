@@ -12,13 +12,16 @@ filtering prompts and responses in-process, without an external guardrail API.
 
 ```
 [Your App / Robot / Edge Device / Open WebUI]
-        ↓  POST /v1/chat/completions
+        ↓  POST /v1/chat/completions  or  /v1/messages
   ┌──────────────────────────────────────┐
   │              nanoguard               │
-  │  Input Guardrails  (<1 µs literal)   │  ← keyword / PII regex / injection patterns
+  │  Input Guardrails  (<1 µs literal)   │  ← keyword / PII regex / injection / spotlight
+  │  Policy Engine                       │  ← YAML rule bundles (ids / severity / compliance)
   │  Backend Router                      │  ← Ollama / OpenAI / Anthropic / any
-  │  Output Guardrails (~4 µs)           │  ← sensitive word masking, streaming
+  │  Output Guardrails (~4 µs)           │  ← word masking, streaming SSE
+  │  Tool Gate + JSON Schema             │  ← allow / deny / validate tool_calls
   │  Audit Log                           │  ← JSONL, SHA-256 hash-only mode
+  │  Hot Reload                          │  ← SIGHUP → atomic config swap
   └──────────────────────────────────────┘
         ↓
   [LLM Backend]
@@ -257,6 +260,45 @@ Responses are filtered before reaching your app. Sensitive words are replaced wi
 
 Streaming SSE responses are buffered across chunk boundaries and split on the SSE event terminator before each event's `delta.content` is filtered. This handles backends that pack multiple events into a single TCP chunk or split a single event across chunks. Non-data lines (`event:`, comments, `[DONE]`) pass through unchanged.
 
+### Tool gate
+
+When the LLM emits `tool_calls` in a response, nanoguard inspects each call before it reaches your application. Calls can be allowed, denied, or sanitized.
+
+- **Name allow / deny** with `*` wildcard support: `[tools] allow = ["search_*"]`, `[tools] deny = ["exec_*", "shell"]`.
+- **JSON Schema validation** on tool arguments — a call with the wrong shape is denied.
+- **Entity scan** on tool argument values: a call whose arguments contain a `reject_entities` PII type is denied; `mask_entities` types are redacted in place.
+
+A denied call is removed from `tool_calls[]` and a synthetic message (or, on `/v1/messages`, a `nanoguard_denied_tools` block; on streaming, a `tool_call_denied` SSE event) surfaces the rejection to the caller. Streaming tool gate operates after the proxy buffers the full `tool_calls[]` delta sequence and the `finish_reason: tool_calls` arrives.
+
+```toml
+[tools]
+enabled = true
+allow = ["search_kb", "lookup_*"]
+deny  = ["exec_*"]
+reject_entities = ["AWS_ACCESS_KEY_ID", "ANTHROPIC_KEY"]
+mask_entities   = ["EMAIL"]
+
+[[tools.schemas]]
+tool_name   = "search_kb"
+schema_path = "schemas/search_kb.json"
+```
+
+### Output JSON Schema validation
+
+When the LLM is expected to return structured JSON (for tool calls, structured outputs, etc.), nanoguard can validate the response against a JSON Schema (Draft 2020-12) before forwarding. Per-route and per-model rule selection is supported. Prose / markdown-fence wrappers are stripped before validation.
+
+```toml
+[output.schema]
+enabled      = true
+on_violation = "alert"   # "alert" | "reject" | "repair" (repair is a reserved stub)
+
+[[output.schema.rules]]
+endpoint      = "/v1/chat/completions"
+model_pattern = "gpt-4o.*"
+schema_path   = "schemas/user_card.json"
+name          = "user_card"
+```
+
 ### Spotlighting (indirect injection defense)
 
 Spotlighting marks untrusted content — typically RAG chunks delivered in `tool` or `function` role messages — so the LLM is reminded to treat it as data, not instructions. nanoguard ships three transforms:
@@ -308,6 +350,71 @@ When enabled, every request writes one JSONL line:
 `hash_only = true` (default): SHA-256 hash of the prompt only — no raw text stored.
 Useful for compliance environments where retaining user input is restricted.
 
+See [`docs/design/audit-log-format.md`](docs/design/audit-log-format.md) for the full JSONL schema, including reload entries written when the proxy hot-reloads its configuration.
+
+---
+
+## Policy bundles
+
+Inline rules in `nanoguard.toml` are fine for small deployments. For compliance work or for sharing rule sets across nanoguard instances, declarative YAML policy bundles let you carry stable rule ids, categories, severities, and compliance tags.
+
+```yaml
+# policies/default.yaml
+version: 1
+metadata:
+  name: nanoguard default
+  updated: "2026-05-10"
+
+rules:
+  - id: PI-001
+    category: prompt_injection
+    severity: high
+    pattern: ignore previous instructions
+    action: block
+
+  - id: PII-001
+    category: pii
+    severity: medium
+    pattern: '/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/'
+    action: redact
+    placeholder: EMAIL
+    compliance: ["GDPR", "HIPAA"]
+```
+
+```toml
+[policies]
+bundle_path = "policies/default.yaml"
+```
+
+At startup (and on hot reload) the bundle's keyword rules merge into `[input.keyword]` and its `redact` rules merge into the redactor patterns. When a request matches a policy rule, the audit log entry gains `rule_id` / `category` / `severity` / `compliance` fields so downstream consumers can pivot by rule lineage. The matcher / redactor hot path is unaffected — the policy index is consulted only at audit time.
+
+See [`docs/design/policy-engine.md`](docs/design/policy-engine.md) for the full schema.
+
+---
+
+## Hot reload
+
+Edit `nanoguard.toml`, the dict files, or the policy bundle, then signal the running process:
+
+```bash
+kill -HUP $(pidof nanoguard)
+# or under systemd:
+systemctl reload nanoguard
+```
+
+The matcher, redactor, spotlight transform, JSON Schema validators, tool gate, and policy index are rebuilt and atomically swapped in. In-flight requests finish on the snapshot they acquired at request entry; the next request sees the new state.
+
+Reload is **all-or-nothing**. A failed parse, a regex that won't compile, an invalid JSON Schema — any failure leaves the live state untouched and writes a `reload_failed` audit entry. A successful reload writes `reload_ok`.
+
+Restart-only knobs (the proxy keeps running on the previous values if these change in the file):
+
+- `[nanoguard] listen` and `log_level`
+- `[backend] *`
+- `[budget] db_path`
+- `[audit] path`
+
+See [`docs/operations.md`](docs/operations.md) for systemd integration, log rotation, and diagnostics, and [`docs/design/hot-reload.md`](docs/design/hot-reload.md) for the design rationale.
+
 ---
 
 ## Configuration
@@ -348,6 +455,10 @@ action = "mask"  # mask | reject | log
 
 [output]
 enabled = true
+
+# [output.schema] — see "Output JSON Schema validation" above
+# [tools]         — see "Tool gate" above
+# [policies]      — see "Policy bundles" above
 
 [budget]
 enabled = false

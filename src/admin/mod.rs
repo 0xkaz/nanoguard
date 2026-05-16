@@ -6,9 +6,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
 
-use crate::AppState;
+use crate::{AppState, SharedState};
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
@@ -56,10 +55,11 @@ pub struct SetLimitRequest {
 
 /// GET /v1/admin/budget/:api_key — get usage and limit
 pub async fn get_budget(
-    State(state): State<Arc<AppState>>,
+    State(shared): State<SharedState>,
     headers: HeaderMap,
     Path(api_key): Path<String>,
 ) -> Response {
+    let state = shared.load_full();
     if let Err(e) = require_admin(&state, &headers) {
         return *e;
     }
@@ -107,11 +107,12 @@ pub async fn get_budget(
 
 /// PUT /v1/admin/budget/:api_key — set token limit
 pub async fn set_budget(
-    State(state): State<Arc<AppState>>,
+    State(shared): State<SharedState>,
     headers: HeaderMap,
     Path(api_key): Path<String>,
     Json(body): Json<SetLimitRequest>,
 ) -> Response {
+    let state = shared.load_full();
     if let Err(e) = require_admin(&state, &headers) {
         return *e;
     }
@@ -145,10 +146,11 @@ pub async fn set_budget(
 
 /// DELETE /v1/admin/budget/:api_key/reset — reset usage counter
 pub async fn reset_budget(
-    State(state): State<Arc<AppState>>,
+    State(shared): State<SharedState>,
     headers: HeaderMap,
     Path(api_key): Path<String>,
 ) -> Response {
+    let state = shared.load_full();
     if let Err(e) = require_admin(&state, &headers) {
         return *e;
     }

@@ -83,9 +83,55 @@ impl AuditLog {
         }
     }
 
+    /// Append a reload outcome to the audit log.
+    ///
+    /// Reload entries use a distinct verdict (`reload_ok` / `reload_failed`)
+    /// and a slim schema. They share the file with request-level entries;
+    /// consumers can filter on the `verdict` prefix.
+    pub fn write_reload(&self, ok: bool, error: Option<String>, latency_us: u64) {
+        let entry = ReloadEntry {
+            request_id: new_request_id(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            verdict: if ok {
+                ReloadVerdict::ReloadOk
+            } else {
+                ReloadVerdict::ReloadFailed
+            },
+            error,
+            latency_us,
+        };
+        let line = match serde_json::to_string(&entry) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("audit serialize error (reload): {e}");
+                return;
+            }
+        };
+        if let Ok(mut f) = self.file.lock() {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
     pub fn hash_only(&self) -> bool {
         self.hash_only
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReloadVerdict {
+    ReloadOk,
+    ReloadFailed,
+}
+
+#[derive(Debug, Serialize)]
+struct ReloadEntry {
+    request_id: String,
+    timestamp: String,
+    verdict: ReloadVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    latency_us: u64,
 }
 
 pub fn new_request_id() -> String {

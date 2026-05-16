@@ -578,6 +578,201 @@ HTTP_CODE=$(curl -s -o "$LOGDIR/s19.json" -w "%{http_code}" "$NG_URL/v1/messages
     -d '{"model":"test","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hello stream"}]}')
 assert_eq "19. Anthropic stream=true refused with 400" "$HTTP_CODE" "400"
 
+# --- 20. Hot reload — SIGHUP picks up a new block rule ---------------------
+info "scenario 20: SIGHUP-driven hot reload picks up a new inline_block rule"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+S20_TOML="$LOGDIR/e2e.s20.toml"
+S20_AUDIT="$LOGDIR/e2e.s20-audit.jsonl"
+rm -f "$S20_AUDIT"
+# Start with the baseline config but enable the audit log so we can
+# observe reload_ok / reload_failed entries.
+awk '/^\[audit\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S20_TOML"
+cat >> "$S20_TOML" <<EOF
+
+[audit]
+enabled = true
+path = "$S20_AUDIT"
+hash_only = true
+EOF
+
+NANOGUARD_CONFIG="$S20_TOML" "$BIN" > "$LOGDIR/ng.s20.log" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# "frobnitz" passes pre-reload (not in inline_block).
+HTTP_PRE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"frobnitz prelude"}]}')
+assert_eq "20a. frobnitz passes pre-reload" "$HTTP_PRE" "200"
+
+# Rewrite the config to add "frobnitz" to inline_block.
+S20_TOML2="$LOGDIR/e2e.s20.toml"
+sed -i.bak 's|inline_block = \[|inline_block = ["frobnitz", |' "$S20_TOML2"
+
+# SIGHUP the proxy and wait for the reload audit entry.
+kill -HUP "$NG_PID" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    grep -q "reload_ok" "$S20_AUDIT" 2>/dev/null && break
+done
+
+if grep -q "reload_ok" "$S20_AUDIT" 2>/dev/null; then
+    ok "20b. audit log records reload_ok after SIGHUP"
+else
+    ng "20b. audit log did NOT record reload_ok (tail: $(tail -3 "$S20_AUDIT" 2>/dev/null || echo none))"
+fi
+
+# Now the same request must be blocked.
+HTTP_POST=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"frobnitz prelude"}]}')
+assert_eq "20c. frobnitz blocked post-reload" "$HTTP_POST" "400"
+
+# --- 21. Hot reload — invalid config leaves live state intact --------------
+info "scenario 21: SIGHUP with an invalid config retains live state and writes reload_failed"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+S21_TOML="$LOGDIR/e2e.s21.toml"
+S21_AUDIT="$LOGDIR/e2e.s21-audit.jsonl"
+rm -f "$S21_AUDIT"
+awk '/^\[audit\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S21_TOML"
+cat >> "$S21_TOML" <<EOF
+
+[audit]
+enabled = true
+path = "$S21_AUDIT"
+hash_only = true
+EOF
+
+NANOGUARD_CONFIG="$S21_TOML" "$BIN" > "$LOGDIR/ng.s21.log" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# Corrupt the config file (broken TOML).
+printf '\n[this is not valid toml\n' >> "$S21_TOML"
+
+# SIGHUP and wait for the reload_failed entry.
+kill -HUP "$NG_PID" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    grep -q "reload_failed" "$S21_AUDIT" 2>/dev/null && break
+done
+
+if grep -q "reload_failed" "$S21_AUDIT" 2>/dev/null; then
+    ok "21a. audit log records reload_failed for invalid config"
+else
+    ng "21a. audit log did NOT record reload_failed (tail: $(tail -3 "$S21_AUDIT" 2>/dev/null || echo none))"
+fi
+
+# The proxy must still serve normally with the previous (valid) config.
+HEALTH_AFTER=$(curl -sf "$NG_URL/health" || echo failed)
+assert_eq "21b. /health still returns ok after failed reload" "$HEALTH_AFTER" "ok"
+
+HTTP_AFTER=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"hello"}]}')
+assert_eq "21c. requests still served after failed reload" "$HTTP_AFTER" "200"
+
+# --- 22. Hot reload — restart-only key changes produce a warn -------------
+info "scenario 22: changing a restart-only key on reload warns and is ignored"
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+S22_TOML="$LOGDIR/e2e.s22.toml"
+S22_AUDIT="$LOGDIR/e2e.s22-audit.jsonl"
+S22_LOG="$LOGDIR/ng.s22.log"
+rm -f "$S22_AUDIT"
+awk '/^\[audit\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S22_TOML"
+cat >> "$S22_TOML" <<EOF
+
+[audit]
+enabled = true
+path = "$S22_AUDIT"
+hash_only = true
+EOF
+
+# Capture the original endpoint so we can verify the live Backend
+# still points at it after a SIGHUP-with-changed-[backend].
+ORIG_ENDPOINT=$(grep -E '^endpoint *=' "$S22_TOML" | head -1 | sed -E 's/.*= *"([^"]+)".*/\1/')
+
+NANOGUARD_CONFIG="$S22_TOML" "$BIN" > "$S22_LOG" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+# Edit a restart-only key — change [backend].endpoint to a clearly wrong
+# value. The reload should detect the drift, log a warn, and otherwise
+# succeed (audit reload_ok), but /v1/models must still report the
+# original endpoint (Backend handle was preserved).
+sed -i.bak 's|^endpoint = .*|endpoint = "http://unreachable.example:9999"|' "$S22_TOML"
+
+kill -HUP "$NG_PID" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    grep -q "reload_ok" "$S22_AUDIT" 2>/dev/null && break
+done
+
+if grep -q "reload_ok" "$S22_AUDIT" 2>/dev/null; then
+    ok "22a. reload still records reload_ok when only restart-only keys changed"
+else
+    ng "22a. expected reload_ok in audit, got: $(tail -3 "$S22_AUDIT" 2>/dev/null || echo none)"
+fi
+
+if grep -q "restart-only key" "$S22_LOG" 2>/dev/null; then
+    ok "22b. proxy log warns about ignored restart-only key changes"
+else
+    ng "22b. expected restart-only-key warn in log; tail: $(tail -5 "$S22_LOG")"
+fi
+
+if grep -q "\[backend\].endpoint" "$S22_LOG" 2>/dev/null; then
+    ok "22c. warn names the changed key ([backend].endpoint)"
+else
+    ng "22c. expected [backend].endpoint in the warn; tail: $(tail -5 "$S22_LOG")"
+fi
+
+# Behavior contract for Greptile finding #1 (split routing fix):
+# Before the fix, AppState::backend_endpoint() read state.config.backend.endpoint
+# (= the reloaded "http://unreachable.example:9999") while Backend::forward_chat
+# kept reading from the preserved RuntimeHandles.backend.cfg. Both paths must
+# now agree.
+#
+# /v1/models can't tell them apart — the mock only handles POST, so a GET
+# returns 502 either way (mock returns 405 → nanoguard fails to parse JSON →
+# 502). Use POST /v1/chat/completions instead: the mock handles it and
+# returns 200 iff the request reached the original mock endpoint. If
+# forward_chat had silently switched to unreachable.example:9999, the call
+# would timeout / connection-refused and surface as 502.
+CHAT_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    --max-time 5 \
+    -d '{"model":"test","messages":[{"role":"user","content":"post-reload check"}]}')
+if [ "$CHAT_CODE" = "200" ]; then
+    ok "22d. /v1/chat/completions still reaches preserved Backend after SIGHUP (200)"
+else
+    ng "22d. /v1/chat/completions returned $CHAT_CODE — Backend may have switched to the edited endpoint"
+fi
+
+# Inverse smoke check: confirm the audit log doesn't accidentally contain
+# the original endpoint string. The error-sanitizer fix in commit c73ca3c
+# maps reload errors to bounded labels; if a future change starts logging
+# the raw config into the audit JSONL this would catch it.
+if ! grep -F "$ORIG_ENDPOINT" "$S22_AUDIT" 2>/dev/null > /dev/null; then
+    ok "22e. audit log does not leak the original backend endpoint string"
+else
+    ng "22e. audit log contains the original endpoint string — error sanitizer regression?"
+fi
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

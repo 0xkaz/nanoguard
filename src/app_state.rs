@@ -24,7 +24,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The backend endpoint this `AppState` forwards requests to.
+    ///
+    /// Reads from `self.backend` (preserved across hot reload), NOT
+    /// from `self.config.backend` (which is the freshly-reloaded TOML
+    /// view and may diverge from what the connection pool was built
+    /// against). Anything externally visible — `/v1/models`, logs,
+    /// future health checks — must read this method to stay consistent
+    /// with the writes `forward_chat` actually performs.
     pub fn backend_endpoint(&self) -> &str {
-        self.config.backend.endpoint.trim_end_matches('/')
+        self.backend.endpoint()
     }
 }

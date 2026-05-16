@@ -4,6 +4,22 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — README catches up with v0.4 → present feature set
+
+README now advertises the features that landed across v0.4 / v0.5 / v0.6 / v0.7 / the in-flight hot-reload work: Tool gate (allow / deny / schema / entity scan), Output JSON Schema validation, Policy bundles (YAML rule sets with stable ids / severity / compliance tags), and Hot reload (SIGHUP-driven atomic config swap). The proxy architecture diagram at the top reflects the actual pipeline shape today instead of the v0.3 sketch. Cross-links to `docs/design/` and `docs/operations.md` for the deeper material.
+
+### Docs — operations runbook + audit log format
+
+Two new public docs that pair with the hot-reload feature: `docs/operations.md` is the operator-facing runbook (systemd unit, SIGHUP usage, logrotate snippet, common-issues section), and `docs/design/audit-log-format.md` is the JSONL schema reference for both request entries and the new reload entries. The audit-log doc enumerates the bounded `error` label vocabulary used in `reload_failed` entries so audit-pipeline consumers can match against a stable set.
+
+### Added — hot reload via SIGHUP
+
+The proxy now picks up config / dict / policy bundle changes without a restart. SIGHUP triggers a rebuild of the matcher, redactor, spotlight, schema, tool gate, and policy index; on success the new state is atomically swapped in (lock-free via `arc-swap`). In-flight requests finish on the snapshot they acquired at handler entry, so a reload mid-request never produces a half-applied filter pass.
+
+Reload is all-or-nothing: a TOML parse error, an invalid policy YAML, a regex that fails to compile, or any other build failure leaves the live state untouched and writes a `reload_failed` audit entry. A successful reload writes `reload_ok`. Restart-only knobs (listen address, log level, backend pool, budget DB, audit file handle) are isolated in a `RuntimeHandles` struct that survives across reloads.
+
+`docs/design/hot-reload.md` graduates from `proposed` to `shipped`. Two new e2e scenarios (20: SIGHUP picks up a new block rule; 21: invalid config keeps live state) bring the e2e count from 41 to 47 assertions.
+
 ### Docs — multi-user auth & routing design set
 
 Four new / revised design docs that together describe how nanoguard becomes a real policy boundary for multi-user deployments. All status `proposed`; no implementation yet.
@@ -12,10 +28,6 @@ Four new / revised design docs that together describe how nanoguard becomes a re
 - **`docs/design/multi-backend-routing.md` (new)** — replaces single `[backend]` with `[backends.*]` + `[routing]` so one proxy can fan out to OpenAI, Anthropic, Ollama, DeepSeek, etc. Per-user `allowed_models` enforces the admin-controlled "which user can hit which model" matrix. Migration from `[backend]` is backwards-compatible for one release.
 - **`docs/design/user-management.md` (new)** — user data model, OIDC-first / local-password-fallback console login, self-service token issuance lifecycle (create / list / revoke / relabel), per-user admin actions (allowed_models, budget_limit, role, force-revoke). Sessions are cookie-based and separate from proxy Bearer tokens.
 - **`docs/design/web-config-ui.md` (revised)** — incorporates the three above: user self-service token UI, admin per-user policy editor, model-allowlist editor backed by `[routing]`. Phase plan re-ordered to land own-token self-service first (Phase 1), then file editing (Phase 2), then OIDC (Phase 4). Static-token mode dropped in favor of local password + OIDC.
-
-### Docs — hot-reload proposal
-
-New file `docs/design/hot-reload.md` (status: proposed) scopes a SIGHUP-driven atomic reload of the request-side configuration: matcher, redactor, spotlight, schema, tool gate, and policy index. The design wraps the config-derived subset of `AppState` in `ArcSwap<ReloadableState>` so handlers acquire a per-request snapshot with a single lock-free pointer load. Validation-on-reload is all-or-nothing; on failure the live state is retained and a `reload_failed` audit entry is written. Listening socket, backend HTTP client, budget DB, and the audit file handle remain restart-only. No implementation yet.
 
 ### Docs — dependency policy catches up with Cargo.toml
 
