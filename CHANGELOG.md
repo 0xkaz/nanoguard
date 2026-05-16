@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Docs — web config UI proposal
+
+New file `docs/design/web-config-ui.md` (status: proposed) describes an optional, out-of-process `nanoguard-console` binary. The console serves a read-only audit / budget dashboard and edits `nanoguard.toml`, `dicts/*.txt`, and `policies/*.yaml` through validated forms; on submit it atomically renames the file, writes an edit-audit entry, and sends SIGHUP to the proxy to trigger hot reload. The core proxy keeps its narrow surface — no mutation endpoint on the proxy itself. Loopback + static-token auth is the default; OIDC and CSRF hardening are later-phase. No implementation yet.
+
 ### Docs — hot-reload proposal
 
 New file `docs/design/hot-reload.md` (status: proposed) scopes a SIGHUP-driven atomic reload of the request-side configuration: matcher, redactor, spotlight, schema, tool gate, and policy index. The design wraps the config-derived subset of `AppState` in `ArcSwap<ReloadableState>` so handlers acquire a per-request snapshot with a single lock-free pointer load. Validation-on-reload is all-or-nothing; on failure the live state is retained and a `reload_failed` audit entry is written. Listening socket, backend HTTP client, budget DB, and the audit file handle remain restart-only. No implementation yet.
