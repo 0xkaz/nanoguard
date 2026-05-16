@@ -142,8 +142,8 @@ machine-to-machine API. The console is the human-to-files API.
 ### Mutating views
 
 Mutating views are gated by an auth check (see Auth) and a
-per-form CSRF token. Every successful submit follows the same
-contract:
+per-session double-submit CSRF token (see Auth § CSRF). Every
+successful submit follows the same contract:
 
 ```
 1. UI validates the form client-side (cheap rejection of
@@ -295,8 +295,17 @@ bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
   `listen` explicitly. This is opt-in, not the default, because a
   misconfigured console on a public IP is the canonical "remote
   config" disaster.
-- **CSRF**: every mutating form embeds a per-session double-submit
-  token. The token rotates on every successful mutation.
+- **CSRF**: every mutating endpoint requires a per-session
+  double-submit token (`X-CSRF-Token` request header, hex-encoded
+  32 bytes). The token is generated at session creation, stored on
+  the `user_sessions` row, returned in the `/api/login` response
+  body and on `/api/me`, and verified in constant time before any
+  side-effecting work. On a successful mutation the server rotates
+  the token, persists the new value to the session row, and returns
+  it via the `X-CSRF-Token-Next` response header so the JS client
+  refreshes its cached value. `POST /api/login` is the only
+  mutating endpoint exempt from the check, since the session
+  required to hold a token does not yet exist.
 - **Audit context**: every edit records the authenticated subject
   (`actor`) in `console-audit.jsonl`. The `actor` is the username
   (local mode) or the OIDC `sub`.

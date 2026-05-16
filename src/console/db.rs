@@ -9,7 +9,7 @@ use std::sync::Mutex;
 /// Console database handle. Wraps the SQLite connection in a mutex because
 /// `rusqlite::Connection` is `Send` but not `Sync`.
 pub struct ConsoleDb {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
 }
 
 impl ConsoleDb {
@@ -29,6 +29,14 @@ impl ConsoleDb {
         let conn = self.conn.lock().unwrap();
         f(&conn)
     }
+}
+
+/// Re-export of [`migrate`] under a `__test_` prefix so unit tests in
+/// sibling modules can prime an in-memory ConsoleDb without making the
+/// internal `migrate` function part of the public surface.
+#[cfg(test)]
+pub(crate) fn __test_migrate(conn: &Connection) -> anyhow::Result<()> {
+    migrate(conn)
 }
 
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
@@ -63,6 +71,24 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
         "#,
     )?;
+    // Phase 2: per-session CSRF token. Added in a separate ALTER so existing
+    // databases from Phase 1 deployments migrate forward without a rebuild.
+    let has_csrf: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(user_sessions)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "csrf_token" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_csrf {
+        conn.execute_batch("ALTER TABLE user_sessions ADD COLUMN csrf_token BLOB")?;
+    }
     Ok(())
 }
 
@@ -232,6 +258,7 @@ pub struct Session {
     pub last_seen_at: String,
     pub user_agent: Option<String>,
     pub ip: Option<String>,
+    pub csrf_token: Option<Vec<u8>>,
 }
 
 pub fn create_session(
@@ -241,14 +268,25 @@ pub fn create_session(
     expires_at: &str,
     user_agent: Option<&str>,
     ip: Option<&str>,
+    csrf_token: &[u8],
 ) -> anyhow::Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO user_sessions (id, user_id, created_at, expires_at, last_seen_at, user_agent, ip)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![id, user_id, now, expires_at, now, user_agent, ip],
+        "INSERT INTO user_sessions (id, user_id, created_at, expires_at, last_seen_at, user_agent, ip, csrf_token)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![id, user_id, now, expires_at, now, user_agent, ip, csrf_token],
     )?;
     Ok(())
+}
+
+/// Rotate (overwrite) the CSRF token on a session row. Returns the number of
+/// rows affected (0 if the session no longer exists).
+pub fn rotate_csrf_token(conn: &Connection, id: &[u8], new_token: &[u8]) -> anyhow::Result<usize> {
+    let n = conn.execute(
+        "UPDATE user_sessions SET csrf_token = ? WHERE id = ?",
+        params![new_token, id],
+    )?;
+    Ok(n)
 }
 
 pub fn touch_session(conn: &Connection, id: &[u8]) -> anyhow::Result<()> {
@@ -262,7 +300,7 @@ pub fn touch_session(conn: &Connection, id: &[u8]) -> anyhow::Result<()> {
 
 pub fn session_by_id(conn: &Connection, id: &[u8]) -> anyhow::Result<Option<Session>> {
     let mut stmt = conn.prepare(
-        "SELECT id, user_id, created_at, expires_at, last_seen_at, user_agent, ip
+        "SELECT id, user_id, created_at, expires_at, last_seen_at, user_agent, ip, csrf_token
          FROM user_sessions WHERE id = ?",
     )?;
     let row = stmt
@@ -275,6 +313,7 @@ pub fn session_by_id(conn: &Connection, id: &[u8]) -> anyhow::Result<Option<Sess
                 last_seen_at: row.get(4)?,
                 user_agent: row.get(5)?,
                 ip: row.get(6)?,
+                csrf_token: row.get(7)?,
             })
         })
         .optional()?;
@@ -305,7 +344,7 @@ pub fn prune_expired_sessions(conn: &Connection) -> anyhow::Result<usize> {
 
 pub fn list_sessions_for_user(conn: &Connection, user_id: i64) -> anyhow::Result<Vec<Session>> {
     let mut stmt = conn.prepare(
-        "SELECT id, user_id, created_at, expires_at, last_seen_at, user_agent, ip
+        "SELECT id, user_id, created_at, expires_at, last_seen_at, user_agent, ip, csrf_token
          FROM user_sessions WHERE user_id = ? ORDER BY last_seen_at DESC",
     )?;
     let rows = stmt.query_map(params![user_id], |row| {
@@ -317,6 +356,7 @@ pub fn list_sessions_for_user(conn: &Connection, user_id: i64) -> anyhow::Result
             last_seen_at: row.get(4)?,
             user_agent: row.get(5)?,
             ip: row.get(6)?,
+            csrf_token: row.get(7)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

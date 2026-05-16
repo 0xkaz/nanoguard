@@ -4,13 +4,34 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 
 let currentUser = null;
+// Per-session CSRF token. Issued on login, refreshed from /api/me on init,
+// and rotated by the server on every successful mutating request via the
+// X-CSRF-Token-Next response header.
+let csrfToken = null;
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 async function api(path, opts = {}) {
+  // Pull headers out of opts so the final fetch spread can't accidentally
+  // overwrite our merged headers (and silently drop the CSRF token) if a
+  // future caller passes its own headers object.
+  const { headers: optHeaders, ...restOpts } = opts;
+  const method = (opts.method || 'GET').toUpperCase();
+  const headers = { 'Content-Type': 'application/json', ...(optHeaders || {}) };
+  if (MUTATING_METHODS.has(method) && path !== '/api/login' && csrfToken) {
+    headers['X-CSRF-Token'] = csrfToken;
+  }
   const res = await fetch(path, {
     credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', ...opts.headers },
-    ...opts,
+    ...restOpts,
+    headers,
   });
+  // Pick up a rotated CSRF token before throwing on non-2xx so the next
+  // request after a 403-on-rotate uses the fresh value.
+  const nextCsrf = res.headers.get('x-csrf-token-next');
+  if (nextCsrf) {
+    csrfToken = nextCsrf;
+  }
   if (res.status === 401 && path !== '/api/login') {
     showLogin();
     throw new Error('unauthorized');
@@ -56,7 +77,14 @@ function switchTab(name) {
 
 async function init() {
   try {
-    currentUser = await api('/api/me');
+    const me = await api('/api/me');
+    currentUser = me;
+    // /api/me echoes the current CSRF token so the SPA can recover it on a
+    // page refresh — otherwise the first mutation would fail with 403 until
+    // the user re-logged in.
+    if (me?.csrf_token) {
+      csrfToken = me.csrf_token;
+    }
     showMain();
   } catch {
     showLogin();
@@ -90,6 +118,7 @@ $('#login-form').addEventListener('submit', async (e) => {
       }),
     });
     currentUser = res.user;
+    csrfToken = res.csrf_token || null;
     showMain();
   } catch (err) {
     $('#login-error').textContent = err.message;
@@ -97,7 +126,10 @@ $('#login-form').addEventListener('submit', async (e) => {
 });
 
 $('#logout-btn').addEventListener('click', async () => {
-  await api('/api/logout', { method: 'POST' });
+  try {
+    await api('/api/logout', { method: 'POST' });
+  } catch {}
+  csrfToken = null;
   showLogin();
 });
 

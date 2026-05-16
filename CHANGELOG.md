@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — per-session CSRF token for console mutating endpoints (XKA-59)
+
+Every mutating console handler now requires a per-session double-submit CSRF token: missing or mismatched header returns `403 Forbidden` before any work is done. The token is generated at session creation, persisted on the `user_sessions` row (new `csrf_token BLOB` column, migrated forward in place), surfaced to the SPA via the `/api/login` response body and on `/api/me`, and verified in constant time via `subtle::ConstantTimeEq` against the stored value. On a successful mutation the server rotates the token, persists the new value, and returns it as `X-CSRF-Token-Next` so the JS client refreshes its cached value transparently. Scope follows `docs/design/web-config-ui.md § Auth`: `POST /api/logout`, `POST /api/tokens`, `DELETE /api/tokens/:id`, `POST /api/users`, `PUT /api/users/:id`, `POST /api/edit`, `POST /api/revert`, and `POST /api/reload/trigger`. `POST /api/login` is exempt — the session that would hold the token does not yet exist. Four new extractor-level tests cover the missing / mismatched / valid / rotation paths.
+
 - **`docs/design/release-strategy.md` (new)** — Reviews the current release process and proposes a three-phase strategy for distribution hardening and workflow automation.
 - **CI/CD: Automated GitHub Releases** — `release.yml` now builds multi-arch binaries for Linux and macOS and uploads them to a GitHub Release automatically when a tag is pushed.
 
