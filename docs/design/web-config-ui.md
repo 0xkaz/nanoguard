@@ -307,6 +307,12 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
 ```
 
+- **`session_secret` is required but has a fallback.** If the
+  value in the config (or `CONSOLE_SESSION_SECRET` environment
+  variable) is empty, `nanoguard-console` generates a random
+  32-byte ephemeral secret at startup and logs it to `stderr`.
+  This allows the console to be used for local development without
+  configuration, though sessions will not persist across restarts.
 - **Listen address defaults to `127.0.0.1`** — loopback only. To
   expose the console on a network interface, the operator changes
   `listen` explicitly. This is opt-in, not the default, because a

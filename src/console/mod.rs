@@ -39,13 +39,20 @@ pub struct ConsoleState {
 /// does not remain visible in `/proc/<pid>/environ` for the process
 /// lifetime.
 pub async fn run(
-    config: Config,
+    mut config: Config,
     bootstrap_password: Option<zeroize::Zeroizing<String>>,
 ) -> anyhow::Result<()> {
     if config.console.session_secret.is_empty() {
-        anyhow::bail!(
-            "console.session_secret is required. Set CONSOLE_SESSION_SECRET or add it to nanoguard.toml"
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        let secret = hex::encode(bytes);
+
+        tracing::warn!(
+            "[console] session_secret is empty; using ephemeral secret '{}'. \
+             Set CONSOLE_SESSION_SECRET (or [console] session_secret in nanoguard.toml) to persist sessions across restarts.",
+            secret
         );
+        config.console.session_secret = secret;
     }
 
     let db_path = &config.budget.db_path;
