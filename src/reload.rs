@@ -808,14 +808,16 @@ mod tests {
             }));
         }
 
-        let responses: Vec<String> =
-            futures_util::future::join_all(handles)
-                .await
-                .into_iter()
-                .map(|r| r.unwrap())
-                .collect();
+        let responses: Vec<String> = futures_util::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
 
-        let busy_count = responses.iter().filter(|r| r.starts_with("ERR busy")).count();
+        let busy_count = responses
+            .iter()
+            .filter(|r| r.starts_with("ERR busy"))
+            .count();
         let bad_cmd_count = responses
             .iter()
             .filter(|r| r.starts_with("ERR expected RELOAD"))
