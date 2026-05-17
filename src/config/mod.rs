@@ -464,6 +464,10 @@ fn default_true() -> bool {
 pub struct ConsoleConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
+    // Optional in TOML: if empty/missing, `console::run` generates an
+    // ephemeral secret at startup (sessions do not survive a restart) and
+    // warns. Setting this to a long random string persists sessions.
+    #[serde(default)]
     pub session_secret: String,
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: i64,

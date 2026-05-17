@@ -1,4 +1,4 @@
-.PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai ollama-start \
+.PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai run-console ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight install-trivy trivy trivy-image mirai preflight-mirai
@@ -183,6 +183,67 @@ clean:
 # Start Ollama if not running, pull model, then run nanoguard
 run: build ollama-start
 	RUST_LOG=info ./target/release/nanoguard
+
+# Start the Web Configuration UI (`nanoguard-console`, default :8081).
+#
+# If $CONSOLE_SESSION_SECRET is unset, generates one for this shell-session.
+# If $BOOTSTRAP_PASSWORD is unset, generates one and prints it ONCE — the
+# admin user is bootstrapped on first start using that value, then it
+# should be unset. Existing $BOOTSTRAP_PASSWORD / $CONSOLE_SESSION_SECRET
+# in the environment are passed through unchanged.
+#
+# Default admin username is `admin` (see [console.auth.local] in
+# nanoguard.toml). Run this in a separate terminal from `make run` — the
+# proxy (:8080) and the console (:8081) are independent processes.
+run-console: build
+	@command -v openssl >/dev/null 2>&1 || { \
+	    echo "error: openssl not installed."; \
+	    echo "       \`make run-console\` uses \`openssl rand\` to generate"; \
+	    echo "       CONSOLE_SESSION_SECRET and BOOTSTRAP_PASSWORD when they"; \
+	    echo "       aren't already set in the environment."; \
+	    echo "       Install openssl, or set both env vars yourself and"; \
+	    echo "       run ./target/release/nanoguard-console directly."; \
+	    exit 1; \
+	}
+	@db_path=$$(awk ' \
+	    /^[[:space:]]*\[budget\][[:space:]]*$$/ { in_budget=1; next } \
+	    /^[[:space:]]*\[[^]]+\][[:space:]]*$$/  { in_budget=0 } \
+	    in_budget && /^[[:space:]]*db_path[[:space:]]*=/ { \
+	        v=$$0; sub(/^[^=]*=[[:space:]]*/, "", v); \
+	        sub(/[[:space:]]*(#.*)?$$/, "", v); \
+	        gsub(/^"|"$$/, "", v); \
+	        print v; exit \
+	    }' nanoguard.toml); \
+	db_path=$${db_path:-nanoguard.db}; \
+	users_exist=0; \
+	if [ -f "$$db_path" ] && command -v sqlite3 >/dev/null 2>&1; then \
+	    count=$$(sqlite3 "$$db_path" "SELECT COUNT(*) FROM users;" 2>/dev/null || echo 0); \
+	    [ "$$count" -gt 0 ] 2>/dev/null && users_exist=1; \
+	fi; \
+	if [ -z "$$CONSOLE_SESSION_SECRET" ]; then \
+	    export CONSOLE_SESSION_SECRET="$$(openssl rand -hex 32)"; \
+	    echo "→ CONSOLE_SESSION_SECRET not set; generated an ephemeral one for this session."; \
+	fi; \
+	if [ "$$users_exist" = "1" ]; then \
+	    echo ""; \
+	    echo "→ $$db_path already has users; BOOTSTRAP_PASSWORD is a no-op."; \
+	    echo "  Sign in at http://localhost:8081/ with the existing admin credentials."; \
+	    echo "  (To start over: rm $$db_path)"; \
+	    echo ""; \
+	elif [ -z "$$BOOTSTRAP_PASSWORD" ]; then \
+	    export BOOTSTRAP_PASSWORD="$$(openssl rand -hex 12)"; \
+	    echo ""; \
+	    echo "  ┌─────────────────────────────────────────────────────────────┐"; \
+	    echo "  │ Bootstrap admin (save this — first-start only):             │"; \
+	    echo "  │                                                             │"; \
+	    echo "  │   username: admin                                           │"; \
+	    echo "  │   password: $$BOOTSTRAP_PASSWORD                  │"; \
+	    echo "  │                                                             │"; \
+	    echo "  │ Then sign in at http://localhost:8081/                      │"; \
+	    echo "  └─────────────────────────────────────────────────────────────┘"; \
+	    echo ""; \
+	fi; \
+	RUST_LOG=info ./target/release/nanoguard-console
 
 # Run with OpenAI backend
 run-openai: build
