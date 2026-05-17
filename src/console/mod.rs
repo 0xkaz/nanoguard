@@ -68,6 +68,18 @@ pub async fn run(
         &config.console.auth.local.bootstrap_admin,
         bootstrap_password,
     ) {
+        if pw.len() < 12 {
+            anyhow::bail!(
+                "Bootstrap password for '{}' must be at least 12 characters",
+                bootstrap.username
+            );
+        }
+        if auth::is_common_password(&pw) {
+            anyhow::bail!(
+                "Bootstrap password for '{}' is too common",
+                bootstrap.username
+            );
+        }
         let hash = auth::hash_password(&pw)?;
         let created =
             db.with_conn(|conn| db::maybe_bootstrap_admin(conn, &bootstrap.username, &hash))?;
@@ -110,12 +122,17 @@ pub async fn run(
         audit_log,
     });
 
-    // Spawn a background task to prune expired sessions every 5 minutes.
+    // Spawn a background task to prune expired and idle sessions every 5 minutes.
     let prune_state = Arc::clone(&state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
+            let idle_hours = prune_state
+                .config
+                .console
+                .session_idle_timeout_hours
+                .unwrap_or(prune_state.config.console.session_ttl_hours);
             match prune_state.db.with_conn(db::prune_expired_sessions) {
                 Ok(n) => {
                     if n > 0 {
@@ -123,6 +140,30 @@ pub async fn run(
                     }
                 }
                 Err(e) => tracing::warn!("Session prune failed: {}", e),
+            }
+            match prune_state
+                .db
+                .with_conn(|conn| db::prune_idle_sessions(conn, idle_hours))
+            {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!("Pruned {} idle sessions", n);
+                    }
+                }
+                Err(e) => tracing::warn!("Idle session prune failed: {}", e),
+            }
+            // Also prune stale login-attempt rows (older than 2x lockout window).
+            let lockout_window = prune_state.config.console.lockout_duration_minutes;
+            match prune_state
+                .db
+                .with_conn(|conn| db::prune_old_login_attempts(conn, lockout_window * 2))
+            {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::debug!("Pruned {} old login attempts", n);
+                    }
+                }
+                Err(e) => tracing::warn!("Login attempt prune failed: {}", e),
             }
         }
     });
