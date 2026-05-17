@@ -165,8 +165,34 @@ pub async fn chat_completions(
         }
     }
 
+    // Resolve which backend in the pool this request goes to. The
+    // routing table is consulted once per request; on miss we fall
+    // back to the default backend (covered by route()).
+    let backend = match state.pool.route(Some(&model)) {
+        Some(b) => b,
+        None => {
+            warn!("routing: no backend resolved for model `{}`", model);
+            // OpenAI-shape error envelope so SDKs / curl pipelines
+            // can parse it like any other 4xx from the backend. Same
+            // structure the rest of this handler uses on validation
+            // failures.
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": format!("no backend configured for model `{model}`"),
+                        "type": "invalid_request_error",
+                        "param": "model",
+                        "code": "model_unrouted",
+                    },
+                })),
+            )
+                .into_response();
+        }
+    };
+
     // Forward to backend
-    let backend_resp = match state.backend.forward_chat(body).await {
+    let backend_resp = match backend.forward_chat(body).await {
         Ok(r) => r,
         Err(e) => {
             warn!("backend error: {}", e);
@@ -493,24 +519,158 @@ pub async fn chat_completions(
     }
 }
 
-/// GET /v1/models — proxy to backend
+/// GET /v1/models — aggregate the full backend pool.
+///
+/// Queries every configured backend in parallel, merges the results,
+/// and tags each model with `owned_by` = its backend label so a
+/// caller can see which upstream a given model name actually lives
+/// on. Individual backend errors are fail-soft: if one upstream is
+/// down we still return the others. Returns 502 only when EVERY
+/// backend fails — that's the case where the proxy has nothing to
+/// offer the client.
+///
+/// Single-backend deployments behave identically to the pre-pool
+/// implementation (one upstream, one response, model list passed
+/// through verbatim if it's already shaped right).
 pub async fn list_models(State(shared): State<SharedState>) -> Response {
     let state = shared.load_full();
-    let url = format!("{}/v1/models", state.backend_endpoint());
-    match state.http_client.get(&url).send().await {
-        Ok(r) => {
-            let status = r.status();
-            match r.json::<Value>().await {
-                Ok(v) => (
-                    StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
-                    Json(v),
-                )
-                    .into_response(),
-                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    let backends = &state.pool.backends;
+    if backends.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": {
+                    "message": "no backends configured",
+                    "type": "server_error",
+                    "code": "no_backends",
+                },
+            })),
+        )
+            .into_response();
+    }
+
+    // Spawn one request per backend, wait for all. Per-backend
+    // timeout is intentionally permissive: `/v1/models` is rarely
+    // hot-path, and a hung upstream blocking briefly is a smaller
+    // sin than misleading the operator about which models are live.
+    let mut tasks = Vec::with_capacity(backends.len());
+    let timeout = std::time::Duration::from_secs(10);
+    for (label, backend) in backends.iter() {
+        let url = format!("{}/v1/models", backend.endpoint());
+        let client = state.http_client.clone();
+        let label = label.clone();
+        // Per-backend api_key has to ride along on the /v1/models
+        // call too — OpenAI, Anthropic, DeepSeek and other paid
+        // providers reject anonymous GETs on /v1/models. The
+        // forward_chat path already sends the bearer for POSTs; we
+        // mirror that here so the aggregation works against a
+        // production pool, not just Ollama.
+        let api_key = backend.api_key().map(|s| s.to_string());
+        tasks.push(tokio::spawn(async move {
+            let mut req = client.get(&url);
+            if let Some(k) = api_key {
+                req = req.bearer_auth(k);
+            }
+            let result = tokio::time::timeout(timeout, req.send()).await;
+            (label, result)
+        }));
+    }
+
+    let mut merged: Vec<Value> = Vec::new();
+    let mut any_ok = false;
+    let mut errors: Vec<Value> = Vec::new();
+    for t in tasks {
+        let Ok((label, result)) = t.await else {
+            continue;
+        };
+        match result {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                // 200 alone is not "healthy" for /v1/models — we
+                // need a valid JSON body containing a `data` array.
+                // Anything else (HTML error page, empty body, body
+                // missing `data`) is recorded as a per-backend
+                // error so `partial_errors` / `all_backends_failed`
+                // tell the truth instead of pretending the
+                // upstream answered.
+                match resp.json::<Value>().await {
+                    Ok(body) => match body.get("data").and_then(|d| d.as_array()) {
+                        Some(entries) => {
+                            any_ok = true;
+                            for mut entry in entries.clone() {
+                                if let Some(obj) = entry.as_object_mut() {
+                                    // Tag with the operator-chosen
+                                    // backend label so the caller
+                                    // knows which upstream serves
+                                    // which model. This overwrites
+                                    // any `owned_by` the upstream
+                                    // already set — by design, the
+                                    // operator's labels are the
+                                    // authority for routing.
+                                    obj.insert(
+                                        "owned_by".to_string(),
+                                        Value::String(label.clone()),
+                                    );
+                                }
+                                merged.push(entry);
+                            }
+                        }
+                        None => {
+                            errors.push(json!({
+                                "backend": label,
+                                "error": "200 OK but response body has no `data` array",
+                            }));
+                        }
+                    },
+                    Err(e) => {
+                        errors.push(json!({
+                            "backend": label,
+                            "error": format!("200 OK but JSON parse failed: {e}"),
+                        }));
+                    }
+                }
+            }
+            Ok(Ok(resp)) => {
+                errors.push(json!({
+                    "backend": label,
+                    "status": resp.status().as_u16(),
+                }));
+            }
+            Ok(Err(e)) => {
+                errors.push(json!({"backend": label, "error": e.to_string()}));
+            }
+            Err(_) => {
+                errors.push(json!({"backend": label, "error": "timeout"}));
             }
         }
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
+
+    if !any_ok {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": {
+                    "message": "every backend in the pool failed to list models",
+                    "type": "server_error",
+                    "code": "all_backends_failed",
+                    "errors": errors,
+                },
+            })),
+        )
+            .into_response();
+    }
+
+    let mut payload = json!({
+        "object": "list",
+        "data": merged,
+    });
+    if !errors.is_empty() {
+        // Surface partial failure so an operator who configured 3
+        // upstreams and only sees 2 backends' models in the list
+        // can tell that something went wrong, rather than assuming
+        // the third deployed nothing.
+        payload["partial_errors"] = Value::Array(errors);
+    }
+    Json(payload).into_response()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

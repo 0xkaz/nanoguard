@@ -23,7 +23,23 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let backend = backend::Backend::new(cfg.backend.clone());
+    // Resolve the multi-backend pool from TOML. `Config::pool()`
+    // handles legacy `[backend]` → synthesized `[backends.default]`
+    // migration, validates routing rule references, and emits
+    // operator-readable warnings (both schemas present, missing
+    // default, etc.) that we surface here instead of swallowing.
+    let (backend_pool_view, pool_warnings) = cfg.pool()?;
+    for w in &pool_warnings {
+        tracing::warn!("{w}");
+    }
+    let pool = backend::BackendPoolRuntime::build(&backend_pool_view);
+    let n_backends = pool.backends.len();
+    let default_label = pool.default_backend.clone();
+    tracing::info!(
+        "backends: {} configured (default = {})",
+        n_backends,
+        default_label
+    );
     let http_client = reqwest::Client::builder().use_rustls_tls().build()?;
 
     let budget = if cfg.budget.enabled {
@@ -68,7 +84,7 @@ async fn main() -> Result<()> {
     };
 
     let runtime = RuntimeHandles {
-        backend,
+        pool,
         http_client,
         budget,
         audit: audit_log,
@@ -82,8 +98,16 @@ async fn main() -> Result<()> {
     // are restart-only keys, so the values frozen here remain authoritative
     // for the process lifetime even if a later reload changes them on disk.
     let listen = cfg.nanoguard.listen.clone();
-    let provider = cfg.backend.provider.clone();
-    let endpoint = cfg.backend.endpoint.clone();
+    let default_backend_provider = backend_pool_view
+        .backends
+        .get(&default_label)
+        .map(|b| b.provider.clone())
+        .unwrap_or_default();
+    let default_backend_endpoint = backend_pool_view
+        .backends
+        .get(&default_label)
+        .map(|b| b.endpoint.clone())
+        .unwrap_or_default();
 
     // Routes that go through client-token verification (when
     // [auth].enabled = true; the middleware short-circuits otherwise).
@@ -131,7 +155,7 @@ async fn main() -> Result<()> {
 
     let addr = listen.parse::<std::net::SocketAddr>()?;
     tracing::info!("nanoguard listening on http://{addr}");
-    tracing::info!("backend: {provider} → {endpoint}");
+    tracing::info!("default backend: {default_backend_provider} → {default_backend_endpoint}");
 
     // Write PID file if configured, so the console can send SIGHUP.
     if let Some(ref pid_file) = cfg.reload.pid_file {

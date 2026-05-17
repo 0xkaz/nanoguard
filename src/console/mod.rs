@@ -187,6 +187,14 @@ pub async fn run(
         .route("/api/budget/limit", post(handlers::api_set_budget_limit))
         .route("/api/budget/reset", post(handlers::api_reset_budget_usage))
         .route(
+            "/api/backends",
+            get(handlers::api_list_backends).post(handlers::api_create_backend),
+        )
+        .route(
+            "/api/backends/:name",
+            put(handlers::api_update_backend).delete(handlers::api_delete_backend),
+        )
+        .route(
             "/api/users",
             get(handlers::api_list_users).post(handlers::api_create_user),
         )

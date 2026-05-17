@@ -20,7 +20,12 @@ use crate::{audit, backend, budget, client_auth, config, AppState};
 /// pattern as `[backend]`.
 #[derive(Clone)]
 pub struct RuntimeHandles {
-    pub backend: backend::Backend,
+    /// Resolved backend pool. Each entry's `reqwest::Client` is the
+    /// per-backend connection pool — preserved across hot reload
+    /// because orphaning a connection pool mid-request is unsafe.
+    /// Adding / removing backends is therefore restart-only;
+    /// `[routing]` changes ARE hot-reloadable (see `build_app_state`).
+    pub pool: backend::BackendPoolRuntime,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,
     pub audit: Option<Arc<audit::AuditLog>>,
@@ -196,6 +201,47 @@ pub fn build_app_state(mut cfg: config::Config, runtime: RuntimeHandles) -> Resu
         None
     };
 
+    // Hot reload semantics for the backend pool:
+    //   - [backends.*] map (= the Backend instances themselves) is
+    //     restart-only — preserved from `runtime.pool` to avoid
+    //     orphaning per-backend reqwest connection pools mid-request.
+    //   - [routing] (rules + default) IS hot-reloadable: we recompute
+    //     them from the freshly-parsed `cfg` and rebind so a SIGHUP
+    //     picks up new routing immediately.
+    let mut pool = runtime.pool.clone();
+    let (new_view, _warnings) = cfg.pool()?;
+
+    // Cross-validate the new routing against the LIVE pool: the
+    // operator may have added a [routing] rule whose backend is
+    // declared in the new [backends.*] but not yet running (because
+    // [backends.*] is restart-only). Reload-then-route-to-nothing
+    // would silently 400 every matching request. Refuse the reload
+    // with a clear reason so the operator sees the problem now
+    // (audit log gets a reload_failed entry), not in production
+    // when requests start failing.
+    for r in &new_view.rules {
+        if !pool.backends.contains_key(&r.backend) {
+            anyhow::bail!(
+                "[routing] rule for model `{}` references backend `{}` which is not in the LIVE pool. \
+                 Restart the proxy to pick up new [backends.*] entries before adding routes that reference them.",
+                r.model,
+                r.backend,
+            );
+        }
+    }
+    if !pool.backends.contains_key(&new_view.default_backend) {
+        anyhow::bail!(
+            "[routing].default = `{}` is not in the LIVE pool. \
+             Restart the proxy to pick up new [backends.*] entries before changing the default.",
+            new_view.default_backend,
+        );
+    }
+
+    // Validation passed — bind the refreshed routing-only fields.
+    // The runtime backend map stays as-is (restart-only).
+    pool.rules = new_view.rules;
+    pool.default_backend = new_view.default_backend;
+
     Ok(AppState {
         config: cfg,
         matchers,
@@ -205,7 +251,7 @@ pub fn build_app_state(mut cfg: config::Config, runtime: RuntimeHandles) -> Resu
         schema,
         tool_gate,
         policy: policy_index,
-        backend: runtime.backend,
+        pool,
         http_client: runtime.http_client,
         budget: runtime.budget,
         audit: runtime.audit,
@@ -425,6 +471,57 @@ fn reload_once(shared: &SharedState, runtime: &RuntimeHandles) -> anyhow::Result
 /// caller that has to deliver it. The list of restart-only keys here
 /// must stay in sync with `docs/design/hot-reload.md > What is not
 /// reloadable, and why` and with the `docs/operations.md` runbook.
+/// Compare two `Option<BackendConfig>` slots by some field accessor.
+/// Helper for the legacy `[backend]` drift detector.
+///
+/// Migration-aware: when either side is `None` (the operator either
+/// hadn't configured `[backend]` yet, or has migrated to
+/// `[backends.*]` and dropped the legacy section), we report "no
+/// change". Only when BOTH sides carry a `[backend]` and a field
+/// genuinely differs does this return true. The earlier
+/// implementation flagged `Some(_)` → `None` as drift, which
+/// produced noisy "[backend].provider changed" warnings on every
+/// SIGHUP during migration.
+#[cfg(unix)]
+fn backend_changed<F>(
+    live: &Option<crate::config::BackendConfig>,
+    new: &Option<crate::config::BackendConfig>,
+    f: F,
+) -> bool
+where
+    F: Fn(&Option<crate::config::BackendConfig>) -> Option<&str>,
+{
+    match (live.is_some(), new.is_some()) {
+        (true, true) => f(live) != f(new),
+        _ => false,
+    }
+}
+
+/// Detect whether the `[backends.*]` map structure (label set,
+/// provider/endpoint/api_key/model for each entry) differs between
+/// two configs. Used to fire the restart-only drift warning when an
+/// operator edited the pool definition while the proxy was running.
+#[cfg(unix)]
+fn same_backend_map(
+    a: &std::collections::BTreeMap<String, crate::config::BackendConfig>,
+    b: &std::collections::BTreeMap<String, crate::config::BackendConfig>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (k, av) in a {
+        let Some(bv) = b.get(k) else { return false };
+        if av.provider != bv.provider
+            || av.endpoint != bv.endpoint
+            || av.api_key != bv.api_key
+            || av.model != bv.model
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(unix)]
 fn warn_on_restart_only_drift(live: &crate::config::Config, new: &crate::config::Config) {
     let mut ignored: Vec<&'static str> = Vec::new();
@@ -435,17 +532,38 @@ fn warn_on_restart_only_drift(live: &crate::config::Config, new: &crate::config:
     if live.nanoguard.log_level != new.nanoguard.log_level {
         ignored.push("[nanoguard].log_level");
     }
-    if live.backend.provider != new.backend.provider {
+    // Legacy single `[backend]` drift. Only fires when the operator
+    // is still on the pre-multi-backend schema. With `[backends.*]`
+    // configured, `live.backend` and `new.backend` are both None and
+    // the comparison short-circuits.
+    if backend_changed(&live.backend, &new.backend, |b| {
+        b.as_ref().map(|c| c.provider.as_str())
+    }) {
         ignored.push("[backend].provider");
     }
-    if live.backend.endpoint != new.backend.endpoint {
+    if backend_changed(&live.backend, &new.backend, |b| {
+        b.as_ref().map(|c| c.endpoint.as_str())
+    }) {
         ignored.push("[backend].endpoint");
     }
-    if live.backend.api_key != new.backend.api_key {
+    if live.backend.as_ref().and_then(|c| c.api_key.as_deref())
+        != new.backend.as_ref().and_then(|c| c.api_key.as_deref())
+    {
         ignored.push("[backend].api_key");
     }
-    if live.backend.model != new.backend.model {
+    if live.backend.as_ref().and_then(|c| c.model.as_deref())
+        != new.backend.as_ref().and_then(|c| c.model.as_deref())
+    {
         ignored.push("[backend].model");
+    }
+
+    // Multi-backend pool drift. [backends.*] is restart-only — the
+    // Backend instances own per-backend reqwest connection pools,
+    // and adding/removing pool entries mid-flight would risk
+    // mid-request orphaning. [routing] IS hot-reloadable, so we
+    // skip it here.
+    if !same_backend_map(&live.backends, &new.backends) {
+        ignored.push("[backends.*]");
     }
     if live.budget.enabled != new.budget.enabled {
         ignored.push("[budget].enabled");
@@ -551,12 +669,14 @@ mod tests {
 
         let cfg = crate::config::Config {
             nanoguard: crate::config::ServerConfig::default(),
-            backend: crate::config::BackendConfig {
+            backend: Some(crate::config::BackendConfig {
                 provider: "ollama".to_string(),
                 endpoint: "http://localhost:11434".to_string(),
                 api_key: None,
                 model: None,
-            },
+            }),
+            backends: std::collections::BTreeMap::new(),
+            routing: crate::config::RoutingConfig::default(),
             input: crate::config::InputConfig::default(),
             output: crate::config::OutputConfig::default(),
             budget: crate::config::BudgetConfig::default(),
@@ -577,10 +697,11 @@ mod tests {
             },
             reload: crate::config::ReloadConfig::default(),
         };
-        let backend = crate::backend::Backend::new(cfg.backend.clone());
+        let (pool_view, _) = cfg.pool().expect("test config produces a backend pool");
+        let pool = crate::backend::BackendPoolRuntime::build(&pool_view);
         let http_client = reqwest::Client::new();
         let runtime = RuntimeHandles {
-            backend,
+            pool,
             http_client,
             budget: None,
             audit: None,
@@ -623,12 +744,14 @@ mod tests {
 
         let cfg = crate::config::Config {
             nanoguard: crate::config::ServerConfig::default(),
-            backend: crate::config::BackendConfig {
+            backend: Some(crate::config::BackendConfig {
                 provider: "ollama".to_string(),
                 endpoint: "http://localhost:11434".to_string(),
                 api_key: None,
                 model: None,
-            },
+            }),
+            backends: std::collections::BTreeMap::new(),
+            routing: crate::config::RoutingConfig::default(),
             input: crate::config::InputConfig::default(),
             output: crate::config::OutputConfig::default(),
             budget: crate::config::BudgetConfig::default(),
@@ -649,10 +772,11 @@ mod tests {
             },
             reload: crate::config::ReloadConfig::default(),
         };
-        let backend = crate::backend::Backend::new(cfg.backend.clone());
+        let (pool_view, _) = cfg.pool().expect("test config produces a backend pool");
+        let pool = crate::backend::BackendPoolRuntime::build(&pool_view);
         let http_client = reqwest::Client::new();
         let runtime = RuntimeHandles {
-            backend,
+            pool,
             http_client,
             budget: None,
             audit: None,

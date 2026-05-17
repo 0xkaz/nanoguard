@@ -2697,6 +2697,433 @@ kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
 
 
+# --- 35. Multi-backend routing: model→backend dispatch -------------------
+# docs/design/multi-backend-routing.md ships. Two mock backends on
+# different ports, two [routing] rules, and the proxy must dispatch
+# each request to the right backend based on the body's `model`.
+info "scenario 35: multi-backend routing dispatches by model"
+
+# Tear down the previous proxy so 35 starts clean. Also pgrep-sweep
+# any nanoguard that might still be holding :$NG_PORT from a flaky
+# earlier scenario — without this sweep, the new proxy's bind fails
+# with EADDRINUSE and the assertions further down get served by the
+# old process pointing at the old mock.
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
+    kill -9 "$pid" 2>/dev/null || true
+done
+sleep 0.5
+
+S35_DIR="$LOGDIR/e2e.s35.workdir"
+rm -rf "$S35_DIR"
+mkdir -p "$S35_DIR"
+
+S35_PROXY_LOG="$LOGDIR/ng.s35.proxy.log"
+S35_TOML="$S35_DIR/nanoguard.toml"
+S35_MOCK_A_PORT=11601
+S35_MOCK_B_PORT=11602
+S35_MOCK_A_LOG="$LOGDIR/mock.s35.a.log"
+S35_MOCK_B_LOG="$LOGDIR/mock.s35.b.log"
+
+# Spawn two labelled mock backends on different ports. We rely on
+# BACKEND_LABEL (added to tools/mock_backend.py in this PR) so the
+# response body tells us which mock answered.
+BACKEND_LABEL="A" python3 "$MOCK" "$S35_MOCK_A_PORT" > "$S35_MOCK_A_LOG" 2>&1 &
+S35_MOCK_A_PID=$!
+BACKEND_LABEL="B" python3 "$MOCK" "$S35_MOCK_B_PORT" > "$S35_MOCK_B_LOG" 2>&1 &
+S35_MOCK_B_PID=$!
+sleep 0.5
+
+cat > "$S35_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[backends.alpha]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S35_MOCK_A_PORT"
+
+[backends.beta]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S35_MOCK_B_PORT"
+
+[routing]
+default = "alpha"
+rules = [
+    { model = "fast-*",   backend = "beta"  },
+    { model = "premium",  backend = "alpha" },
+]
+EOF
+
+NANOGUARD_CONFIG="$S35_TOML" "$BIN" > "$S35_PROXY_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "35-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+
+# 35a. Exact-match rule: `model: premium` → backend `alpha`.
+RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"premium","messages":[{"role":"user","content":"hello-35a"}]}')
+ECHO_A=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+case "$ECHO_A" in
+    "[A] You said: hello-35a") ok "35a. premium → alpha (mock A answered)" ;;
+    *) ng "35a. expected mock A's echo; got: $ECHO_A" ;;
+esac
+
+# 35b. Glob rule: `model: fast-foo` → backend `beta`.
+RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"fast-foo","messages":[{"role":"user","content":"hello-35b"}]}')
+ECHO_B=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+case "$ECHO_B" in
+    "[B] You said: hello-35b") ok "35b. fast-* glob → beta (mock B answered)" ;;
+    *) ng "35b. expected mock B's echo; got: $ECHO_B" ;;
+esac
+
+# 35c. No rule matches → fallback to [routing].default = alpha.
+RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"unknown-model","messages":[{"role":"user","content":"hello-35c"}]}')
+ECHO_C=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+case "$ECHO_C" in
+    "[A] You said: hello-35c") ok "35c. unmatched model falls back to routing.default = alpha" ;;
+    *) ng "35c. expected fallback to mock A; got: $ECHO_C" ;;
+esac
+
+# 35d. /api/overview surfaces both backends + the routing table.
+# Need to spawn a console for this — share the same TOML.
+S35_CONSOLE_PORT=18090
+S35_CONSOLE_URL="http://127.0.0.1:$S35_CONSOLE_PORT"
+S35_CONSOLE_LOG="$LOGDIR/ng.s35.console.log"
+S35_COOKIES="$LOGDIR/e2e.s35.cookies"
+S35_DB="$S35_DIR/nanoguard.db"
+rm -f "$S35_COOKIES"
+cat >> "$S35_TOML" <<EOF
+
+[budget]
+enabled = false
+db_path = "$S35_DB"
+
+[console]
+listen = "127.0.0.1:$S35_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S35_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S35_BOOTSTRAP_PW" }
+EOF
+
+S35_PW="s35-pw-$(openssl rand -hex 8)"
+(cd "$S35_DIR" && NANOGUARD_CONFIG="$S35_TOML" \
+    S35_BOOTSTRAP_PW="$S35_PW" \
+    "$CONSOLE_BIN" > "$S35_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+wait_for_url "35-pre. console boot" "$S35_CONSOLE_URL/" 15 || exit 1
+
+curl -s -o /dev/null -c "$S35_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S35_PW\"}" \
+    "$S35_CONSOLE_URL/api/login"
+OV=$(curl -s -b "$S35_COOKIES" "$S35_CONSOLE_URL/api/overview")
+N_BACKENDS=$(echo "$OV" | jq -r '.backends | length')
+assert_eq "35d. /api/overview reports 2 backends" "$N_BACKENDS" "2"
+
+ROUTING_DEFAULT=$(echo "$OV" | jq -r '.routing.default')
+assert_eq "35d-default. routing default is alpha" "$ROUTING_DEFAULT" "alpha"
+
+N_RULES=$(echo "$OV" | jq -r '.routing.rules | length')
+assert_eq "35d-rules. routing has 2 rules" "$N_RULES" "2"
+
+# 35e. /v1/models aggregates the pool. Each backend's response
+# carries its label as `owned_by`, so a single GET /v1/models tells
+# the operator which upstream serves what.
+MODELS=$(curl -s "$NG_URL/v1/models")
+N_MODELS=$(echo "$MODELS" | jq -r '.data | length')
+case "$N_MODELS" in
+    [1-9]*) ok "35e. /v1/models aggregates across the pool (count = $N_MODELS)" ;;
+    *)      ng "35e. /v1/models returned no entries: $MODELS" ;;
+esac
+
+# At least one entry should be tagged with each backend label.
+HAS_ALPHA=$(echo "$MODELS" | jq -r '[.data[] | select(.owned_by == "alpha")] | length')
+HAS_BETA=$(echo "$MODELS" | jq -r '[.data[] | select(.owned_by == "beta")] | length')
+case "$HAS_ALPHA$HAS_BETA" in
+    0*|*0) ng "35e-labels. expected models tagged with both backend labels; got alpha=$HAS_ALPHA beta=$HAS_BETA" ;;
+    *)     ok "35e-labels. /v1/models entries are tagged with backend labels" ;;
+esac
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+kill "$S35_MOCK_A_PID" "$S35_MOCK_B_PID" 2>/dev/null || true
+wait "$S35_MOCK_A_PID" "$S35_MOCK_B_PID" 2>/dev/null || true
+
+# 35f. Strict default: two backends without [routing].default MUST
+# refuse to start. Without this guard the proxy silently picked
+# `BTreeMap-first` (alphabetical), and a typo'd model name would
+# leak to whatever backend happened to sort first.
+S35_BAD_TOML="$S35_DIR/no-default.toml"
+sed '/^default = /d' "$S35_TOML" > "$S35_BAD_TOML"
+sleep 0.3
+S35_BAD_LOG="$LOGDIR/ng.s35.bad.log"
+NANOGUARD_CONFIG="$S35_BAD_TOML" "$BIN" > "$S35_BAD_LOG" 2>&1 &
+BAD_PID=$!
+sleep 0.6
+if kill -0 "$BAD_PID" 2>/dev/null; then
+    ng "35f. proxy started without [routing].default with 2 backends — should have refused"
+    kill "$BAD_PID" 2>/dev/null
+else
+    if grep -q "\[routing\].default is required" "$S35_BAD_LOG"; then
+        ok "35f. proxy refuses to start without [routing].default when N>1"
+    else
+        ng "35f. proxy exited but for the wrong reason; log: $(tail -3 "$S35_BAD_LOG" | tr '\n' ' ')"
+    fi
+fi
+wait "$BAD_PID" 2>/dev/null || true
+
+# --- 36. Console Backends tab — list / create / delete via API ----------
+# Scenario 35 proved routing on the proxy side; 36 walks the Console
+# UI handlers an operator clicks through. The API mutations rewrite
+# nanoguard.toml on disk via toml_edit; the proxy live pool is
+# restart-only, so the mutation surfaces in /api/backends and on
+# disk, but the proxy keeps using its existing pool until restart.
+# That contract is exactly what the assertions below pin.
+info "scenario 36: Console Backends tab — list / create / delete"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
+    kill -9 "$pid" 2>/dev/null || true
+done
+sleep 0.5
+
+S36_DIR="$LOGDIR/e2e.s36.workdir"
+rm -rf "$S36_DIR"
+mkdir -p "$S36_DIR"
+
+S36_CONSOLE_PORT=18091
+S36_CONSOLE_URL="http://127.0.0.1:$S36_CONSOLE_PORT"
+S36_TOML="$S36_DIR/nanoguard.toml"
+S36_DB="$S36_DIR/nanoguard.db"
+S36_PROXY_LOG="$LOGDIR/ng.s36.proxy.log"
+S36_CONSOLE_LOG="$LOGDIR/ng.s36.console.log"
+S36_COOKIES="$LOGDIR/e2e.s36.cookies"
+S36_RELOAD_SOCK="$LOGDIR/e2e.s36.reload.sock"
+rm -f "$S36_COOKIES" "$S36_RELOAD_SOCK"
+
+cat > "$S36_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[backends.starter]
+provider = "openai"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+
+[routing]
+default = "starter"
+
+[budget]
+enabled = false
+db_path = "$S36_DB"
+
+[reload]
+socket = "$S36_RELOAD_SOCK"
+
+[console]
+listen = "127.0.0.1:$S36_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S36_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S36_BOOTSTRAP_PW" }
+EOF
+
+(cd "$S36_DIR" && NANOGUARD_CONFIG="$S36_TOML" "$BIN" > "$S36_PROXY_LOG" 2>&1) &
+NG_PID=$!
+wait_for_url "36-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+
+S36_PW="s36-pw-$(openssl rand -hex 8)"
+(cd "$S36_DIR" && NANOGUARD_CONFIG="$S36_TOML" \
+    S36_BOOTSTRAP_PW="$S36_PW" \
+    "$CONSOLE_BIN" > "$S36_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+wait_for_url "36-pre. console boot" "$S36_CONSOLE_URL/" 15 || exit 1
+
+LOGIN=$(curl -s -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S36_PW\"}" \
+    "$S36_CONSOLE_URL/api/login")
+S36_CSRF=$(echo "$LOGIN" | jq -r '.csrf_token // empty')
+
+# 36a. GET /api/backends lists the bootstrap backend.
+RESP=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/backends")
+N=$(echo "$RESP" | jq -r '.data | length')
+assert_eq "36a. GET /api/backends lists 1 backend" "$N" "1"
+DEF=$(echo "$RESP" | jq -r '.default')
+assert_eq "36a-default. default backend is `starter`" "$DEF" "starter"
+
+# 36b. POST /api/backends creates a new entry. The mutation lands in
+# nanoguard.toml on disk (toml_edit round-trip preserves other
+# sections); the proxy's live pool is restart-only, so /api/backends
+# from the *console* sees it via re-parsing the updated TOML on the
+# next request.
+ADD_HDR="$LOGDIR/e2e.s36.add.hdr"
+ADD=$(curl -s -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -D "$ADD_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S36_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11700"}' \
+    "$S36_CONSOLE_URL/api/backends?name=secondary")
+RESTART=$(echo "$ADD" | jq -r '.restart_required // empty')
+assert_eq "36b. POST /api/backends reports restart_required = true" "$RESTART" "true"
+
+# Refresh CSRF for subsequent mutations.
+S36_CSRF=$(grep -i '^x-csrf-token-next:' "$ADD_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S36_CSRF" ] && S36_CSRF=$(echo "$LOGIN" | jq -r '.csrf_token // empty')
+
+# 36c. The new backend appears in nanoguard.toml.
+if grep -q '^\[backends.secondary\]' "$S36_TOML"; then
+    ok "36c. nanoguard.toml now contains [backends.secondary]"
+else
+    ng "36c. [backends.secondary] not found in $S36_TOML"
+fi
+
+# 36d. The /api/backends list now reflects 2 entries.
+N=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/backends" | jq -r '.data | length')
+assert_eq "36d. /api/backends now lists 2 backends" "$N" "2"
+
+# 36e. POST again with the same name is 409 Conflict.
+DUP=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S36_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11700"}' \
+    "$S36_CONSOLE_URL/api/backends?name=secondary")
+assert_eq "36e. duplicate POST returns 409" "$DUP" "409"
+
+# 36f. DELETE the new backend.
+DEL_HDR="$LOGDIR/e2e.s36.del.hdr"
+DEL=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -D "$DEL_HDR" \
+    -X DELETE \
+    -H "X-CSRF-Token: $S36_CSRF" \
+    "$S36_CONSOLE_URL/api/backends/secondary")
+assert_eq "36f. DELETE /api/backends/secondary returns 200" "$DEL" "200"
+
+S36_CSRF=$(grep -i '^x-csrf-token-next:' "$DEL_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S36_CSRF" ] && S36_CSRF=$(echo "$LOGIN" | jq -r '.csrf_token // empty')
+
+# 36g. DELETE of the default backend is refused with 409.
+DEL_DEF=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -X DELETE \
+    -H "X-CSRF-Token: $S36_CSRF" \
+    "$S36_CONSOLE_URL/api/backends/starter")
+assert_eq "36g. deleting the routing default is rejected (409)" "$DEL_DEF" "409"
+
+# 36h. Non-admin cannot manage backends. Spawn a viewer.
+S36_VIEWER_PW="s36-viewer-$(openssl rand -hex 8)"
+curl -s -o /dev/null -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S36_CSRF" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S36_VIEWER_PW\",\"role\":\"user\"}" \
+    "$S36_CONSOLE_URL/api/users"
+S36_VIEWER_COOKIES="$LOGDIR/e2e.s36.viewer.cookies"
+rm -f "$S36_VIEWER_COOKIES"
+VLOGIN=$(curl -s -c "$S36_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S36_VIEWER_PW\"}" \
+    "$S36_CONSOLE_URL/api/login")
+V_CSRF=$(echo "$VLOGIN" | jq -r '.csrf_token // empty')
+
+V_LIST=$(curl -s -o /dev/null -w "%{http_code}" -b "$S36_VIEWER_COOKIES" \
+    "$S36_CONSOLE_URL/api/backends")
+assert_eq "36h. viewer GET /api/backends is 403" "$V_LIST" "403"
+
+V_ADD=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S36_VIEWER_COOKIES" -c "$S36_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $V_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11700"}' \
+    "$S36_CONSOLE_URL/api/backends?name=v-add")
+assert_eq "36i. viewer POST /api/backends is 403" "$V_ADD" "403"
+
+# 36j-l. api_key 3-state: omit / null / string. Seed a backend with
+# a known key, then exercise each path.
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+curl -s -o /dev/null -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11700","api_key":"sk-initial"}' \
+    "$S36_CONSOLE_URL/api/backends?name=keyed"
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# Omit api_key on PUT → should keep "sk-initial".
+curl -s -o /dev/null -X PUT -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11701"}' \
+    "$S36_CONSOLE_URL/api/backends/keyed"
+KEPT=$(grep -A 4 '^\[backends.keyed\]' "$S36_TOML" | grep '^api_key' | head -n1)
+case "$KEPT" in
+    *'sk-initial'*) ok "36j. api_key omit keeps stored key (sk-initial)" ;;
+    *) ng "36j. api_key omit cleared or mangled the stored key; got: $KEPT" ;;
+esac
+
+# Explicit null → should clear.
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+curl -s -o /dev/null -X PUT -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11701","api_key":null}' \
+    "$S36_CONSOLE_URL/api/backends/keyed"
+if grep -A 4 '^\[backends.keyed\]' "$S36_TOML" | grep -q '^api_key'; then
+    ng "36k. api_key null did not clear the stored key"
+else
+    ok "36k. api_key explicit null clears the stored key"
+fi
+
+# String → should replace.
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+curl -s -o /dev/null -X PUT -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11701","api_key":"sk-rotated"}' \
+    "$S36_CONSOLE_URL/api/backends/keyed"
+ROTATED=$(grep -A 4 '^\[backends.keyed\]' "$S36_TOML" | grep '^api_key' | head -n1)
+case "$ROTATED" in
+    *'sk-rotated'*) ok "36l. api_key string value replaces the stored key" ;;
+    *) ng "36l. api_key string did not replace; got: $ROTATED" ;;
+esac
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

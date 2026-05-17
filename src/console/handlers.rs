@@ -1072,6 +1072,519 @@ pub async fn api_reset_budget_usage(
         .into_response()
 }
 
+// ── API: Backends (admin only) — multi-backend routing ────────────────────
+//
+// These handlers read and rewrite the `[backends.*]` section of
+// `nanoguard.toml` on disk. The proxy's live backend pool is
+// restart-only (see docs/design/multi-backend-routing.md > State
+// management — orphaning a `reqwest` connection pool mid-request is
+// unsafe), so a "Save" here updates the on-disk config and fires a
+// reload trigger, but the proxy's live pool only picks up
+// new/removed entries on the next process restart. Routing rules
+// (the `[routing]` section) ARE hot-reloadable; those land in a
+// separate handler.
+//
+// The handlers use `toml_edit` to round-trip the TOML so unrelated
+// sections, comments, and whitespace stay verbatim. Atomic rename
+// + reload trigger come from the same helpers the file-edit
+// machinery uses.
+
+/// Backend create/update request body.
+///
+/// `api_key` is a deliberate three-state value to avoid the
+/// "operator hit Save without retyping the key and we silently
+/// cleared it" footgun:
+///
+/// - field omitted from JSON  → `None`           → keep stored key
+/// - `"api_key": null`        → `Some(None)`     → clear stored key
+/// - `"api_key": "sk-..."`    → `Some(Some(s))`  → replace with `s`
+///
+/// `serde(default, with = ...)` realizes the distinction via the
+/// double-Option deserializer below.
+#[derive(Deserialize)]
+pub struct BackendUpsertRequest {
+    pub provider: String,
+    pub endpoint: String,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub api_key: Option<Option<String>>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+fn deserialize_some_option<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // If the field is present, deserialize as Option<String> (null
+    // becomes Some(None) via the outer Option wrapping). If the
+    // field is absent, serde's `default` short-circuits to None,
+    // which the handler reads as "keep current".
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// Re-parse nanoguard.toml from disk. The ConsoleState holds the
+/// startup snapshot for stable reads, but Backend CRUD writes the
+/// on-disk file and we need to see those writes in subsequent
+/// reads without a process restart. Used by the Backends handlers
+/// for both the list and the existence checks.
+fn fresh_config() -> anyhow::Result<crate::config::Config> {
+    crate::config::Config::from_env_or_default()
+}
+
+/// `GET /api/backends` — list configured backends. Admin-only;
+/// listing backends reveals upstream provider URLs and is not
+/// information a viewer-role user needs.
+pub async fn api_list_backends(
+    State(_state): State<Arc<ConsoleState>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    if let Err(e) = require_admin(&user) {
+        return *e;
+    }
+
+    let cfg = match fresh_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("re-parse failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let (pool_view, _) = match cfg.pool() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("config invalid: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let data: Vec<serde_json::Value> = pool_view
+        .backends
+        .iter()
+        .map(|(name, b)| {
+            json!({
+                "name": name,
+                "provider": b.provider,
+                "endpoint": b.endpoint,
+                "model": b.model,
+                "has_api_key": b.api_key.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                "is_default": name == &pool_view.default_backend,
+            })
+        })
+        .collect();
+    Json(json!({"data": data, "default": pool_view.default_backend})).into_response()
+}
+
+/// `POST /api/backends?name=<name>` — add a backend. Returns 409 if
+/// `<name>` already exists.
+pub async fn api_create_backend(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Query(q): Query<BackendNameQuery>,
+    Json(body): Json<BackendUpsertRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let name = q.name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "name query parameter is required"})),
+        )
+            .into_response();
+    }
+    if let Err(msg) = validate_backend_name(name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    }
+    if let Err(msg) = validate_backend_body(&body) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    }
+
+    let cfg = match fresh_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e:#}")})),
+            )
+                .into_response();
+        }
+    };
+    if cfg.backends.contains_key(name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!("backend `{name}` already exists; PUT to update")})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = upsert_backend_in_toml(name, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+            .into_response();
+    }
+
+    record_backend_mutation(&state, &admin, "backend_create", name, Some(&body));
+    let reload = super::reload::trigger_reload(&state.config.reload);
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::CREATED,
+        headers,
+        Json(json!({
+            "name": name,
+            "restart_required": true,
+            "reload": reload_outcome_json(&reload),
+        })),
+    )
+        .into_response()
+}
+
+/// `PUT /api/backends/:name` — replace a backend's fields. 404 when
+/// the backend does not exist.
+pub async fn api_update_backend(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Path(name): Path<String>,
+    Json(body): Json<BackendUpsertRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    if let Err(msg) = validate_backend_name(&name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    }
+    if let Err(msg) = validate_backend_body(&body) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    }
+
+    let cfg = match fresh_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e:#}")})),
+            )
+                .into_response();
+        }
+    };
+    if !cfg.backends.contains_key(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("backend `{name}` not found")})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = upsert_backend_in_toml(&name, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+            .into_response();
+    }
+
+    record_backend_mutation(&state, &admin, "backend_update", &name, Some(&body));
+    let reload = super::reload::trigger_reload(&state.config.reload);
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({
+            "name": name,
+            "restart_required": true,
+            "reload": reload_outcome_json(&reload),
+        })),
+    )
+        .into_response()
+}
+
+/// `DELETE /api/backends/:name` — drop a backend from the TOML.
+/// Refuses to remove the routing default; the operator must point
+/// `[routing].default` at a different label first.
+pub async fn api_delete_backend(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+    let cfg = match fresh_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e:#}")})),
+            )
+                .into_response();
+        }
+    };
+    if !cfg.backends.contains_key(&name) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("backend `{name}` not found")})),
+        )
+            .into_response();
+    }
+    if cfg.routing.default.as_deref() == Some(name.as_str()) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!(
+                "cannot delete backend `{name}`: it is the routing default. \
+                 Change [routing].default first."
+            )})),
+        )
+            .into_response();
+    }
+    if cfg.routing.rules.iter().any(|r| r.backend == name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!(
+                "cannot delete backend `{name}`: at least one [routing] rule references it. \
+                 Update the rules first."
+            )})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = delete_backend_in_toml(&name) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+            .into_response();
+    }
+
+    record_backend_mutation(&state, &admin, "backend_delete", &name, None);
+    let reload = super::reload::trigger_reload(&state.config.reload);
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({
+            "name": name,
+            "restart_required": true,
+            "reload": reload_outcome_json(&reload),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct BackendNameQuery {
+    pub name: String,
+}
+
+fn validate_backend_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("backend name cannot be empty".into());
+    }
+    if name.len() > 64 {
+        return Err("backend name too long (max 64 chars)".into());
+    }
+    // Keep names TOML-bare-key-safe so the round-trip stays sane: a
+    // name that needs quoting would force us to choose a quoting
+    // style and roundtrip it through toml_edit's escape logic; not
+    // worth the surface for an operator label.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("backend name must match [A-Za-z0-9_-]+".into());
+    }
+    Ok(())
+}
+
+fn validate_backend_body(body: &BackendUpsertRequest) -> std::result::Result<(), String> {
+    match body.provider.as_str() {
+        "openai" | "anthropic" | "ollama" => {}
+        other => {
+            return Err(format!(
+                "unknown provider `{other}` (openai|anthropic|ollama)"
+            ))
+        }
+    }
+    let endpoint = body.endpoint.trim();
+    if endpoint.is_empty() {
+        return Err("endpoint cannot be empty".into());
+    }
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return Err("endpoint must start with http:// or https://".into());
+    }
+    Ok(())
+}
+
+/// Round-trip `nanoguard.toml`: parse via `toml_edit::DocumentMut`
+/// so comments/whitespace stay verbatim, insert or replace the
+/// `[backends.<name>]` section, atomically rename. Backed up to
+/// `.nanoguard-backups/` like every other config edit.
+fn upsert_backend_in_toml(name: &str, body: &BackendUpsertRequest) -> anyhow::Result<()> {
+    use std::fs;
+    // Honor NANOGUARD_CONFIG when set so e2e (and operators with a
+    // non-default config location) actually edit the file the proxy
+    // reads, not a hard-coded "nanoguard.toml" in the CWD.
+    let path_owned =
+        std::env::var("NANOGUARD_CONFIG").unwrap_or_else(|_| "nanoguard.toml".to_string());
+    let path = path_owned.as_str();
+    let original = fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+    let mut doc = original
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+
+    let backends_section = doc
+        .entry("backends")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let backends_tbl = backends_section
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[backends] in {path} is not a table"))?;
+    // Make [backends] itself implicit so it does not render as a
+    // standalone empty header — only [backends.NAME] subtables show.
+    backends_tbl.set_implicit(true);
+
+    // Preserve the existing entry if there is one — so the api_key
+    // 3-state semantics work: "keep current" leaves the stored value
+    // exactly as it was on disk. A full insert would silently drop
+    // any field not explicitly sent in the request.
+    let existing = backends_tbl
+        .get(name)
+        .and_then(|i| i.as_table())
+        .cloned()
+        .unwrap_or_default();
+    let mut entry = existing;
+
+    entry.insert("provider", toml_edit::value(body.provider.clone()));
+    entry.insert("endpoint", toml_edit::value(body.endpoint.clone()));
+    match &body.api_key {
+        // Omitted: keep stored key. No mutation.
+        None => {}
+        // Explicit null: clear stored key.
+        Some(None) => {
+            entry.remove("api_key");
+        }
+        // String: replace.
+        Some(Some(k)) => {
+            entry.insert("api_key", toml_edit::value(k.clone()));
+        }
+    }
+    // `model` mirrors `api_key`'s "field omitted = keep current"
+    // rule. Since `entry` is the cloned existing table, doing
+    // nothing here preserves the prior model field. If serde
+    // someday gives `model` the same 3-state shape, switch this
+    // branch to follow.
+    if let Some(ref m) = body.model {
+        entry.insert("model", toml_edit::value(m.clone()));
+    }
+    backends_tbl.insert(name, toml_edit::Item::Table(entry));
+
+    let serialized = doc.to_string();
+    super::edit::atomic_write(path, &serialized, |_| super::edit::ValidationResult {
+        valid: true,
+        error: None,
+    })?;
+    Ok(())
+}
+
+fn delete_backend_in_toml(name: &str) -> anyhow::Result<()> {
+    use std::fs;
+    let path_owned =
+        std::env::var("NANOGUARD_CONFIG").unwrap_or_else(|_| "nanoguard.toml".to_string());
+    let path = path_owned.as_str();
+    let original = fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+    let mut doc = original
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+
+    if let Some(backends) = doc.get_mut("backends").and_then(|i| i.as_table_mut()) {
+        backends.remove(name);
+    }
+
+    let serialized = doc.to_string();
+    super::edit::atomic_write(path, &serialized, |_| super::edit::ValidationResult {
+        valid: true,
+        error: None,
+    })?;
+    Ok(())
+}
+
+fn record_backend_mutation(
+    state: &Arc<ConsoleState>,
+    admin: &crate::console::db::User,
+    action: &str,
+    name: &str,
+    body: Option<&BackendUpsertRequest>,
+) {
+    if let Some(ref log) = state.audit_log {
+        let mut rec = MutationRecord::new(
+            &admin.username,
+            admin.id,
+            action,
+            format!(
+                "{} {} backend `{}`",
+                admin.username,
+                action.trim_start_matches("backend_"),
+                name
+            ),
+        )
+        .with_target(name.to_string());
+        if let Some(b) = body {
+            // The audit shape for api_key reflects the request
+            // intent, NOT the stored result — because the stored
+            // value depends on the pre-mutation state (which the
+            // audit writer doesn't see). null/false = caller asked
+            // to clear; string/true = caller sent a new value;
+            // omitted = caller asked to keep current. Operators
+            // reading the audit log get the action, not just the
+            // resulting state.
+            let api_key_intent = match &b.api_key {
+                None => json!("keep"),
+                Some(None) => json!("clear"),
+                Some(Some(_)) => json!("replace"),
+            };
+            rec = rec.with_after(json!({
+                "name": name,
+                "provider": b.provider,
+                "endpoint": b.endpoint,
+                "api_key_intent": api_key_intent,
+                "model": b.model,
+            }));
+        }
+        log.record_mutation(&rec);
+    }
+}
+
+fn reload_outcome_json(reload: &super::reload::ReloadOutcome) -> serde_json::Value {
+    json!({
+        "triggered": reload.triggered,
+        "method": reload.method,
+        "error": reload.error,
+    })
+}
+
 // ── API: Overview / getting-started summary ────────────────────────────────
 
 /// `GET /api/overview` — a single read-only snapshot the SPA needs to
@@ -1198,14 +1711,62 @@ pub async fn api_overview(
         },
     }));
 
-    // Backend digest. Multi-backend routing is still proposed
-    // (docs/design/multi-backend-routing.md), so today this is one
-    // upstream, surfaced for completeness.
-    let backend = json!({
-        "provider": cfg.backend.provider,
-        "endpoint": cfg.backend.endpoint,
-        "model": cfg.backend.model,
+    // Backend digest. Multi-backend routing is shipped: resolve the
+    // pool view (with legacy [backend] → "default" synthesis) and
+    // return one entry per backend label plus the routing table.
+    let (pool_view, _) = cfg.pool().unwrap_or_else(|_| {
+        // Pool resolution failed (e.g. routing rule pointing at an
+        // unknown backend). The proxy is unlikely to be up either,
+        // but rather than 500 the overview endpoint we return an
+        // empty pool so the SPA can still render the rest of the
+        // dashboard. The error will already be in the startup log.
+        (
+            crate::config::BackendPool {
+                backends: std::collections::BTreeMap::new(),
+                rules: Vec::new(),
+                default_backend: String::new(),
+            },
+            Vec::new(),
+        )
     });
+
+    let backends: Vec<serde_json::Value> = pool_view
+        .backends
+        .iter()
+        .map(|(name, b)| {
+            json!({
+                "name": name,
+                "provider": b.provider,
+                "endpoint": b.endpoint,
+                "model": b.model,
+                "is_default": name == &pool_view.default_backend,
+            })
+        })
+        .collect();
+    let routing = json!({
+        "default": pool_view.default_backend,
+        "rules": pool_view.rules.iter().map(|r| json!({
+            "model": r.model,
+            "backend": r.backend,
+        })).collect::<Vec<_>>(),
+    });
+    // Legacy single-backend digest stays under `backend` for SPA
+    // compatibility. Pick the routing default rather than
+    // `backends.first()` — with multiple backends `.first()` is
+    // BTreeMap-alphabetical, which lies to old SPA builds about
+    // which upstream is actually serving unmatched requests. The
+    // default is what those callers used to see when only one
+    // backend was configured.
+    let backend = backends
+        .iter()
+        .find(|b| {
+            b.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n == pool_view.default_backend)
+        })
+        .cloned()
+        .or_else(|| backends.first().cloned())
+        .unwrap_or_else(|| json!({}));
 
     // Count this user's live (non-revoked) tokens so the SPA can
     // say "you have N tokens" inline, without making the operator
@@ -1224,6 +1785,8 @@ pub async fn api_overview(
             "env_marker": env_marker,
         },
         "backend": backend,
+        "backends": backends,
+        "routing": routing,
         "guards": guards,
         "user_token_count": token_count,
         "endpoints": [

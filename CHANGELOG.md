@@ -4,6 +4,39 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — Multi-backend routing: one proxy, many upstreams
+
+A single proxy can now hold N upstream backends (OpenAI, Anthropic, Ollama, DeepSeek, …) side-by-side and dispatch each request to the right one based on the request body's `model` field. Phase 1 of `docs/design/multi-backend-routing.md` ships in this release; per-client `allowed_models`, audit verdict expansion (`model_denied` / `model_unrouted`), and provider-side failover remain proposed.
+
+**Schema.** `[backends.NAME]` (operator-chosen label) declares one backend per section, with the existing `provider` / `endpoint` / `api_key` / `model` fields. `[routing]` carries `default = "<name>"` and `rules = [{ model = "...", backend = "..." }]`. Patterns support exact strings and trailing-`*` globs (`gpt-4o-*` matches `gpt-4o-mini`); rules are scanned in declared order, first match wins. The legacy single `[backend]` section still works — nanoguard synthesizes a `default` pool entry from it, and a startup warning fires if both schemas are present.
+
+**Backend pool.** `Backend` instances keep their per-backend `reqwest` connection pools (one per upstream) and are preserved across hot reload, because orphaning a connection pool mid-request is unsafe. Adding or removing entries in `[backends.*]` is therefore restart-only; the `warn_on_restart_only_drift` helper reports the change on SIGHUP. `[routing]` (the rules + default) IS hot-reloadable — the proxy picks up new routing immediately on reload.
+
+**Proxy hot path.** Both `/v1/chat/completions` and `/v1/messages` extract the request body's `model`, call `state.pool.route(model)`, and forward through the resolved backend. An unroutable model returns 400 with a clear error rather than reaching some default upstream silently. `/v1/models` continues to surface the legacy default backend's list for compatibility; per-backend model federation is a future iteration.
+
+**Console (`nanoguard-console`).** A new admin-only **Backends** tab lists every configured backend, shows the routing default, and offers Add / Edit / Delete buttons that go through the new `GET|POST /api/backends` and `PUT|DELETE /api/backends/:name` endpoints. Each mutation rewrites `nanoguard.toml` via `toml_edit` so unrelated sections, comments, and whitespace stay verbatim. Deletes are refused with 409 when the target is the routing default or referenced by any `[routing]` rule. Every mutation goes through an atomic-write + backup + reload trigger, audited under `backend_create` / `backend_update` / `backend_delete` in `console-audit.jsonl`. The response carries `restart_required: true` so the UI can warn the operator that the live pool only picks up the change on the next process restart.
+
+**Overview API.** `/api/overview` now returns a `backends` array (one entry per pool member, with `name`, `provider`, `endpoint`, `model`, `is_default`, `has_api_key`) plus a `routing` object containing `default` and the rules list. The legacy `backend` key on the response keeps the first entry for old SPA builds.
+
+**e2e.** Two new scenarios:
+- **35** spawns two labelled mock backends on different ports, sets `[routing]` rules for `premium` (exact → `alpha`) and `fast-*` (glob → `beta`), and confirms each request reaches the right mock. Also: unmatched `model` falls back to `[routing].default`; `/api/overview` reports both backends and the rule list.
+- **36** drives the Console Backends API end-to-end: list shows the bootstrap entry, POST creates a new one with `restart_required: true` and the new section appears in `nanoguard.toml`, list now shows 2, duplicate POST is 409, DELETE drops the row, deleting the routing default is 409, viewer (non-admin) is 403 on every endpoint.
+
+`tools/e2e.sh` is now at 169 assertions (was 147 at PR #41 merge).
+
+CodeRabbit review fixes applied during the PR (each closes a real defect, not a stylistic nit):
+
+- **`[routing].default` is strictly required when N>1 backends are configured.** The earlier "pick BTreeMap-first and warn" path silently routed unmatched models to whichever backend sorted alphabetically first; a typo'd model name leaked to an unrelated upstream. `Config::pool()` now refuses to start in that state.
+- **`api_key` field is 3-state in the Console PUT body.** Previously, omitting `api_key` cleared the stored key — exactly the path an operator who hit Save without retyping their secret would take. The field is now `Option<Option<String>>` via a double-Option deserializer: omitted = keep current, explicit null = clear, string = replace. `upsert_backend_in_toml` preserves the rest of the existing entry instead of doing a full overwrite. SPA UI updated with a matching three-choice prompt.
+- **Reload validates `[routing]` against the LIVE pool, not the new TOML.** Because `[backends.*]` is restart-only, a SIGHUP that added a rule pointing at a not-yet-restarted backend used to graft an invalid route onto the live state and silently 400 every matching request. `reload_once` now refuses the swap with a clear `reload_failed` reason.
+- **Routing-miss errors are OpenAI/Anthropic-shaped.** `/v1/chat/completions` now returns the `{error: {message, type, code, param}}` envelope; `/v1/messages` returns `error.type = "invalid_request_error"` matching the Anthropic spec for client-side 400s.
+- **`/api/overview` legacy `backend` field comes from `routing.default`,** not `backends.first()`. Old SPA builds that only read the legacy key now see the active default upstream instead of an alphabetical accident.
+- **`/v1/models` aggregates the full pool.** Queries every backend in parallel, tags each model with `owned_by = <backend label>`, fails soft on per-backend errors (returns 502 only when every upstream fails), surfaces partial failures under `partial_errors`.
+- **`backend_changed` is migration-aware.** Removing legacy `[backend]` in favor of `[backends.*]` no longer fires spurious "[backend].provider changed" drift warnings on SIGHUP.
+- **`docs/design/multi-backend-routing.md`** opens with a "Shipped vs Proposed" call-out so a reader sees Phase 1 boundaries before scrolling into Phase 2 / proposed material.
+
+**Migration.** Existing single-`[backend]` deployments keep working as-is; no migration is required. To move a deployment to multi-backend, add a `[backends.NAME]` section and remove the legacy `[backend]` block (or leave it — the startup warning is informational).
+
 ### Added — Console Overview "Getting Started" + "Guards Active" panels, Console-side budget editor
 
 The Console's first screen after login used to be three read-only cards (config file count, audit entry presence, budget key count). An operator who just installed nanoguard had no way to learn from the UI **how to send their first request** — there was no proxy URL displayed, no curl example, no Bearer-wiring hint, and no signal about which guards were active. This release fills those gaps:

@@ -503,28 +503,32 @@ mod tests {
     use crate::config::{BackendConfig, BudgetConfig, Config};
 
     fn dummy_state(admin_key: Option<String>) -> AppState {
-        AppState {
-            config: Config {
-                nanoguard: Default::default(),
-                backend: BackendConfig {
-                    provider: "ollama".to_string(),
-                    endpoint: "http://localhost:11434".to_string(),
-                    api_key: None,
-                    model: None,
-                },
-                input: Default::default(),
-                output: Default::default(),
-                budget: BudgetConfig {
-                    admin_api_key: admin_key,
-                    ..Default::default()
-                },
-                audit: Default::default(),
-                tools: Default::default(),
-                policies: Default::default(),
-                auth: Default::default(),
-                console: Default::default(),
-                reload: Default::default(),
+        let cfg = Config {
+            nanoguard: Default::default(),
+            backend: Some(BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            }),
+            backends: std::collections::BTreeMap::new(),
+            routing: Default::default(),
+            input: Default::default(),
+            output: Default::default(),
+            budget: BudgetConfig {
+                admin_api_key: admin_key,
+                ..Default::default()
             },
+            audit: Default::default(),
+            tools: Default::default(),
+            policies: Default::default(),
+            auth: Default::default(),
+            console: Default::default(),
+            reload: Default::default(),
+        };
+        let (pool_view, _) = cfg.pool().expect("legacy [backend] always resolves");
+        AppState {
+            config: cfg,
             matchers: std::sync::Arc::new(
                 crate::matcher::Matchers::build(&Default::default()).unwrap(),
             ),
@@ -538,12 +542,7 @@ mod tests {
             schema: None,
             tool_gate: None,
             policy: None,
-            backend: crate::backend::Backend::new(BackendConfig {
-                provider: "ollama".to_string(),
-                endpoint: "http://localhost:11434".to_string(),
-                api_key: None,
-                model: None,
-            }),
+            pool: crate::backend::BackendPoolRuntime::build(&pool_view),
             http_client: reqwest::Client::new(),
             budget: None,
             audit: None,

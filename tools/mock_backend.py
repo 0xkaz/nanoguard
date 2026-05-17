@@ -10,6 +10,7 @@ For SSE tests, set `?stream=1` or pass `"stream": true` in the body —
 the backend emits a series of `data: {...}` chunks then `data: [DONE]`.
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -32,6 +33,29 @@ def extract_user_text(req):
 class MockHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[mock] " + fmt % args + "\n")
+
+    def do_GET(self):
+        # Tiny GET surface so nanoguard's /v1/models aggregation can
+        # hit the mock during scenario 35. Reports a single model
+        # named after the label so the test can confirm the
+        # per-backend tag survives the merge.
+        if self.path in ("/v1/models", "/v1/models/"):
+            label = os.environ.get("BACKEND_LABEL", "mock")
+            payload = {
+                "object": "list",
+                "data": [
+                    {"id": f"{label}-model", "object": "model", "owned_by": label},
+                ],
+            }
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -60,7 +84,12 @@ class MockHandler(BaseHTTPRequestHandler):
             except Exception:
                 tool_calls = None
 
-        echo = f"You said: {user_msg}"
+        # `BACKEND_LABEL` lets the e2e script run two mock backends
+        # on different ports and tell them apart in the response. The
+        # default reproduces the historical "You said: ..." shape so
+        # existing scenarios keep matching their assertions verbatim.
+        label = os.environ.get("BACKEND_LABEL", "")
+        echo = f"[{label}] You said: {user_msg}" if label else f"You said: {user_msg}"
 
         if req.get("stream"):
             if tool_calls is not None:
