@@ -122,8 +122,14 @@ fn login_attempt_tracking_and_pruning() {
     record_login_attempt(&conn, "eve", Some("10.0.0.1")).unwrap();
     let pruned = prune_old_login_attempts(&conn, 1).unwrap();
     assert_eq!(pruned, 0); // too fresh
-    let pruned_old = prune_old_login_attempts(&conn, 0).unwrap();
-    assert_eq!(pruned_old, 1); // older than 0 minutes
+    let old = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+    conn.execute(
+        "UPDATE login_attempts SET attempted_at = ? WHERE username = ?",
+        rusqlite::params![old, "eve"],
+    )
+    .unwrap();
+    let pruned_old = prune_old_login_attempts(&conn, 1).unwrap();
+    assert_eq!(pruned_old, 1); // older than 1 minute
 }
 
 #[test]

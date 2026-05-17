@@ -235,6 +235,23 @@ pub async fn api_login(
         .or_else(|| headers.get("x-real-ip"))
         .and_then(|v| v.to_str().ok());
 
+    // Per-IP rate limiting - check early to block repeated attempts
+    let max_attempts = state.config.console.max_login_attempts;
+    let lockout_minutes = state.config.console.lockout_duration_minutes;
+    if let Some(ip_str) = ip {
+        let ip_count = state
+            .db
+            .with_conn(|conn| db::count_recent_login_attempts_by_ip(conn, ip_str, lockout_minutes))
+            .unwrap_or(0);
+        if ip_count >= max_attempts {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "too many requests from this IP"})),
+            )
+                .into_response();
+        }
+    }
+
     let user = match state
         .db
         .with_conn(|conn| db::user_by_username(conn, &body.username))
@@ -333,23 +350,6 @@ pub async fn api_login(
             Json(json!({"error": "invalid credentials"})),
         )
             .into_response();
-    }
-
-    // Rate-limit per IP
-    let max_attempts = state.config.console.max_login_attempts;
-    let lockout_minutes = state.config.console.lockout_duration_minutes;
-    if let Some(ip_str) = ip {
-        let ip_count = state
-            .db
-            .with_conn(|conn| db::count_recent_login_attempts_by_ip(conn, ip_str, lockout_minutes))
-            .unwrap_or(0);
-        if ip_count >= max_attempts {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({"error": "too many requests from this IP"})),
-            )
-                .into_response();
-        }
     }
 
     // Clear failed login attempts on success.
