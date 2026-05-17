@@ -2470,6 +2470,233 @@ fi
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
 
+# --- 34. /api/overview + Console-side budget editor -----------------------
+# The Overview tab in the Console is the operator's first screen after
+# login. It depends on /api/overview returning a proxy_url, the live
+# guard digest, and the user's token count. The budget editor lives on
+# /api/budget/limit + /api/budget/reset and exists so an operator does
+# not have to also configure proxy ADMIN_API_KEY to manage caps.
+info "scenario 34: /api/overview snapshot + budget limit/reset round-trip"
+
+S34_DIR="$LOGDIR/e2e.s34.workdir"
+rm -rf "$S34_DIR"
+mkdir -p "$S34_DIR"
+
+S34_PORT=18089
+S34_CONSOLE_URL="http://127.0.0.1:$S34_PORT"
+S34_DB="$S34_DIR/nanoguard.db"
+S34_TOML="$S34_DIR/nanoguard.toml"
+S34_CONSOLE_LOG="$LOGDIR/ng.s34.console.log"
+S34_COOKIES="$LOGDIR/e2e.s34.cookies"
+rm -f "$S34_COOKIES"
+
+cat > "$S34_TOML" <<EOF
+[nanoguard]
+listen = "0.0.0.0:8080"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.pii]
+enabled = true
+action = "mask"
+
+[budget]
+enabled = true
+db_path = "$S34_DB"
+
+[console]
+listen = "127.0.0.1:$S34_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S34_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S34_BOOTSTRAP_PW" }
+EOF
+
+# Pre-seed the budget tables so the editor has a row to operate on.
+sqlite3 "$S34_DB" <<EOF
+CREATE TABLE IF NOT EXISTS api_key_limits (
+    api_key TEXT PRIMARY KEY,
+    token_limit INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS api_key_usage (
+    api_key TEXT PRIMARY KEY,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    reset_at TEXT
+);
+INSERT OR REPLACE INTO api_key_usage (api_key, total_tokens) VALUES ('demo-key', 4242);
+EOF
+
+S34_PW="s34-pw-$(openssl rand -hex 8)"
+(cd "$S34_DIR" && NANOGUARD_CONFIG="$S34_TOML" \
+    S34_BOOTSTRAP_PW="$S34_PW" \
+    "$CONSOLE_BIN" > "$S34_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+wait_for_url "34-pre. nanoguard-console boot" "$S34_CONSOLE_URL/" 15 || exit 1
+
+LOGIN=$(curl -s -c "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S34_PW\"}" \
+    "$S34_CONSOLE_URL/api/login")
+S34_CSRF=$(echo "$LOGIN" | jq -r '.csrf_token // empty')
+
+# 34a. /api/overview returns the listen-derived proxy URL with
+# 0.0.0.0 normalized to localhost, so a copy-paste curl works.
+OV=$(curl -s -b "$S34_COOKIES" "$S34_CONSOLE_URL/api/overview")
+PROXY_URL=$(echo "$OV" | jq -r '.proxy_url // empty')
+assert_eq "34a. /api/overview normalizes 0.0.0.0:8080 to localhost:8080" \
+    "$PROXY_URL" "http://localhost:8080"
+
+# 34b. The backend digest reflects the TOML.
+BACKEND_EP=$(echo "$OV" | jq -r '.backend.endpoint // empty')
+assert_eq "34b. /api/overview surfaces the configured backend endpoint" \
+    "$BACKEND_EP" "http://127.0.0.1:$MOCK_PORT"
+
+# 34c. Guard list includes at least the 7 documented entries.
+N_GUARDS=$(echo "$OV" | jq -r '.guards | length')
+case "$N_GUARDS" in
+    7|8|9|10) ok "34c. /api/overview returns a guard list ($N_GUARDS entries)" ;;
+    *)        ng "34c. unexpected guard count: $N_GUARDS" ;;
+esac
+
+# 34d. Input PII guard reports enabled=true (we set it in the TOML).
+PII_ENABLED=$(echo "$OV" | jq -r '.guards[] | select(.name == "Input PII redaction") | .enabled')
+assert_eq "34d. Input PII guard is reported enabled" "$PII_ENABLED" "true"
+
+# 34e. /v1/* endpoints are advertised so an OpenAI-SDK user can find
+# the correct path without reading docs.
+HAS_CHAT=$(echo "$OV" | jq -r '.endpoints[]' | grep -c '/v1/chat/completions' || true)
+case "$HAS_CHAT" in
+    0) ng "34e. /v1/chat/completions not in advertised endpoints" ;;
+    *) ok "34e. /v1/chat/completions advertised in /api/overview" ;;
+esac
+
+# 34f. Set a budget limit for the seeded api key. Also capture
+# response headers so the next assertion can verify CSRF rotation —
+# every mutating console endpoint MUST rotate the per-session token
+# (XKA-59 contract), and budget endpoints were added late so this
+# scenario locks the rotation behavior for them too.
+SET_HDR="$LOGDIR/e2e.s34.set.hdr"
+SET_RESP=$(curl -s -b "$S34_COOKIES" -c "$S34_COOKIES" \
+    -D "$SET_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S34_CSRF" \
+    -d '{"api_key":"demo-key","limit":100000}' \
+    "$S34_CONSOLE_URL/api/budget/limit")
+SET_LIMIT=$(echo "$SET_RESP" | jq -r '.limit // empty')
+assert_eq "34f. POST /api/budget/limit echoes the new limit" "$SET_LIMIT" "100000"
+
+NEXT_CSRF=$(grep -i '^x-csrf-token-next:' "$SET_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+if [ -n "$NEXT_CSRF" ] && [ "$NEXT_CSRF" != "$S34_CSRF" ]; then
+    ok "34f-rot. /api/budget/limit rotates X-CSRF-Token-Next"
+    S34_CSRF="$NEXT_CSRF"
+else
+    ng "34f-rot. /api/budget/limit did not rotate CSRF token"
+fi
+
+# The old CSRF must now be stale — using it should be a 403.
+STALE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: deadbeef-not-the-rotated-value" \
+    -d '{"api_key":"demo-key","limit":99}' \
+    "$S34_CONSOLE_URL/api/budget/limit")
+assert_eq "34f-stale. an old/wrong CSRF token is rejected (403)" "$STALE_CODE" "403"
+
+# Inspect the SQLite table directly: the limit must be persisted, not
+# just echoed.
+DB_LIMIT=$(sqlite3 "$S34_DB" "SELECT token_limit FROM api_key_limits WHERE api_key='demo-key';" 2>/dev/null)
+assert_eq "34g. budget limit lands in api_key_limits" "$DB_LIMIT" "100000"
+
+# Helper: every mutation rotates the CSRF token, so the next call
+# needs the value the server returned in X-CSRF-Token-Next. Pull it
+# from /api/me to avoid juggling header captures inline. Defined
+# before the first call below (bash has no function hoisting).
+refresh_s34_csrf() {
+    S34_CSRF=$(curl -s -b "$S34_COOKIES" "$S34_CONSOLE_URL/api/me" \
+        | jq -r '.csrf_token // empty')
+}
+
+# 34g-fresh. Setting a limit on a key that never had usage yet must
+# still surface in the admin /api/budget reader. The reader JOINs
+# from api_key_usage → api_key_limits, so a freshly-set limit on a
+# never-used key would otherwise be invisible until that key was
+# spent against. The handler upserts a zero-usage row to keep this
+# honest; this assertion locks that behavior.
+refresh_s34_csrf
+curl -s -o /dev/null -b "$S34_COOKIES" -c "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S34_CSRF" \
+    -d '{"api_key":"fresh-key","limit":50000}' \
+    "$S34_CONSOLE_URL/api/budget/limit"
+LIST=$(curl -s -b "$S34_COOKIES" "$S34_CONSOLE_URL/api/budget")
+FRESH_LIMIT=$(echo "$LIST" | jq -r '.data[] | select(.api_key == "fresh-key") | .limit')
+assert_eq "34g-fresh. limit on a never-used key is visible in /api/budget" \
+    "$FRESH_LIMIT" "50000"
+
+refresh_s34_csrf
+
+# 34h. Reset the usage counter and confirm api_key_usage rows back to 0.
+curl -s -o /dev/null -b "$S34_COOKIES" -c "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S34_CSRF" \
+    -d '{"api_key":"demo-key"}' \
+    "$S34_CONSOLE_URL/api/budget/reset"
+DB_USAGE=$(sqlite3 "$S34_DB" "SELECT total_tokens FROM api_key_usage WHERE api_key='demo-key';" 2>/dev/null)
+assert_eq "34h. POST /api/budget/reset zeroes the usage counter" "$DB_USAGE" "0"
+
+# 34i. Clearing the limit (POST with limit=null) DELETEs the row, so
+# the cap reverts to "unlimited" (no row in api_key_limits).
+refresh_s34_csrf
+curl -s -o /dev/null -b "$S34_COOKIES" -c "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S34_CSRF" \
+    -d '{"api_key":"demo-key","limit":null}' \
+    "$S34_CONSOLE_URL/api/budget/limit"
+ROWS=$(sqlite3 "$S34_DB" "SELECT COUNT(*) FROM api_key_limits WHERE api_key='demo-key';" 2>/dev/null)
+assert_eq "34i. clearing the limit removes the api_key_limits row" "$ROWS" "0"
+
+# 34j. Non-admin cannot edit limits — the Budget editor MUST stay
+# admin-gated. Provision a viewer user, log in, and confirm 403.
+refresh_s34_csrf
+
+VIEWER_PW="s34-viewer-$(openssl rand -hex 8)"
+curl -s -o /dev/null -b "$S34_COOKIES" -c "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S34_CSRF" \
+    -d "{\"username\":\"viewer\",\"password\":\"$VIEWER_PW\",\"role\":\"user\"}" \
+    "$S34_CONSOLE_URL/api/users"
+
+S34_VIEWER_COOKIES="$LOGDIR/e2e.s34.viewer.cookies"
+rm -f "$S34_VIEWER_COOKIES"
+VLOGIN=$(curl -s -c "$S34_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"viewer\",\"password\":\"$VIEWER_PW\"}" \
+    "$S34_CONSOLE_URL/api/login")
+V_CSRF=$(echo "$VLOGIN" | jq -r '.csrf_token // empty')
+
+VIEWER_SET=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S34_VIEWER_COOKIES" -c "$S34_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $V_CSRF" \
+    -d '{"api_key":"demo-key","limit":50000}' \
+    "$S34_CONSOLE_URL/api/budget/limit")
+assert_eq "34j. non-admin POST /api/budget/limit is rejected (403)" "$VIEWER_SET" "403"
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

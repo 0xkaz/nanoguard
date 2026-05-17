@@ -492,6 +492,37 @@ Browse to `http://127.0.0.1:8081/` and log in as the bootstrap admin.
 
 The proxy and the console are independent processes; you can run the console without the proxy and vice versa. They share `[budget].db_path` (default `nanoguard.db`), so run both from the same working directory.
 
+### 4. Point your app at the proxy
+
+The Overview tab in the Console renders a **Getting Started** panel with the live proxy URL, a working curl example, and the OpenAI SDK env-var form. The same information assembled by hand:
+
+- **Proxy URL:** `http://<your-host>:8080` (from `[nanoguard].listen`)
+- **Endpoints:**
+  - `POST /v1/chat/completions` — OpenAI-compatible
+  - `POST /v1/messages` — Anthropic-compatible (text + `tool_use`)
+  - `GET /v1/models` — passthrough
+  - `GET /health` — unauthenticated
+- **Auth:** if `[auth].enabled = true` in `nanoguard.toml`, every `/v1/*` request needs `Authorization: Bearer <token>`. Mint a token from the **Tokens** tab in the console; the wire value is shown once on creation.
+
+curl, with `[auth].enabled = true`:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ng_t_..." \
+  -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"hello"}]}'
+```
+
+OpenAI SDKs are drop-in — just override the base URL:
+
+```bash
+# Python / Node
+export OPENAI_BASE_URL=http://localhost:8080/v1
+export OPENAI_API_KEY=ng_t_...   # one of your tokens from the Tokens tab
+```
+
+The Overview tab also renders a **Guards Active** panel listing which input/output guards are on (keyword block list, PII redaction, spotlighting, schema validation, tool gate, policy bundle) and their current parameters. Most are reload-safe — edit `nanoguard.toml` from the Config tab and the proxy picks up the new state without a restart.
+
 ---
 
 ## Configuration

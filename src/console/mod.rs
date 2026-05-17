@@ -183,6 +183,9 @@ pub async fn run(
         .route("/api/audit", get(handlers::api_audit))
         .route("/api/budget", get(handlers::api_budget))
         .route("/api/config", get(handlers::api_config))
+        .route("/api/overview", get(handlers::api_overview))
+        .route("/api/budget/limit", post(handlers::api_set_budget_limit))
+        .route("/api/budget/reset", post(handlers::api_reset_budget_usage))
         .route(
             "/api/users",
             get(handlers::api_list_users).post(handlers::api_create_user),

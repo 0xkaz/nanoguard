@@ -876,6 +876,366 @@ pub async fn api_budget(
     Json(json!({ "data": items })).into_response()
 }
 
+// ── API: Budget admin (limit set + usage reset) ────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SetBudgetLimitRequest {
+    pub api_key: String,
+    /// Per-API-key cap in tokens. Pass `null` (or omit) to clear an
+    /// existing limit. The SQLite store maps "no row" to "unlimited",
+    /// so a missing limit is functionally unlimited.
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+/// `POST /api/budget/limit` — set or clear a per-key budget cap from
+/// the Console. Mirrors `PUT /v1/admin/budget/:api_key` on the proxy,
+/// but it lives inside the Console process so an operator who only
+/// has the Console URL and a Console session does not also need a
+/// proxy `ADMIN_API_KEY` to manage limits.
+pub async fn api_set_budget_limit(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Json(body): Json<SetBudgetLimitRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let api_key = body.api_key.trim();
+    if api_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "api_key is required"})),
+        )
+            .into_response();
+    }
+
+    let db_path = &state.config.budget.db_path;
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("budget: open rw failed: {}", e);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "budget database unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    let result = match body.limit {
+        Some(limit) => {
+            // Upsert the limit, then make sure an api_key_usage row
+            // exists too. The admin /api/budget reader JOINs from
+            // usage → limits, so a freshly-set limit on a never-used
+            // key would otherwise be invisible (no usage row → no
+            // JOIN match → no row in the response) and the operator
+            // would think the save didn't take.
+            let r1 = conn.execute(
+                "INSERT INTO api_key_limits (api_key, token_limit)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(api_key) DO UPDATE SET token_limit = excluded.token_limit",
+                params![api_key, limit],
+            );
+            if r1.is_ok() {
+                let _ = conn.execute(
+                    "INSERT INTO api_key_usage (api_key, total_tokens)
+                     VALUES (?1, 0)
+                     ON CONFLICT(api_key) DO NOTHING",
+                    params![api_key],
+                );
+            }
+            r1
+        }
+        None => conn.execute(
+            "DELETE FROM api_key_limits WHERE api_key = ?1",
+            params![api_key],
+        ),
+    };
+
+    if let Err(e) = result {
+        tracing::warn!("budget: write failed: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to write budget limit"})),
+        )
+            .into_response();
+    }
+
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &admin.username,
+                admin.id,
+                "budget_set_limit",
+                format!(
+                    "{} set budget limit for `{}` to {}",
+                    admin.username,
+                    api_key,
+                    body.limit
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unlimited".to_string())
+                ),
+            )
+            .with_target(api_key.to_string())
+            .with_after(json!({ "api_key": api_key, "limit": body.limit })),
+        );
+    }
+
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({ "api_key": api_key, "limit": body.limit })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ResetBudgetUsageRequest {
+    pub api_key: String,
+}
+
+/// `POST /api/budget/reset` — zero the usage counter for an API key.
+/// Mirrors `DELETE /v1/admin/budget/:api_key/reset` on the proxy.
+pub async fn api_reset_budget_usage(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Json(body): Json<ResetBudgetUsageRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let api_key = body.api_key.trim();
+    if api_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "api_key is required"})),
+        )
+            .into_response();
+    }
+
+    let db_path = &state.config.budget.db_path;
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("budget: open rw failed: {}", e);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "budget database unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = conn.execute(
+        "INSERT INTO api_key_usage (api_key, total_tokens) VALUES (?1, 0)
+         ON CONFLICT(api_key) DO UPDATE SET total_tokens = 0",
+        params![api_key],
+    ) {
+        tracing::warn!("budget: reset failed: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to reset budget usage"})),
+        )
+            .into_response();
+    }
+
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &admin.username,
+                admin.id,
+                "budget_reset_usage",
+                format!("{} reset budget usage for `{}`", admin.username, api_key),
+            )
+            .with_target(api_key.to_string()),
+        );
+    }
+
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({ "api_key": api_key, "reset": true })),
+    )
+        .into_response()
+}
+
+// ── API: Overview / getting-started summary ────────────────────────────────
+
+/// `GET /api/overview` — a single read-only snapshot the SPA needs to
+/// render the "you can start using nanoguard like this" panel without
+/// piecing it together from three other endpoints.
+///
+/// Returns the proxy's listen URL, the auth mode (so we know whether to
+/// tell the user "no token required" or to point them at the Tokens
+/// tab), and a digest of which guard families are currently active.
+/// Read-only on purpose — this is the front door, not a settings page.
+pub async fn api_overview(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    let cfg = &state.config;
+
+    // Reconstruct the proxy URL the operator's clients should target.
+    // [nanoguard].listen can be "0.0.0.0:8080" or "127.0.0.1:8080";
+    // the wildcard is correct on the wire but useless in a curl
+    // example, so substitute localhost for clarity. Anything else
+    // (a real interface address) is left as-is so a multi-host
+    // deploy still gets a useful value.
+    let listen = &cfg.nanoguard.listen;
+    let display_host_port = if let Some(port) = listen.strip_prefix("0.0.0.0:") {
+        format!("localhost:{port}")
+    } else if let Some(port) = listen.strip_prefix("[::]:") {
+        format!("localhost:{port}")
+    } else {
+        listen.clone()
+    };
+    let proxy_url = format!("http://{display_host_port}");
+
+    let auth_enabled = cfg.auth.enabled;
+    let env_marker = cfg.auth.env_marker;
+
+    // Guard digest: enough for the operator to see at a glance "yes
+    // PII redaction is on, schema validation is off." Each entry is
+    // {name, enabled, summary}. The SPA renders them as a list with
+    // a green/grey dot.
+    //
+    // Child guards are gated by their parent pipeline switch: if
+    // `[input].enabled = false` the whole input pass is skipped, so
+    // showing `Input PII redaction` as ON when it never runs would
+    // be misleading. The summary still shows the configured child
+    // value so an operator who toggles `[input].enabled` back on can
+    // see what will activate.
+    let input_on = cfg.input.enabled;
+    let output_on = cfg.output.enabled;
+    let mut guards: Vec<serde_json::Value> = Vec::new();
+    let input_master_note = if input_on {
+        ""
+    } else {
+        " (input pipeline disabled)"
+    };
+    let output_master_note = if output_on {
+        ""
+    } else {
+        " (output pipeline disabled)"
+    };
+    guards.push(json!({
+        "name": "Input pipeline (master)",
+        "enabled": input_on,
+        "summary": if input_on { "running" } else { "disabled — child guards do not run" },
+    }));
+    guards.push(json!({
+        "name": "Input keyword block list",
+        "enabled": input_on,
+        "summary": format!(
+            "{} inline_block / {} inline_alert / {} inline_flag keywords{}",
+            cfg.input.keyword.inline_block.len(),
+            cfg.input.keyword.inline_alert.len(),
+            cfg.input.keyword.inline_flag.len(),
+            input_master_note,
+        ),
+    }));
+    guards.push(json!({
+        "name": "Input PII redaction",
+        "enabled": input_on && cfg.input.pii.enabled,
+        "summary": format!("action = {:?}{}", cfg.input.pii.action, input_master_note),
+    }));
+    guards.push(json!({
+        "name": "Spotlighting",
+        "enabled": input_on && cfg.input.spotlight.enabled,
+        "summary": format!("method = {}{}", cfg.input.spotlight.method, input_master_note),
+    }));
+    guards.push(json!({
+        "name": "Output pipeline (master)",
+        "enabled": output_on,
+        "summary": if output_on { "running" } else { "disabled — child guards do not run" },
+    }));
+    guards.push(json!({
+        "name": "Output PII redaction",
+        "enabled": output_on && cfg.output.pii.enabled,
+        "summary": format!("action = {:?}{}", cfg.output.pii.action, output_master_note),
+    }));
+    guards.push(json!({
+        "name": "Output schema validation",
+        "enabled": output_on && cfg.output.schema.enabled,
+        "summary": format!(
+            "{} rule(s); on_violation = {}{}",
+            cfg.output.schema.rules.len(),
+            cfg.output.schema.on_violation,
+            output_master_note,
+        ),
+    }));
+    let tool_allow_len = cfg.tools.allow.as_ref().map_or(0, |v| v.len());
+    guards.push(json!({
+        "name": "Tool gate",
+        "enabled": cfg.tools.enabled,
+        "summary": format!(
+            "{} allow / {} deny rule(s)",
+            tool_allow_len,
+            cfg.tools.deny.len(),
+        ),
+    }));
+    let policy_bundle_path = cfg.policies.bundle_path.as_deref().unwrap_or("");
+    guards.push(json!({
+        "name": "Policy bundle",
+        "enabled": !policy_bundle_path.is_empty(),
+        "summary": if policy_bundle_path.is_empty() {
+            "no bundle configured".to_string()
+        } else {
+            format!("path = {}", policy_bundle_path)
+        },
+    }));
+
+    // Backend digest. Multi-backend routing is still proposed
+    // (docs/design/multi-backend-routing.md), so today this is one
+    // upstream, surfaced for completeness.
+    let backend = json!({
+        "provider": cfg.backend.provider,
+        "endpoint": cfg.backend.endpoint,
+        "model": cfg.backend.model,
+    });
+
+    // Count this user's live (non-revoked) tokens so the SPA can
+    // say "you have N tokens" inline, without making the operator
+    // click into the Tokens tab to find out.
+    let token_count = state
+        .db
+        .with_conn(|conn| Ok(token_store::list_for_user(conn, user.id)?))
+        .map(|rows| rows.iter().filter(|r| r.revoked_at.is_none()).count())
+        .unwrap_or(0);
+
+    Json(json!({
+        "proxy_url": proxy_url,
+        "listen": listen,
+        "auth": {
+            "enabled": auth_enabled,
+            "env_marker": env_marker,
+        },
+        "backend": backend,
+        "guards": guards,
+        "user_token_count": token_count,
+        "endpoints": [
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/models",
+            "/health",
+        ],
+    }))
+    .into_response()
+}
+
 // ── API: Config files (read-only) ───────────────────────────────────────────
 
 pub async fn api_config(State(_state): State<Arc<ConsoleState>>) -> Response {
