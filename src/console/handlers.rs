@@ -693,6 +693,19 @@ pub async fn api_revoke_token(
                     })),
                 );
             }
+            // Cross-process invalidation. The proxy keeps an in-memory
+            // verification cache (default 60s TTL) keyed by token prefix.
+            // The Web Console runs as a separate process, so calling
+            // `invalidate_cached` here would only touch *our* (empty)
+            // cache. Send the dedicated `INVALIDATE_TOKENS` command over
+            // the configured [reload].socket (or, if only [reload].pid_file
+            // is configured, fall back to SIGHUP — heavier, same end).
+            //
+            // Surface the trigger outcome in the response body so an
+            // operator who configured `[reload]` and is watching for
+            // revoke-then-200 regressions can spot a misconfigured
+            // socket / pid_file at exactly the moment it bites them.
+            let reload = super::reload::trigger_invalidate_tokens(&state.config.reload);
             let next_csrf = rotate_csrf(&state, &session_id);
             let headers = csrf_next_headers(next_csrf.as_deref());
             (
@@ -702,6 +715,11 @@ pub async fn api_revoke_token(
                     "id": id,
                     "status": "revoked",
                     "affected": affected,
+                    "reload": {
+                        "triggered": reload.triggered,
+                        "method": reload.method,
+                        "error": reload.error,
+                    },
                 })),
             )
                 .into_response()
@@ -1256,6 +1274,11 @@ pub async fn api_force_revoke_user_tokens(
         );
     }
 
+    // Same cross-process invalidation story as `api_revoke_token`:
+    // a forced mass-revoke is exactly the scenario where leaving up to
+    // 60s of cached "verified" results on the proxy would be a security
+    // bug. See `api_revoke_token` for the design rationale.
+    let reload = super::reload::trigger_invalidate_tokens(&state.config.reload);
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (
@@ -1265,6 +1288,11 @@ pub async fn api_force_revoke_user_tokens(
             "user_id": id,
             "username": target.username,
             "revoked": revoked,
+            "reload": {
+                "triggered": reload.triggered,
+                "method": reload.method,
+                "error": reload.error,
+            },
         })),
     )
         .into_response()

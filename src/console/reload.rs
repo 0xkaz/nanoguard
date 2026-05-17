@@ -17,9 +17,29 @@ pub struct ReloadOutcome {
 
 /// Trigger a reload via the configured method.
 pub fn trigger_reload(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
+    dispatch(cfg, "RELOAD")
+}
+
+/// Ask the proxy to drop its in-memory client-token verification cache.
+///
+/// This is the cross-process counterpart to
+/// `client_auth::ClientAuth::invalidate_all_cached`: the Web Console and
+/// the proxy live in separate binaries against a shared SQLite DB, so a
+/// console-side revoke cannot reach the proxy's per-process cache via a
+/// function call. The Unix-socket path sends an `INVALIDATE_TOKENS\n`
+/// command (cheap, just flushes the cache). The pid-file path falls back
+/// to SIGHUP, which is heavier — a full state rebuild — but achieves the
+/// same end (a fresh `AppState` snapshot whose cache starts empty when
+/// `[auth]` is freshly resolved). Prefer `[reload].socket` when revoke
+/// latency matters.
+pub fn trigger_invalidate_tokens(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
+    dispatch(cfg, "INVALIDATE_TOKENS")
+}
+
+fn dispatch(cfg: &crate::config::ReloadConfig, command: &str) -> ReloadOutcome {
     // Prefer Unix socket if configured.
     if let Some(ref socket_path) = cfg.socket {
-        match trigger_via_socket(socket_path) {
+        match trigger_via_socket(socket_path, command) {
             Ok(()) => ReloadOutcome {
                 triggered: true,
                 method: "socket".to_string(),
@@ -32,6 +52,9 @@ pub fn trigger_reload(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
             },
         }
     } else if let Some(ref pid_file) = cfg.pid_file {
+        // SIGHUP is the only signal-based path the proxy currently
+        // understands. INVALIDATE_TOKENS callers get the same SIGHUP,
+        // which performs a full reload — a superset of cache flush.
         match trigger_via_pid_file(pid_file) {
             Ok(()) => ReloadOutcome {
                 triggered: true,
@@ -78,7 +101,7 @@ fn trigger_via_pid_file(_pid_file: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn trigger_via_socket(socket_path: &str) -> Result<()> {
+fn trigger_via_socket(socket_path: &str, command: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
@@ -106,9 +129,10 @@ fn trigger_via_socket(socket_path: &str) -> Result<()> {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .with_context(|| "setting write timeout")?;
+    let payload = format!("{}\n", command);
     stream
-        .write_all(b"RELOAD\n")
-        .with_context(|| "writing RELOAD to socket")?;
+        .write_all(payload.as_bytes())
+        .with_context(|| format!("writing {} to socket", command))?;
     stream.flush().with_context(|| "flushing socket")?;
 
     let mut buf = [0u8; 256];
@@ -126,7 +150,7 @@ fn trigger_via_socket(socket_path: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn trigger_via_socket(_socket_path: &str) -> Result<()> {
+fn trigger_via_socket(_socket_path: &str, _command: &str) -> Result<()> {
     bail!("Unix socket reload is only supported on Unix")
 }
 
@@ -328,7 +352,7 @@ mod tests {
             stream.write_all(b"OK\n").unwrap();
         });
 
-        let result = trigger_via_socket(&socket_path);
+        let result = trigger_via_socket(&socket_path, "RELOAD");
         assert!(result.is_ok(), "socket trigger failed: {:?}", result);
         handle.join().unwrap();
         let _ = std::fs::remove_file(&socket_path);
@@ -353,7 +377,7 @@ mod tests {
             stream.write_all(b"ERR something_broken\n").unwrap();
         });
 
-        let result = trigger_via_socket(&socket_path);
+        let result = trigger_via_socket(&socket_path, "RELOAD");
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
         assert!(

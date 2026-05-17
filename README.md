@@ -468,7 +468,23 @@ cargo run --bin nanoguard-console
 ./target/release/nanoguard-console
 ```
 
-`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. The bootstrap is **one-shot** — the user table is only seeded when it is empty. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell**; on subsequent restarts that env var is ignored (the existing admin owns the password, recoverable only by deleting `nanoguard.db` or editing the row).
+`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. The bootstrap is **one-shot** — the user table is only seeded when it is empty. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell**; on subsequent restarts that env var is ignored (the existing admin owns the password).
+
+### 2a. Recovering a forgotten admin password
+
+If the admin password is lost — for example because `make run-console` generated and printed it once and the line is no longer in the terminal scrollback — the offline `nanoguard-admin` CLI can reset any user's password without going through the web UI:
+
+```bash
+make set-admin-password                       # interactive prompt with echo off
+make set-admin-password ADMIN_USER=alice      # target a different user
+
+# or directly:
+./target/release/nanoguard-admin set-password admin            # tty prompt
+./target/release/nanoguard-admin list-users                    # see who exists
+echo "$NEW_PW" | ./target/release/nanoguard-admin set-password admin --password-stdin
+```
+
+The plaintext password is wrapped in `Zeroizing<String>` while it lives in memory, hashed with the same argon2id parameters the console itself uses, and **existing sessions for the affected user are invalidated** so a leaked cookie cannot keep an attacker signed in. `nanoguard-admin` reads the same `[budget].db_path` the console reads, so run it from the same working directory.
 
 ### 3. Open the console
 

@@ -126,6 +126,16 @@ impl ClientAuth {
         self.inner.cache.invalidate(prefix);
     }
 
+    /// Drop every cached verification result. Used after a hot reload
+    /// so a token revoked by an out-of-process actor (the Web Console,
+    /// running in a separate `nanoguard-console` binary against the
+    /// shared SQLite DB) takes effect on the very next request without
+    /// waiting for the per-entry TTL. `nanoguard-console` triggers a
+    /// reload after a token mutation specifically to flow through here.
+    pub fn invalidate_all_cached(&self) {
+        self.inner.cache.clear();
+    }
+
     /// Test-only accessor for the cache, used to assert hit/miss
     /// behavior end-to-end without exposing the internal type publicly.
     #[cfg(test)]

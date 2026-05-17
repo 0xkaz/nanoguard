@@ -40,6 +40,7 @@ It only blocks/masks/logs. It never changes the meaning of a message.
 | `src/admin/` | `/v1/admin/budget/*` Bearer-authed admin API |
 | `src/config/` | TOML config loading and defaults |
 | `src/bin/nanoguard-eval.rs` | Recognizer evaluation harness (P/R/F1 against a labeled corpus) |
+| `src/bin/nanoguard-admin.rs` | Offline user-management CLI for the Console DB (e.g. `set-password`, `list-users`); shares `[budget].db_path` and `console::auth` with `nanoguard-console`. |
 
 ## Build
 

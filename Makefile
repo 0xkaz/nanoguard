@@ -1,4 +1,4 @@
-.PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai run-console ollama-start \
+.PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai run-console set-admin-password ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight install-trivy trivy trivy-image mirai preflight-mirai
@@ -227,8 +227,11 @@ run-console: build
 	if [ "$$users_exist" = "1" ]; then \
 	    echo ""; \
 	    echo "→ $$db_path already has users; BOOTSTRAP_PASSWORD is a no-op."; \
-	    echo "  Sign in at http://localhost:8081/ with the existing admin credentials."; \
-	    echo "  (To start over: rm $$db_path)"; \
+	    echo "  Sign in at http://localhost:8081/ with the existing admin credentials,"; \
+	    echo "  or reset a forgotten password with:"; \
+	    echo "    make set-admin-password           # interactive (no shell-history leak)"; \
+	    echo "    ./target/release/nanoguard-admin --help"; \
+	    echo "  (To wipe the DB and start over: rm $$db_path)"; \
 	    echo ""; \
 	elif [ -z "$$BOOTSTRAP_PASSWORD" ]; then \
 	    export BOOTSTRAP_PASSWORD="$$(openssl rand -hex 12)"; \
@@ -244,6 +247,19 @@ run-console: build
 	    echo ""; \
 	fi; \
 	RUST_LOG=info ./target/release/nanoguard-console
+
+# Reset an admin / user password in the Console DB without going through the
+# web UI. Useful when the bootstrap password has been forgotten or the
+# admin account is otherwise locked out. Prompts on the controlling tty
+# with echo turned off so the plaintext does not land in shell history.
+#
+# Defaults to the user named "admin". Override with `ADMIN_USER=<name>`
+# (not `USER=…`; that variable is the POSIX login-name and would clobber
+# the shell user's own $USER on every invocation).
+ADMIN_USER ?= admin
+
+set-admin-password: build
+	./target/release/nanoguard-admin set-password "$(ADMIN_USER)"
 
 # Run with OpenAI backend
 run-openai: build
