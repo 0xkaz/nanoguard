@@ -13,7 +13,7 @@ Four new scenarios that fence the remaining operational surface of the Web Conso
 - **Scenario 32 (`backup_limit` pruning)** — sets `[console] backup_limit = 3`, performs 6 edits against a seeded dict file, and confirms `/api/backups` returns exactly 3 entries and the disk view agrees. Catches a regression where retention was off by one or pruning silently disabled.
 - **Scenario 33 (audit JSON shape)** — provokes a `user_create` mutation, parses the JSONL line with `jq`, and asserts the documented envelope field by field: `actor`, `action`, `target`, `request_id` (locked to the 48-hex-char form documented at `src/audit/mod.rs:186`), `timestamp` (RFC3339-shaped), `actor_id` (stringified i64 — same column will hold OIDC subjects in Phase 4), and that `after.password_hash` is absent (password hash leak across operator logs would be a real bug).
 
-`tools/e2e.sh` now carries 129 assertions (was 109 at PR #39 merge). Each scenario spawns its own (proxy?, console) pair on isolated ports under a per-scenario workdir.
+`tools/e2e.sh` now carries 129 assertions (was 109 at PR #39 merge). Each scenario spawns a `nanoguard-console` (and a `nanoguard` proxy when the test exercises a proxy-side path) on isolated ports under a per-scenario workdir.
 
 ### Changed — `nanoguard-admin` tty prompt is now in-process
 

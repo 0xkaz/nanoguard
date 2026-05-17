@@ -1988,6 +1988,24 @@ assert_eq "30b. /api/me after expires_at is in the past returns 401" "$ME_EXPIRE
 SESS_COUNT=$(sqlite3 "$S30_DB" "SELECT COUNT(*) FROM user_sessions;" 2>/dev/null)
 assert_eq "30c. the expired session row was reaped by the extractor" "$SESS_COUNT" "0"
 
+# 30c-idle. The idle timeout is a separate path from absolute expiry
+# (src/console/auth.rs:215-220). expires_at is in the future but
+# last_seen_at is older than session_idle_timeout_hours (defaults to
+# session_ttl_hours) — the extractor must still 401 + sweep the row.
+rm -f "$S30_COOKIES"
+curl -s -o /dev/null -c "$S30_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S30_PW\"}" \
+    "$S30_CONSOLE_URL/api/login"
+# Far-future expires_at, far-past last_seen_at — only the idle gate
+# can produce the 401 we're about to assert.
+sqlite3 "$S30_DB" "UPDATE user_sessions SET expires_at='2099-01-01T00:00:00Z', last_seen_at='2000-01-01T00:00:00Z';" 2>/dev/null
+ME_IDLE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    "$S30_CONSOLE_URL/api/me")
+assert_eq "30c-idle. /api/me after the idle timeout returns 401" "$ME_IDLE" "401"
+IDLE_REAPED=$(sqlite3 "$S30_DB" "SELECT COUNT(*) FROM user_sessions;" 2>/dev/null)
+assert_eq "30c-idle-reap. idle-expired session row was also reaped" "$IDLE_REAPED" "0"
+
 # 30d. Re-login → new session → mark the user disabled in SQL →
 # /api/me must immediately 401. This is the "fire an admin RIGHT NOW"
 # escalation path. The extractor at src/console/auth.rs:239 reads
@@ -2006,6 +2024,17 @@ sqlite3 "$S30_DB" "UPDATE users SET disabled = 1 WHERE username='admin';" 2>/dev
 ME_DISABLED=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
     "$S30_CONSOLE_URL/api/me")
 assert_eq "30d. /api/me after the user is disabled returns 401" "$ME_DISABLED" "401"
+
+# 30d-other. The disabled check runs in the auth extractor used by
+# every authenticated endpoint, not just /api/me. Make sure a
+# mutating endpoint also 401s — a regression that special-cased
+# /api/me but missed POST /api/tokens would let a disabled admin
+# keep minting tokens.
+TOKENS_DISABLED=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"should-not-mint"}' \
+    "$S30_CONSOLE_URL/api/tokens")
+assert_eq "30d-other. mutating endpoint also 401s for a disabled user" "$TOKENS_DISABLED" "401"
 
 # 30e. A fresh login attempt for a disabled user also fails. Without
 # this check an attacker who learned the password could keep getting
@@ -2354,19 +2383,31 @@ curl -s -o /dev/null -b "$S33_COOKIES" -c "$S33_COOKIES" \
     -d '{"username":"audit-victim","password":"s33-audit-pw-zzzzz","role":"user"}' \
     "$S33_CONSOLE_URL/api/users"
 
-# Give the writer a moment to flush.
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -s "$S33_AUDIT" ] && break
+# Wait for the user_create line specifically, not just any line. The
+# login mutation also writes to this file and lands first, so a
+# non-empty-file check exits the loop too early and the next grep
+# can intermittently miss user_create.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if grep -q '"action":"user_create"' "$S33_AUDIT" 2>/dev/null; then
+        break
+    fi
     sleep 0.1
 done
 
-# 33a. login record has actor + action="login" and parses as JSON.
+# 33a. login record is a valid JSON line. Login is the simplest
+# audit shape — no `target`, no `before`/`after` — so all that has
+# to hold is `action == "login"` and `actor == "admin"`.
 LOGIN_LINE=$(grep '"action":"login"' "$S33_AUDIT" | head -n1)
 if [ -n "$LOGIN_LINE" ] && echo "$LOGIN_LINE" | jq . >/dev/null 2>&1; then
     ok "33a. login mutation is a valid JSON line"
 else
     ng "33a. login record missing or invalid JSON; line: $LOGIN_LINE"
 fi
+
+LOGIN_ACTOR=$(echo "$LOGIN_LINE" | jq -r '.actor // empty')
+assert_eq "33a-actor. login.actor is admin" "$LOGIN_ACTOR" "admin"
+LOGIN_ACTION=$(echo "$LOGIN_LINE" | jq -r '.action // empty')
+assert_eq "33a-action. login.action == login" "$LOGIN_ACTION" "login"
 
 # 33b-h. The envelope fields. Every assertion targets one promised key.
 USER_CREATE=$(grep '"action":"user_create"' "$S33_AUDIT" | head -n1)
@@ -2394,9 +2435,11 @@ else
     ng "33e. request_id unexpected: $REQ_ID"
 fi
 
-# 33f. timestamp parses as RFC3339.
+# 33f. timestamp parses as RFC3339 — anchor at both ends and accept
+# the fractional-second + offset shapes `chrono::Utc::now().to_rfc3339()`
+# produces.
 TS=$(echo "$USER_CREATE" | jq -r '.timestamp // empty')
-if printf '%s' "$TS" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}'; then
+if printf '%s' "$TS" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'; then
     ok "33f. timestamp is RFC3339-shaped"
 else
     ng "33f. timestamp unexpected: $TS"
@@ -2418,10 +2461,11 @@ fi
 # 33i. actor_id is a stringified i64 (the schema documents this — OIDC
 # subjects will live in the same column eventually).
 ACTOR_ID=$(echo "$USER_CREATE" | jq -r '.actor_id // empty')
-case "$ACTOR_ID" in
-    [0-9]*) ok "33i. actor_id is numeric (stringified i64)" ;;
-    *) ng "33i. actor_id unexpected shape: $ACTOR_ID" ;;
-esac
+if printf '%s' "$ACTOR_ID" | grep -Eq '^-?[0-9]+$'; then
+    ok "33i. actor_id is numeric (stringified i64)"
+else
+    ng "33i. actor_id unexpected shape: $ACTOR_ID"
+fi
 
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
