@@ -16,10 +16,50 @@ use crate::client_auth::{store as token_store, Token};
 
 use super::{
     audit::MutationRecord,
-    auth::{build_logout_cookie, build_session_cookie, verify_password, CurrentUser, MaybeUser},
+    auth::{
+        build_logout_cookie, build_session_cookie, encode_csrf_token, generate_csrf_token,
+        verify_password, CurrentUser, MutatingUser, CSRF_NEXT_HEADER,
+    },
     db::{self, User},
     ConsoleState,
 };
+
+/// Rotate the CSRF token on a session row and return the new wire-encoded
+/// value. Logs a warning if the rotation fails (which would only happen if
+/// the session was concurrently deleted) — the mutation itself has already
+/// succeeded, so a failed rotation does not change the response status, but
+/// the client will fall back to its prior token and re-authenticate on the
+/// next mutation.
+fn rotate_csrf(state: &ConsoleState, session_id: &[u8]) -> Option<String> {
+    let new_raw = generate_csrf_token();
+    match state
+        .db
+        .with_conn(|conn| db::rotate_csrf_token(conn, session_id, &new_raw))
+    {
+        Ok(n) if n > 0 => Some(encode_csrf_token(&new_raw)),
+        Ok(_) => {
+            tracing::warn!("csrf: rotate skipped (session no longer exists)");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("csrf: rotate failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Build a [`HeaderMap`] carrying the rotated CSRF token so the JS client
+/// can refresh its cached value. Returns an empty map when rotation
+/// produced no value (i.e. the session row had already been deleted).
+fn csrf_next_headers(token: Option<&str>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(t) = token {
+        if let Ok(value) = axum::http::HeaderValue::from_str(t) {
+            headers.insert(axum::http::HeaderName::from_static(CSRF_NEXT_HEADER), value);
+        }
+    }
+    headers
+}
 
 // ── Request / response types ────────────────────────────────────────────────
 
@@ -243,6 +283,7 @@ pub async fn api_login(
     }
 
     let session_id = super::auth::generate_session_id();
+    let csrf_raw = generate_csrf_token();
     let ttl_hours = state.config.console.session_ttl_hours;
     let expires = chrono::Utc::now() + chrono::Duration::hours(ttl_hours);
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
@@ -259,6 +300,7 @@ pub async fn api_login(
             &expires.to_rfc3339(),
             user_agent,
             ip,
+            &csrf_raw,
         )
     }) {
         tracing::warn!("login: failed to create session: {}", e);
@@ -282,46 +324,80 @@ pub async fn api_login(
     }
 
     let cookie = session_cookie(&state, &session_id);
+    let csrf_wire = encode_csrf_token(&csrf_raw);
     (
         StatusCode::OK,
         [(axum::http::header::SET_COOKIE, cookie.to_string())],
-        Json(json!({"ok": true, "user": UserResponse::from(user)})),
+        Json(json!({
+            "ok": true,
+            "user": UserResponse::from(user),
+            "csrf_token": csrf_wire,
+        })),
     )
         .into_response()
 }
 
 pub async fn api_logout(
     State(state): State<Arc<ConsoleState>>,
-    MaybeUser(user): MaybeUser,
+    MutatingUser { user, session_id }: MutatingUser,
 ) -> Response {
-    if let Some(ref u) = user {
-        let _ = state
-            .db
-            .with_conn(|conn| db::delete_user_sessions(conn, u.id));
-        if let Some(ref log) = state.audit_log {
-            log.record_mutation(
-                &MutationRecord::new(
-                    &u.username,
-                    u.id,
-                    "logout",
-                    format!("{} logged out", u.username),
-                )
-                .with_target(u.username.clone()),
-            );
-        }
+    let _ = state
+        .db
+        .with_conn(|conn| db::delete_user_sessions(conn, user.id));
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &user.username,
+                user.id,
+                "logout",
+                format!("{} logged out", user.username),
+            )
+            .with_target(user.username.clone()),
+        );
     }
 
     let cookie = logout_cookie(&state);
-    (
-        StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, cookie.to_string())],
-        Json(json!({"ok": true})),
-    )
-        .into_response()
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    let mut response_headers = HeaderMap::new();
+    if let Ok(cookie_value) = axum::http::HeaderValue::from_str(&cookie.to_string()) {
+        response_headers.insert(axum::http::header::SET_COOKIE, cookie_value);
+    }
+    for (k, v) in headers {
+        if let Some(k) = k {
+            response_headers.insert(k, v);
+        }
+    }
+    (StatusCode::OK, response_headers, Json(json!({"ok": true}))).into_response()
 }
 
-pub async fn api_me(CurrentUser(user): CurrentUser) -> impl IntoResponse {
-    Json(UserResponse::from(user))
+pub async fn api_me(
+    State(state): State<Arc<ConsoleState>>,
+    CurrentUser(user): CurrentUser,
+    headers: HeaderMap,
+) -> Response {
+    // Re-derive the CSRF token from the current session so the JS client can
+    // recover it after a page refresh without a re-login.
+    let csrf = super::auth::extract_session_id(&headers, &state.config.console.session_secret)
+        .and_then(|sid| {
+            state
+                .db
+                .with_conn(|conn| db::session_by_id(conn, &sid))
+                .ok()
+                .flatten()
+                .and_then(|s| s.csrf_token)
+        })
+        .map(|raw| encode_csrf_token(&raw));
+
+    let user_json = serde_json::to_value(UserResponse::from(user)).unwrap_or_else(|_| json!({}));
+    let mut body = match user_json {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let Some(c) = csrf {
+        body.insert("csrf_token".into(), serde_json::Value::String(c));
+    }
+    Json(serde_json::Value::Object(body)).into_response()
 }
 
 // ── API: Tokens (self-service) ──────────────────────────────────────────────
@@ -364,7 +440,7 @@ pub async fn api_list_tokens(
 
 pub async fn api_create_token(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(user): CurrentUser,
+    MutatingUser { user, session_id }: MutatingUser,
     Json(body): Json<CreateTokenRequest>,
 ) -> Response {
     let label_trimmed = body.label.trim();
@@ -457,8 +533,11 @@ pub async fn api_create_token(
         );
     }
 
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
     (
         StatusCode::CREATED,
+        headers,
         Json(json!({
             "id": id,
             "prefix": token.prefix,
@@ -473,7 +552,7 @@ pub async fn api_create_token(
 
 pub async fn api_revoke_token(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(user): CurrentUser,
+    MutatingUser { user, session_id }: MutatingUser,
     Path(id): Path<i64>,
 ) -> Response {
     let owned_row = state.db.with_conn(|conn| {
@@ -532,12 +611,18 @@ pub async fn api_revoke_token(
                     })),
                 );
             }
-            Json(json!({
-                "id": id,
-                "status": "revoked",
-                "affected": affected,
-            }))
-            .into_response()
+            let next_csrf = rotate_csrf(&state, &session_id);
+            let headers = csrf_next_headers(next_csrf.as_deref());
+            (
+                StatusCode::OK,
+                headers,
+                Json(json!({
+                    "id": id,
+                    "status": "revoked",
+                    "affected": affected,
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::warn!("revoke_token: {}", e);
@@ -755,7 +840,10 @@ pub async fn api_list_users(
 
 pub async fn api_create_user(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(admin): CurrentUser,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
     Json(body): Json<CreateUserRequest>,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
@@ -812,8 +900,11 @@ pub async fn api_create_user(
                     })),
                 );
             }
+            let next_csrf = rotate_csrf(&state, &session_id);
+            let headers = csrf_next_headers(next_csrf.as_deref());
             (
                 StatusCode::CREATED,
+                headers,
                 Json(json!({
                     "id": id,
                     "username": username,
@@ -843,7 +934,10 @@ pub async fn api_create_user(
 
 pub async fn api_update_user(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(admin): CurrentUser,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
     Path(id): Path<i64>,
     Json(body): Json<UpdateUserRequest>,
 ) -> Response {
@@ -986,7 +1080,9 @@ pub async fn api_update_user(
                 }
                 log.record_mutation(&rec);
             }
-            Json(json!({ "affected": n })).into_response()
+            let next_csrf = rotate_csrf(&state, &session_id);
+            let headers = csrf_next_headers(next_csrf.as_deref());
+            (StatusCode::OK, headers, Json(json!({ "affected": n }))).into_response()
         }
         Err(e) => {
             tracing::warn!("update_user: {}", e);
@@ -1001,7 +1097,10 @@ pub async fn api_update_user(
 
 pub async fn api_force_revoke_user_tokens(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(admin): CurrentUser,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
     Path(id): Path<i64>,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
@@ -1058,12 +1157,18 @@ pub async fn api_force_revoke_user_tokens(
         );
     }
 
-    Json(json!({
-        "user_id": id,
-        "username": target.username,
-        "revoked": revoked,
-    }))
-    .into_response()
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({
+            "user_id": id,
+            "username": target.username,
+            "revoked": revoked,
+        })),
+    )
+        .into_response()
 }
 
 // ── API: File editing (admin only) ──────────────────────────────────────────
@@ -1110,7 +1215,10 @@ fn is_safe_editable_path(path: &str) -> bool {
 
 pub async fn api_edit_file(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(admin): CurrentUser,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
     Json(body): Json<EditFileRequest>,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
@@ -1178,13 +1286,19 @@ pub async fn api_edit_file(
     // Trigger reload.
     let reload = super::reload::trigger_reload(&state.config.reload);
 
-    Json(json!({
-        "ok": true,
-        "before_hash": before_hash,
-        "after_hash": after_hash,
-        "reload": reload,
-    }))
-    .into_response()
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({
+            "ok": true,
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+            "reload": reload,
+        })),
+    )
+        .into_response()
 }
 
 pub async fn api_validate_file(
@@ -1256,7 +1370,10 @@ pub async fn api_list_backups(
 
 pub async fn api_revert_file(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(admin): CurrentUser,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
     Json(body): Json<RevertFileRequest>,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
@@ -1312,25 +1429,36 @@ pub async fn api_revert_file(
 
     let reload = super::reload::trigger_reload(&state.config.reload);
 
-    Json(json!({
-        "ok": true,
-        "reload": reload,
-    }))
-    .into_response()
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({
+            "ok": true,
+            "reload": reload,
+        })),
+    )
+        .into_response()
 }
 
 // ── API: Reload ─────────────────────────────────────────────────────────────
 
 pub async fn api_trigger_reload(
     State(state): State<Arc<ConsoleState>>,
-    CurrentUser(admin): CurrentUser,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
         return *e;
     }
 
     let outcome = super::reload::trigger_reload(&state.config.reload);
-    Json(json!(outcome)).into_response()
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (StatusCode::OK, headers, Json(json!(outcome))).into_response()
 }
 
 #[derive(Deserialize, Default)]
