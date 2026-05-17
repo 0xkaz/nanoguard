@@ -449,7 +449,15 @@ If `CONSOLE_SESSION_SECRET` is set in the environment and non-empty, it override
 
 If `listen` is non-loopback, cookies are automatically marked `Secure` — terminate TLS in front of the console in that case.
 
-### 2. Set the env vars and start the console
+### 2. Start the console
+
+The fastest path is `make run-console`. It builds, generates a `CONSOLE_SESSION_SECRET` if you don't have one set, generates a `BOOTSTRAP_PASSWORD` and prints it once when the user table is empty (otherwise it tells you to log in with the existing admin), then starts the listener:
+
+```bash
+make run-console
+```
+
+For full manual control:
 
 ```bash
 export CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)"
@@ -460,7 +468,7 @@ cargo run --bin nanoguard-console
 ./target/release/nanoguard-console
 ```
 
-`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell** — the bootstrap is one-shot and the variable is no longer needed.
+`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. The bootstrap is **one-shot** — the user table is only seeded when it is empty. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell**; on subsequent restarts that env var is ignored (the existing admin owns the password, recoverable only by deleting `nanoguard.db` or editing the row).
 
 ### 3. Open the console
 
