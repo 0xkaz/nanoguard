@@ -1,4 +1,4 @@
-> **Status:** partial (commit ef5b188, 2026-05-17 — Phase 1 (read-only console + own-token self-service + admin user CRUD) shipped in cdc795c, Phase 2 (file-write contract, reload trigger, console-audit) shipped in ef5b188. Phase 3 (remaining reloadable TOML sections), Phase 4 (OIDC), and Phase 5 (change-request mode) remain proposed.)
+> **Status:** partial (commit ef5b188 — Phase 1 (read-only console + own-token self-service + admin user CRUD) shipped in cdc795c, Phase 2 (file-write contract, reload trigger, console-audit) shipped in ef5b188. Phase 3 (remaining reloadable TOML sections), Phase 4 (OIDC), and Phase 5 (change-request mode) remain proposed.)
 
 # Web Configuration UI
 
