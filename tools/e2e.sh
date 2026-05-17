@@ -2581,14 +2581,37 @@ case "$HAS_CHAT" in
     *) ok "34e. /v1/chat/completions advertised in /api/overview" ;;
 esac
 
-# 34f. Set a budget limit for the seeded api key.
+# 34f. Set a budget limit for the seeded api key. Also capture
+# response headers so the next assertion can verify CSRF rotation —
+# every mutating console endpoint MUST rotate the per-session token
+# (XKA-59 contract), and budget endpoints were added late so this
+# scenario locks the rotation behavior for them too.
+SET_HDR="$LOGDIR/e2e.s34.set.hdr"
 SET_RESP=$(curl -s -b "$S34_COOKIES" -c "$S34_COOKIES" \
+    -D "$SET_HDR" \
     -H "Content-Type: application/json" \
     -H "X-CSRF-Token: $S34_CSRF" \
     -d '{"api_key":"demo-key","limit":100000}' \
     "$S34_CONSOLE_URL/api/budget/limit")
 SET_LIMIT=$(echo "$SET_RESP" | jq -r '.limit // empty')
 assert_eq "34f. POST /api/budget/limit echoes the new limit" "$SET_LIMIT" "100000"
+
+NEXT_CSRF=$(grep -i '^x-csrf-token-next:' "$SET_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+if [ -n "$NEXT_CSRF" ] && [ "$NEXT_CSRF" != "$S34_CSRF" ]; then
+    ok "34f-rot. /api/budget/limit rotates X-CSRF-Token-Next"
+    S34_CSRF="$NEXT_CSRF"
+else
+    ng "34f-rot. /api/budget/limit did not rotate CSRF token"
+fi
+
+# The old CSRF must now be stale — using it should be a 403.
+STALE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: deadbeef-not-the-rotated-value" \
+    -d '{"api_key":"demo-key","limit":99}' \
+    "$S34_CONSOLE_URL/api/budget/limit")
+assert_eq "34f-stale. an old/wrong CSRF token is rejected (403)" "$STALE_CODE" "403"
 
 # Inspect the SQLite table directly: the limit must be persisted, not
 # just echoed.
@@ -2597,11 +2620,30 @@ assert_eq "34g. budget limit lands in api_key_limits" "$DB_LIMIT" "100000"
 
 # Helper: every mutation rotates the CSRF token, so the next call
 # needs the value the server returned in X-CSRF-Token-Next. Pull it
-# from /api/me to avoid juggling header captures inline.
+# from /api/me to avoid juggling header captures inline. Defined
+# before the first call below (bash has no function hoisting).
 refresh_s34_csrf() {
     S34_CSRF=$(curl -s -b "$S34_COOKIES" "$S34_CONSOLE_URL/api/me" \
         | jq -r '.csrf_token // empty')
 }
+
+# 34g-fresh. Setting a limit on a key that never had usage yet must
+# still surface in the admin /api/budget reader. The reader JOINs
+# from api_key_usage → api_key_limits, so a freshly-set limit on a
+# never-used key would otherwise be invisible until that key was
+# spent against. The handler upserts a zero-usage row to keep this
+# honest; this assertion locks that behavior.
+refresh_s34_csrf
+curl -s -o /dev/null -b "$S34_COOKIES" -c "$S34_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S34_CSRF" \
+    -d '{"api_key":"fresh-key","limit":50000}' \
+    "$S34_CONSOLE_URL/api/budget/limit"
+LIST=$(curl -s -b "$S34_COOKIES" "$S34_CONSOLE_URL/api/budget")
+FRESH_LIMIT=$(echo "$LIST" | jq -r '.data[] | select(.api_key == "fresh-key") | .limit')
+assert_eq "34g-fresh. limit on a never-used key is visible in /api/budget" \
+    "$FRESH_LIMIT" "50000"
+
 refresh_s34_csrf
 
 # 34h. Reset the usage counter and confirm api_key_usage rows back to 0.
@@ -2653,6 +2695,7 @@ assert_eq "34j. non-admin POST /api/budget/limit is rejected (403)" "$VIEWER_SET
 
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
+
 
 # --- summary ---------------------------------------------------------------
 

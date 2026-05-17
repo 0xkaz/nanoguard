@@ -147,13 +147,17 @@ async function loadOverview() {
 
   // The "Getting Started" + "Guards Active" panels are populated from
   // /api/overview. Failing this fetch should not blank the existing
-  // three cards above, so we wrap it independently.
+  // three cards above, so we wrap it independently. Both child cards
+  // share one source, so an error must replace BOTH placeholders;
+  // updating only one used to leave the other stuck on "Loading…".
   try {
     const ov = await api('/api/overview');
     renderGettingStarted(ov);
     renderGuards(ov);
   } catch (err) {
-    $('#getting-started-body').textContent = `error: ${err.message}`;
+    const msg = `<p class="hint warn">Could not load overview: ${esc(err.message)}</p>`;
+    $('#getting-started-body').innerHTML = msg;
+    $('#guards-body').innerHTML = msg;
   }
 }
 

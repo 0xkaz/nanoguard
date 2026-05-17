@@ -16,7 +16,7 @@ The Console's first screen after login used to be three read-only cards (config 
 - **README "Point your app at the proxy" section** — adds step 4 in the Web Configuration UI walkthrough with the same curl + SDK form the Overview panel renders, so a reader who has not opened the Console yet still has a working snippet.
 - **e2e scenario 34** — covers the new surface end-to-end: `/api/overview` shape (URL normalization, backend digest, guard count, PII enabled flag, endpoint list), the budget limit set/clear/persist round-trip via SQLite, the usage reset round-trip, and the admin-only gate (viewer is 403 on `/api/budget/limit`).
 
-`tools/e2e.sh` is now at 144 assertions (was 134 at PR #40 merge).
+`tools/e2e.sh` is now at 147 assertions (was 134 at PR #40 merge). The added cases pin: (a) the Overview's child guard badges (`Input PII redaction`, `Spotlighting`, `Output PII redaction`, `Output schema validation`) are gated by the parent `[input].enabled` / `[output].enabled` master switch — the pipeline-disabled state surfaces honestly in the UI; (b) setting a budget limit for a never-used api_key still makes it appear in the admin `/api/budget` reader (the handler now upserts a zero-usage row alongside the limit so the JOIN-from-usage reader sees it); (c) `/api/budget/limit` and `/api/budget/reset` rotate the per-session CSRF token on every mutation, and the previous value is now stale (403); and (d) on `/api/overview` failure, both the Getting Started AND the Guards Active cards fall back to an error state instead of one being stuck on "Loading…".
 
 ### Added — Console e2e Phase C: session lifecycle, cross-user revoke, backup pruning, audit shape
 

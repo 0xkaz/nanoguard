@@ -928,12 +928,29 @@ pub async fn api_set_budget_limit(
     };
 
     let result = match body.limit {
-        Some(limit) => conn.execute(
-            "INSERT INTO api_key_limits (api_key, token_limit)
-             VALUES (?1, ?2)
-             ON CONFLICT(api_key) DO UPDATE SET token_limit = excluded.token_limit",
-            params![api_key, limit],
-        ),
+        Some(limit) => {
+            // Upsert the limit, then make sure an api_key_usage row
+            // exists too. The admin /api/budget reader JOINs from
+            // usage → limits, so a freshly-set limit on a never-used
+            // key would otherwise be invisible (no usage row → no
+            // JOIN match → no row in the response) and the operator
+            // would think the save didn't take.
+            let r1 = conn.execute(
+                "INSERT INTO api_key_limits (api_key, token_limit)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(api_key) DO UPDATE SET token_limit = excluded.token_limit",
+                params![api_key, limit],
+            );
+            if r1.is_ok() {
+                let _ = conn.execute(
+                    "INSERT INTO api_key_usage (api_key, total_tokens)
+                     VALUES (?1, 0)
+                     ON CONFLICT(api_key) DO NOTHING",
+                    params![api_key],
+                );
+            }
+            r1
+        }
         None => conn.execute(
             "DELETE FROM api_key_limits WHERE api_key = ?1",
             params![api_key],
@@ -1094,39 +1111,70 @@ pub async fn api_overview(
     // PII redaction is on, schema validation is off." Each entry is
     // {name, enabled, summary}. The SPA renders them as a list with
     // a green/grey dot.
+    //
+    // Child guards are gated by their parent pipeline switch: if
+    // `[input].enabled = false` the whole input pass is skipped, so
+    // showing `Input PII redaction` as ON when it never runs would
+    // be misleading. The summary still shows the configured child
+    // value so an operator who toggles `[input].enabled` back on can
+    // see what will activate.
+    let input_on = cfg.input.enabled;
+    let output_on = cfg.output.enabled;
     let mut guards: Vec<serde_json::Value> = Vec::new();
+    let input_master_note = if input_on {
+        ""
+    } else {
+        " (input pipeline disabled)"
+    };
+    let output_master_note = if output_on {
+        ""
+    } else {
+        " (output pipeline disabled)"
+    };
+    guards.push(json!({
+        "name": "Input pipeline (master)",
+        "enabled": input_on,
+        "summary": if input_on { "running" } else { "disabled — child guards do not run" },
+    }));
     guards.push(json!({
         "name": "Input keyword block list",
-        "enabled": cfg.input.enabled,
+        "enabled": input_on,
         "summary": format!(
-            "{} inline_block / {} inline_alert / {} inline_flag keywords",
+            "{} inline_block / {} inline_alert / {} inline_flag keywords{}",
             cfg.input.keyword.inline_block.len(),
             cfg.input.keyword.inline_alert.len(),
             cfg.input.keyword.inline_flag.len(),
+            input_master_note,
         ),
     }));
     guards.push(json!({
         "name": "Input PII redaction",
-        "enabled": cfg.input.pii.enabled,
-        "summary": format!("action = {:?}", cfg.input.pii.action),
+        "enabled": input_on && cfg.input.pii.enabled,
+        "summary": format!("action = {:?}{}", cfg.input.pii.action, input_master_note),
     }));
     guards.push(json!({
         "name": "Spotlighting",
-        "enabled": cfg.input.spotlight.enabled,
-        "summary": format!("method = {}", cfg.input.spotlight.method),
+        "enabled": input_on && cfg.input.spotlight.enabled,
+        "summary": format!("method = {}{}", cfg.input.spotlight.method, input_master_note),
+    }));
+    guards.push(json!({
+        "name": "Output pipeline (master)",
+        "enabled": output_on,
+        "summary": if output_on { "running" } else { "disabled — child guards do not run" },
     }));
     guards.push(json!({
         "name": "Output PII redaction",
-        "enabled": cfg.output.pii.enabled,
-        "summary": format!("action = {:?}", cfg.output.pii.action),
+        "enabled": output_on && cfg.output.pii.enabled,
+        "summary": format!("action = {:?}{}", cfg.output.pii.action, output_master_note),
     }));
     guards.push(json!({
         "name": "Output schema validation",
-        "enabled": cfg.output.schema.enabled,
+        "enabled": output_on && cfg.output.schema.enabled,
         "summary": format!(
-            "{} rule(s); on_violation = {}",
+            "{} rule(s); on_violation = {}{}",
             cfg.output.schema.rules.len(),
-            cfg.output.schema.on_violation
+            cfg.output.schema.on_violation,
+            output_master_note,
         ),
     }));
     let tool_allow_len = cfg.tools.allow.as_ref().map_or(0, |v| v.len());
