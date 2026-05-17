@@ -389,10 +389,20 @@ intentionally narrow:
    landed with hot reload).
 2. **Unix domain socket** (optional). If `[reload] socket = "..."`
    is set in the proxy config, the proxy listens on that socket
-   for a single line: `RELOAD\n`. The console writes that line and
-   reads the immediate `OK\n` or `ERR <message>\n`. This avoids
-   PID file races on systems that wrap nanoguard in a process
-   supervisor.
+   for a single line and replies with `OK\n` or `ERR <message>\n`.
+   The accepted commands are:
+   - `RELOAD\n` — full rebuild of the `AppState` (matcher, redactor,
+     spotlight, schema, tool_gate, policy index). Same effect as
+     SIGHUP.
+   - `INVALIDATE_TOKENS\n` — flush only the client-auth verification
+     cache. Sent by the console after a token mutation (revoke
+     today; future expansions like force-revoke-all). Cheap: no
+     matcher / regex / policy rebuild, just one `Mutex::lock` and
+     `HashMap::clear` on the cache. When `[auth]` is disabled the
+     command is a no-op success.
+   PID-file mode does not have a per-command channel, so the console
+   falls back to SIGHUP for `INVALIDATE_TOKENS` too; the lighter
+   path is only available when `[reload] socket` is configured.
 
 There is **no TCP reload endpoint**. The console talks to the
 proxy through Unix primitives only, on the same host. Cross-host

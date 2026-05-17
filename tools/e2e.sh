@@ -995,6 +995,197 @@ HTTPS_OK_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completi
     -d '{"model":"test","messages":[{"role":"user","content":"https proto"}]}')
 assert_eq "25c. require_https accepts X-Forwarded-Proto: https (200)" "$HTTPS_OK_CODE" "200"
 
+# --- 26. Console-issued token round-trip ----------------------------------
+# Operators can mint proxy tokens two ways: the admin API (covered in
+# scenario 23) or the Web Console UI. The two paths share the same
+# client_tokens table and the same hashing route, so they MUST stay
+# wire-compatible. Scenario 26 stands up both a proxy with [auth].enabled
+# AND a nanoguard-console pointed at the same DB, mints a token through
+# `POST /api/tokens`, sends it to /v1/chat/completions, and confirms
+# revoke-from-the-console invalidates it immediately on the proxy side.
+info "scenario 26: console-UI-issued tokens are accepted (and revocable) by the proxy"
+
+# Tear down the previous proxy. Console is a fresh process started below.
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+# Make sure no leftover console from a previous run holds :18081.
+for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do
+    kill "$pid" 2>/dev/null || true
+done
+
+CONSOLE_BIN="$ROOT/target/release/nanoguard-console"
+ADMIN_BIN="$ROOT/target/release/nanoguard-admin"
+S26_PORT=18081
+S26_CONSOLE_URL="http://127.0.0.1:$S26_PORT"
+S26_DB="$LOGDIR/e2e.s26.db"
+S26_PROXY_TOML="$LOGDIR/e2e.s26.proxy.toml"
+S26_CONSOLE_TOML="$LOGDIR/e2e.s26.console.toml"
+S26_CONSOLE_AUDIT="$LOGDIR/e2e.s26.console-audit.jsonl"
+S26_PROXY_LOG="$LOGDIR/ng.s26.proxy.log"
+S26_CONSOLE_LOG="$LOGDIR/ng.s26.console.log"
+S26_PROXY_AUDIT="$LOGDIR/ng.s26.audit.jsonl"
+S26_RELOAD_SOCK="$LOGDIR/e2e.s26.reload.sock"
+S26_COOKIES="$LOGDIR/e2e.s26.cookies"
+rm -f "$S26_DB" "$S26_CONSOLE_AUDIT" "$S26_PROXY_AUDIT" "$S26_COOKIES" "$S26_RELOAD_SOCK"
+
+# Proxy config: [auth].enabled so tokens are required, shared DB so
+# the console writes into the same client_tokens table.
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" \
+    | awk '/^\[audit\]/{skip=1; next} skip && /^\[/{skip=0} !skip' \
+    > "$S26_PROXY_TOML"
+cat >> "$S26_PROXY_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S26_DB"
+admin_api_key = "s26-admin"
+
+[audit]
+enabled = true
+path = "$S26_PROXY_AUDIT"
+hash_only = true
+
+[auth]
+enabled = true
+env_marker = "t"
+
+[reload]
+socket = "$S26_RELOAD_SOCK"
+EOF
+
+# Console config: same DB (`[budget].db_path` is what `nanoguard-console`
+# reads), bootstrap_admin so the admin user is provisioned, loopback
+# listener so cookies are not marked Secure (we're on plain HTTP).
+# Same [reload].pid_file as the proxy so console revoke fires SIGHUP at
+# the proxy and the verification cache is flushed cross-process.
+cp "$S26_PROXY_TOML" "$S26_CONSOLE_TOML"
+cat >> "$S26_CONSOLE_TOML" <<EOF
+
+[console]
+listen = "127.0.0.1:$S26_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S26_CONSOLE_AUDIT"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S26_BOOTSTRAP_PASSWORD" }
+EOF
+
+NANOGUARD_CONFIG="$S26_PROXY_TOML" "$BIN" > "$S26_PROXY_LOG" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+S26_PASSWORD="s26-pw-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S26_CONSOLE_TOML" \
+    S26_BOOTSTRAP_PASSWORD="$S26_PASSWORD" \
+    "$CONSOLE_BIN" > "$S26_CONSOLE_LOG" 2>&1 &
+CONSOLE_PID=$!
+S26_READY=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 0.2
+    # `/` returns the SPA shell when the console is up.
+    if curl -sf -o /dev/null "$S26_CONSOLE_URL/"; then
+        S26_READY=1
+        break
+    fi
+done
+if [ "$S26_READY" -ne 1 ]; then
+    ng "26-pre. nanoguard-console did not become ready; see $S26_CONSOLE_LOG"
+    kill "$CONSOLE_PID" "$NG_PID" 2>/dev/null || true
+fi
+
+# 26a. Log in as the bootstrap admin and capture the session cookie +
+# initial CSRF token.
+LOGIN_RESP=$(curl -s -c "$S26_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S26_PASSWORD\"}" \
+    "$S26_CONSOLE_URL/api/login")
+LOGIN_CSRF=$(echo "$LOGIN_RESP" | jq -r '.csrf_token // empty')
+if [ -n "$LOGIN_CSRF" ] && [ "$LOGIN_CSRF" != "null" ]; then
+    ok "26a. POST /api/login returns a csrf_token"
+else
+    ng "26a. login did not return a csrf_token; resp: $LOGIN_RESP"
+fi
+
+# 26b. Mint a proxy token through the console UI. The response body
+# carries the wire token exactly once.
+MINT_HDR_FILE="$LOGDIR/e2e.s26.mint.hdr"
+MINT_BODY=$(curl -s -b "$S26_COOKIES" -c "$S26_COOKIES" \
+    -D "$MINT_HDR_FILE" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $LOGIN_CSRF" \
+    -d '{"label":"e2e-26-from-console"}' \
+    "$S26_CONSOLE_URL/api/tokens")
+S26_TOKEN_WIRE=$(echo "$MINT_BODY" | jq -r '.token // empty')
+S26_TOKEN_ID=$(echo "$MINT_BODY" | jq -r '.id // empty')
+case "$S26_TOKEN_WIRE" in
+    ng_t_*) ok "26b. POST /api/tokens (console UI) returns a wire token with the configured env_marker" ;;
+    *)      ng "26b. mint response did not yield an ng_t_… token; body: $MINT_BODY" ;;
+esac
+
+# Refresh the CSRF token from the rotation header for the revoke call.
+S26_CSRF_NEXT=$(grep -i '^x-csrf-token-next:' "$MINT_HDR_FILE" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+if [ -z "$S26_CSRF_NEXT" ]; then
+    S26_CSRF_NEXT="$LOGIN_CSRF"
+fi
+
+# 26c. The console-minted token authenticates a proxy request — the
+# exact thing this whole binary is for. Without this assertion the
+# console's "Create token" button could regress to writing rows the
+# proxy cannot verify, and nothing would catch it.
+S26_USE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $S26_TOKEN_WIRE" \
+    -d '{"model":"test","messages":[{"role":"user","content":"from-console-ui"}]}')
+assert_eq "26c. proxy accepts a token minted through the console UI (200)" "$S26_USE_CODE" "200"
+
+# 26d. Console list view exposes the token by prefix; the secret never
+# round-trips after creation.
+LIST_BODY=$(curl -s -b "$S26_COOKIES" "$S26_CONSOLE_URL/api/tokens")
+LIST_HAS_PREFIX=$(echo "$LIST_BODY" | jq -r --arg id "$S26_TOKEN_ID" \
+    '.data[] | select((.id|tostring) == $id) | .prefix // empty')
+case "$LIST_HAS_PREFIX" in
+    ng_t_*) ok "26d. GET /api/tokens (console) lists the new token by prefix" ;;
+    *)      ng "26d. console list missing prefix for id=$S26_TOKEN_ID; body: $LIST_BODY" ;;
+esac
+
+# Defense in depth: the JSON should not carry the cleartext secret.
+if echo "$LIST_BODY" | jq -e --arg id "$S26_TOKEN_ID" \
+    '.data[] | select((.id|tostring) == $id) | .token' >/dev/null 2>&1
+then
+    ng "26d-leak. console list response leaked .token for the new token"
+else
+    ok "26d-leak. console list response does not include the cleartext token"
+fi
+
+# 26e. Revoke from the console UI and confirm the proxy refuses the
+# very next request — same in-memory cache invalidation contract the
+# admin path uses (scenario 23j).
+REVOKE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+    -b "$S26_COOKIES" -c "$S26_COOKIES" \
+    -H "X-CSRF-Token: $S26_CSRF_NEXT" \
+    "$S26_CONSOLE_URL/api/tokens/$S26_TOKEN_ID")
+assert_eq "26e. DELETE /api/tokens/:id (console) returns 200" "$REVOKE_CODE" "200"
+
+S26_AFTER_REVOKE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $S26_TOKEN_WIRE" \
+    -d '{"model":"test","messages":[{"role":"user","content":"after console revoke"}]}')
+assert_eq "26f. console-revoked token is rejected by the proxy immediately (401)" "$S26_AFTER_REVOKE_CODE" "401"
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

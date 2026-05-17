@@ -4,6 +4,10 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Fixed — console-issued token revoke now takes effect on the proxy immediately
+
+The Web Console and the proxy run as separate binaries, so the proxy's in-memory client-token verification cache (default 60s TTL) used to keep a console-revoked token usable for up to a minute. A new `INVALIDATE_TOKENS\n` command on the `[reload].socket` channel asks the proxy to drop the cache only (no matcher / redactor / policy rebuild). `console::reload::trigger_invalidate_tokens` sends it from `DELETE /api/tokens/:id` and surfaces the trigger outcome in the response body so a misconfigured `[reload]` shows up at exactly the moment it bites. PID-file deployments fall back to SIGHUP, same as before. Scenario 26 in `tools/e2e.sh` stands up both binaries against a shared SQLite DB and asserts the full round-trip: console UI mints a token → proxy `/v1/chat/completions` accepts it (200) → console UI revokes it → proxy rejects it (401).
+
 ### Added — `nanoguard-admin` offline user-management CLI
 
 New `src/bin/nanoguard-admin.rs` binary covers the lock-out path the web Console intentionally does not: a lost or forgotten admin password. Subcommands are `set-password <username>` and `list-users`. `set-password` argon2id-hashes the new value through the same `console::db::set_password_hash` write path the Web UI uses, and invalidates the affected user's live sessions so a leaked cookie cannot keep an attacker signed in. Three input modes — interactive tty prompt with echo off (default), `--password-stdin` for piping from a password manager, `--password <pw>` for scripted runs — and the plaintext lives in `Zeroizing<String>` for its entire lifetime. The binary reuses `nanoguard::console::{auth, db}` directly so the on-disk format cannot drift from the Console, and it reads `[budget].db_path` from the same `nanoguard.toml` the Console reads. Wrapper target `make set-admin-password [ADMIN_USER=alice]`; `make run-console` now points operators at this recovery path in its "already has users" message. README adds a "Recovering a forgotten admin password" section.

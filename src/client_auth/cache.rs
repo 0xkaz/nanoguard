@@ -140,8 +140,11 @@ impl TokenCache {
         inner.map.remove(prefix);
     }
 
-    /// Clear the entire cache. For test setup only.
-    #[cfg(test)]
+    /// Drop every entry. Used from `ClientAuth::invalidate_all_cached`
+    /// — the cross-process "the Web Console just revoked a token, stop
+    /// trusting your in-memory verification results" notification.
+    /// Atomic with respect to concurrent `get` / `insert` callers
+    /// (single Mutex), so no half-cleared snapshot leaks out.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.map.clear();

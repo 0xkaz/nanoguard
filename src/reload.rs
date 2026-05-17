@@ -346,19 +346,48 @@ pub async fn run_socket_reload_task(
                 return;
             }
 
-            if line.trim() != "RELOAD" {
-                let _ = write_half.write_all(b"ERR expected RELOAD\\n\n").await;
-                return;
-            }
-
-            tracing::info!("hot reload: socket received RELOAD, rebuilding state");
-            match execute_reload(&shared, &runtime).await {
-                Ok(()) => {
-                    let _ = write_half.write_all(b"OK\n").await;
+            match line.trim() {
+                "RELOAD" => {
+                    tracing::info!("hot reload: socket received RELOAD, rebuilding state");
+                    match execute_reload(&shared, &runtime).await {
+                        Ok(()) => {
+                            let _ = write_half.write_all(b"OK\n").await;
+                        }
+                        Err(reason) => {
+                            let _ = write_half
+                                .write_all(format!("ERR {reason}\n").as_bytes())
+                                .await;
+                        }
+                    }
                 }
-                Err(reason) => {
+                "INVALIDATE_TOKENS" => {
+                    // Flush the client-auth verification cache only.
+                    // This is the lightweight cross-process notification
+                    // the Web Console sends after revoking a token via
+                    // `POST /api/tokens/:id DELETE`. RELOAD would also
+                    // achieve invalidation as a side-effect of rebuilding
+                    // AppState, but it pays for matcher / redactor /
+                    // policy / schema reconstruction we don't need here.
+                    let state = shared.load_full();
+                    if let Some(auth) = state.client_auth.as_ref() {
+                        auth.invalidate_all_cached();
+                        tracing::info!(
+                            "hot reload: socket received INVALIDATE_TOKENS, flushed client-auth cache"
+                        );
+                        let _ = write_half.write_all(b"OK\n").await;
+                    } else {
+                        // [auth] is disabled, so there is no cache to
+                        // flush. Treat as a no-op success so the caller
+                        // does not have to special-case the config.
+                        tracing::info!(
+                            "hot reload: socket received INVALIDATE_TOKENS, [auth] disabled — no-op"
+                        );
+                        let _ = write_half.write_all(b"OK\n").await;
+                    }
+                }
+                _ => {
                     let _ = write_half
-                        .write_all(format!("ERR {reason}\n").as_bytes())
+                        .write_all(b"ERR expected RELOAD or INVALIDATE_TOKENS\n")
                         .await;
                 }
             }
