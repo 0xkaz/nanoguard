@@ -144,6 +144,80 @@ async function loadOverview() {
     const budget = await api('/api/budget');
     $('#budget-count').textContent = (budget.data || []).length;
   } catch {}
+
+  // The "Getting Started" + "Guards Active" panels are populated from
+  // /api/overview. Failing this fetch should not blank the existing
+  // three cards above, so we wrap it independently.
+  try {
+    const ov = await api('/api/overview');
+    renderGettingStarted(ov);
+    renderGuards(ov);
+  } catch (err) {
+    $('#getting-started-body').textContent = `error: ${err.message}`;
+  }
+}
+
+function renderGettingStarted(ov) {
+  const proxyUrl = ov.proxy_url;
+  const authOn = ov.auth?.enabled === true;
+  const hasToken = (ov.user_token_count || 0) > 0;
+
+  // Show the user three things they actually need to send the first
+  // request: the proxy URL, a curl example with the right Bearer
+  // wiring, and the OpenAI SDK environment-variable form.
+  const authBlurb = authOn
+    ? (hasToken
+        ? `<p class="hint ok">Client authentication is <strong>enabled</strong>. Use one of your <a href="#" data-tab-link="tokens">tokens</a> as the Bearer.</p>`
+        : `<p class="hint warn">Client authentication is <strong>enabled</strong>, but you have no tokens yet. <a href="#" data-tab-link="tokens">Create one</a> before sending a request.</p>`)
+    : `<p class="hint">Client authentication is <strong>disabled</strong>. Any caller can reach the proxy on this host — fine for local dev, not safe to expose on a network. Enable <code>[auth].enabled = true</code> in <code>nanoguard.toml</code> and start issuing tokens before opening the listener up.</p>`;
+
+  const bearerCurl = authOn ? `\\\n  -H "Authorization: Bearer ng_${ov.auth.env_marker || 'p'}_..." ` : '';
+  const curlExample = `curl ${proxyUrl}/v1/chat/completions \\\n  -H "Content-Type: application/json" ${bearerCurl}\\\n  -d '{"model":"${ov.backend.model || 'gpt-4o-mini'}","messages":[{"role":"user","content":"hello"}]}'`;
+
+  const sdkExample = authOn
+    ? `# OpenAI Python SDK\nexport OPENAI_BASE_URL=${proxyUrl}/v1\nexport OPENAI_API_KEY=ng_${ov.auth.env_marker || 'p'}_...   # from the Tokens tab\n\n# OpenAI Node SDK\nprocess.env.OPENAI_BASE_URL = "${proxyUrl}/v1";\nprocess.env.OPENAI_API_KEY = "ng_${ov.auth.env_marker || 'p'}_...";`
+    : `# OpenAI Python SDK\nexport OPENAI_BASE_URL=${proxyUrl}/v1\nexport OPENAI_API_KEY=any-string-works-when-auth-disabled\n\n# OpenAI Node SDK\nprocess.env.OPENAI_BASE_URL = "${proxyUrl}/v1";`;
+
+  const endpointsHtml = (ov.endpoints || []).map(p =>
+    `<li><code>${esc(proxyUrl + p)}</code></li>`
+  ).join('');
+
+  $('#getting-started-body').innerHTML = `
+    <p class="hint">Point your LLM client at the proxy URL below. Nanoguard exposes an OpenAI-compatible <code>/v1/chat/completions</code> and Anthropic-compatible <code>/v1/messages</code>; the rest of your stack stays the same.</p>
+    <dl class="kv">
+      <dt>Proxy URL</dt><dd><code>${esc(proxyUrl)}</code></dd>
+      <dt>Backend</dt><dd><code>${esc(ov.backend.provider)}</code> → <code>${esc(ov.backend.endpoint)}</code>${ov.backend.model ? ` (model: <code>${esc(ov.backend.model)}</code>)` : ''}</dd>
+      <dt>Endpoints</dt><dd><ul class="endpoints">${endpointsHtml}</ul></dd>
+      <dt>Your tokens</dt><dd>${ov.user_token_count} active <a href="#" data-tab-link="tokens">(manage)</a></dd>
+    </dl>
+    ${authBlurb}
+    <h4>Send a request with curl</h4>
+    <pre class="example"><code>${esc(curlExample)}</code></pre>
+    <h4>Use it from the OpenAI SDK</h4>
+    <pre class="example"><code>${esc(sdkExample)}</code></pre>
+  `;
+
+  // Wire the "manage tokens" inline links to the tab nav.
+  $$('#getting-started-body [data-tab-link]').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      switchTab(a.dataset.tabLink);
+    });
+  });
+}
+
+function renderGuards(ov) {
+  const items = (ov.guards || []).map(g => `
+    <li class="guard ${g.enabled ? 'on' : 'off'}">
+      <span class="dot" aria-hidden="true"></span>
+      <span class="name">${esc(g.name)}</span>
+      <span class="summary">${esc(g.summary)}</span>
+    </li>
+  `).join('');
+  $('#guards-body').innerHTML = `
+    <ul class="guard-list">${items}</ul>
+    <p class="hint subtle">Edit <code>nanoguard.toml</code> via the Config tab to change these. Most changes take effect on the next reload (SIGHUP / <code>RELOAD</code> over the configured socket); a small set of keys are restart-only — see <code>docs/design/hot-reload.md</code>.</p>
+  `;
 }
 
 $$('[data-tab]').forEach(btn => {
@@ -217,19 +291,66 @@ async function loadBudget() {
   try {
     const res = await api('/api/budget');
     const tbody = $('#budget-table tbody');
+    const isAdmin = currentUser?.role === 'admin';
     tbody.innerHTML = (res.data || []).map(b => {
       const pct = b.limit ? Math.round((b.usage / b.limit) * 100) : 0;
+      const adminCol = isAdmin
+        ? `<td>
+             <button class="btn small" data-budget-edit="${esc(b.api_key)}" data-budget-limit="${b.limit ?? ''}">Edit limit</button>
+             <button class="btn small danger" data-budget-reset="${esc(b.api_key)}">Reset usage</button>
+           </td>`
+        : '';
       return `
         <tr>
           <td><code>${esc(b.api_key)}</code></td>
           <td>${b.usage.toLocaleString()}</td>
           <td>${b.limit?.toLocaleString() ?? '—'}</td>
           <td>${b.limit ? `<div class="bar"><div style="width:${pct}%">${pct}%</div></div>` : '—'}</td>
+          ${adminCol}
         </tr>
       `;
     }).join('');
+
+    // Wire the per-row admin actions. Edit prompts for a new limit
+    // (empty input clears the cap); Reset zeroes the usage counter.
+    $$('#budget-table [data-budget-edit]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const apiKey = btn.dataset.budgetEdit;
+        const current = btn.dataset.budgetLimit;
+        const input = prompt(`New token limit for ${apiKey}\n(leave empty to clear; current: ${current || 'unlimited'})`, current);
+        if (input === null) return;
+        const trimmed = input.trim();
+        const payload = { api_key: apiKey };
+        if (trimmed !== '') {
+          const n = Number(trimmed);
+          if (!Number.isFinite(n) || n < 0 || Math.floor(n) !== n) {
+            alert('Limit must be a non-negative integer or empty.');
+            return;
+          }
+          payload.limit = n;
+        }
+        try {
+          await api('/api/budget/limit', { method: 'POST', body: JSON.stringify(payload) });
+          loadBudget();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+    });
+    $$('#budget-table [data-budget-reset]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const apiKey = btn.dataset.budgetReset;
+        if (!confirm(`Reset usage counter for ${apiKey}?`)) return;
+        try {
+          await api('/api/budget/reset', { method: 'POST', body: JSON.stringify({ api_key: apiKey }) });
+          loadBudget();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+    });
   } catch (err) {
-    $('#budget-table tbody').innerHTML = `<tr><td colspan="4" class="error">${esc(err.message)}</td></tr>`;
+    $('#budget-table tbody').innerHTML = `<tr><td colspan="5" class="error">${esc(err.message)}</td></tr>`;
   }
 }
 
@@ -262,6 +383,26 @@ $('#audit-verdict').addEventListener('change', loadAudit);
 let editingPath = null;
 let editOriginal = '';
 
+// Short, plain-English description of what each editable file
+// controls. Shown above the file content in the Config tab so an
+// operator who has never read docs/design/*.md still has a chance of
+// editing the right file. Matched against the file path on display.
+function fileCaption(path) {
+  if (path === 'nanoguard.toml') {
+    return 'Top-level proxy config: listen address, backend, [auth], PII / spotlight / tool gate / schema toggles, [budget], [audit], [reload], [console]. Most keys are reload-safe; a small set (listen, log_level, [backend], db paths, audit path) are restart-only.';
+  }
+  if (path.startsWith('dicts/') && path.includes('pii-regex')) {
+    return 'PII regex dictionary. Each line is `/<regex>/<TAB><ENTITY>` (e.g. `/[a-z]+@[a-z]+/<TAB>EMAIL`). Matched entities are masked, rejected, or logged depending on [input.pii].action.';
+  }
+  if (path.startsWith('dicts/') && path.endsWith('.txt')) {
+    return 'Keyword dictionary used by the input matcher. Each line is `<pattern><TAB><action-key>` where action-key is 0 (block) / 1 (alert) / 2 (flag). Reload-safe.';
+  }
+  if (path.startsWith('policies/') && (path.endsWith('.yaml') || path.endsWith('.yml'))) {
+    return 'YAML policy bundle. Bundles keyword + redaction rules with policy metadata (rule_id, severity, compliance tags) so audit entries carry rule lineage. Reload-safe.';
+  }
+  return '';
+}
+
 async function loadConfig() {
   editingPath = null;
   $('#config-editor').classList.add('hidden');
@@ -269,12 +410,16 @@ async function loadConfig() {
   try {
     const res = await api('/api/config');
     const container = $('#config-list');
-    container.innerHTML = Object.entries(res.files || {}).map(([name, content]) => `
+    container.innerHTML = Object.entries(res.files || {}).map(([name, content]) => {
+      const cap = fileCaption(name);
+      return `
       <div class="config-file">
         <h4>${esc(name)} ${currentUser?.role === 'admin' ? `<button class="btn small" data-edit="${esc(name)}">Edit</button>` : ''}</h4>
+        ${cap ? `<p class="hint subtle file-caption">${esc(cap)}</p>` : ''}
         <pre><code>${esc(content)}</code></pre>
       </div>
-    `).join('');
+    `;
+    }).join('');
     $$('.config-file [data-edit]').forEach(btn => {
       btn.addEventListener('click', () => startEdit(btn.dataset.edit, res.files[btn.dataset.edit]));
     });

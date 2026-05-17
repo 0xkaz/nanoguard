@@ -4,6 +4,20 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — Console Overview "Getting Started" + "Guards Active" panels, Console-side budget editor
+
+The Console's first screen after login used to be three read-only cards (config file count, audit entry presence, budget key count). An operator who just installed nanoguard had no way to learn from the UI **how to send their first request** — there was no proxy URL displayed, no curl example, no Bearer-wiring hint, and no signal about which guards were active. This release fills those gaps:
+
+- **`GET /api/overview` (new)** — single read-only snapshot of the live proxy: `proxy_url` (with `0.0.0.0:*` normalized to `localhost:*` for copy-paste), `auth` mode and `env_marker`, the configured backend, the documented endpoint set (`/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/health`), and a guard digest (input keyword block / PII / spotlighting / output PII / schema / tool gate / policy bundle, each with `enabled` + a short `summary`). Also surfaces the caller's `user_token_count` so the SPA can tell them whether they have a usable token.
+- **Overview "Getting Started" panel** — renders the live proxy URL, a working curl example tailored to whether `[auth]` is enabled, and OpenAI-SDK env-var snippets so a user can paste `OPENAI_BASE_URL=http://localhost:8080/v1` into their app. Inline links jump to the Tokens tab.
+- **Overview "Guards Active" panel** — renders the guard digest with green/grey dots so the operator can see at a glance what is on and what is off, plus a hint pointing at the Config tab for changes.
+- **Config tab captions** — each file under `nanoguard.toml` / `dicts/*.txt` / `policies/*.yaml` now carries a one-line plain-English description above the content ("what does this file control"). Previously the SPA dumped raw file content with no guidance.
+- **Budget tab inline editor (admin-only)** — per-row "Edit limit" and "Reset usage" buttons fire `POST /api/budget/limit` and `POST /api/budget/reset` respectively. Both write the same `api_key_limits` / `api_key_usage` tables the proxy admin API writes, so an operator who only has Console session does not also need an `ADMIN_API_KEY` to manage caps. Both endpoints rotate CSRF, gate on `require_admin`, and record a `budget_set_limit` / `budget_reset_usage` line in `console-audit.jsonl` so changes have a paper trail.
+- **README "Point your app at the proxy" section** — adds step 4 in the Web Configuration UI walkthrough with the same curl + SDK form the Overview panel renders, so a reader who has not opened the Console yet still has a working snippet.
+- **e2e scenario 34** — covers the new surface end-to-end: `/api/overview` shape (URL normalization, backend digest, guard count, PII enabled flag, endpoint list), the budget limit set/clear/persist round-trip via SQLite, the usage reset round-trip, and the admin-only gate (viewer is 403 on `/api/budget/limit`).
+
+`tools/e2e.sh` is now at 144 assertions (was 134 at PR #40 merge).
+
 ### Added — Console e2e Phase C: session lifecycle, cross-user revoke, backup pruning, audit shape
 
 Four new scenarios that fence the remaining operational surface of the Web Console:

@@ -180,3 +180,42 @@ dialog::backdrop { background: rgba(0,0,0,.6); }
 h2 { margin-top: 0; font-size: 1.25rem; }
 h3 { margin-top: 0; font-size: 1.05rem; }
 h4 { margin-top: 0; font-size: .95rem; }
+
+/* Overview: Getting Started + Guards Active */
+.card.wide { grid-column: 1 / -1; margin-bottom: 1rem; }
+#getting-started-body .hint,
+#guards-body .hint { font-size: .9rem; color: #cbd5e1; }
+.hint.ok    { color: #4ade80; }
+.hint.warn  { color: #facc15; }
+.hint.subtle { color: #94a3b8; font-size: .8rem; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: .25rem .75rem; margin: .5rem 0; }
+dl.kv dt { color: #94a3b8; font-size: .85rem; }
+dl.kv dd { margin: 0; font-size: .9rem; }
+ul.endpoints { list-style: none; padding: 0; margin: 0; }
+ul.endpoints li { font-size: .85rem; }
+pre.example {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 4px;
+  padding: .6rem .8rem;
+  font-size: .8rem;
+  overflow-x: auto;
+  white-space: pre;
+}
+ul.guard-list { list-style: none; padding: 0; margin: 0; }
+ul.guard-list li.guard {
+  display: grid;
+  grid-template-columns: 12px 220px 1fr;
+  gap: .5rem;
+  align-items: center;
+  padding: .25rem 0;
+  font-size: .9rem;
+}
+li.guard .dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #475569;
+}
+li.guard.on .dot  { background: #4ade80; }
+li.guard.off .dot { background: #475569; }
+li.guard .name { color: #e2e8f0; }
+li.guard .summary { color: #94a3b8; font-size: .85rem; }
