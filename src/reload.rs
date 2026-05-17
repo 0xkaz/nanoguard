@@ -213,6 +213,49 @@ pub fn build_app_state(mut cfg: config::Config, runtime: RuntimeHandles) -> Resu
     })
 }
 
+/// Run a single reload attempt on the blocking pool and emit an audit entry.
+#[cfg(unix)]
+async fn execute_reload(shared: &SharedState, runtime: &RuntimeHandles) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
+    let shared_for_task = shared.clone();
+    let runtime_for_task = runtime.clone();
+    let result =
+        tokio::task::spawn_blocking(move || reload_once(&shared_for_task, &runtime_for_task))
+            .await;
+    match result {
+        Ok(Ok(())) => {
+            let elapsed_us = t0.elapsed().as_micros() as u64;
+            tracing::info!("hot reload: success ({}µs)", elapsed_us);
+            emit_reload_audit(shared, true, None, elapsed_us);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let elapsed_us = t0.elapsed().as_micros() as u64;
+            let reason = classify_reload_error(&e);
+            // Full chain is local-debug only; it can carry config /
+            // policy / schema content that we do not want to persist.
+            tracing::debug!("hot reload: error chain: {e:#}");
+            tracing::warn!(
+                "hot reload: FAILED ({}µs) — live state retained: {}",
+                elapsed_us,
+                reason
+            );
+            emit_reload_audit(shared, false, Some(reason.to_string()), elapsed_us);
+            Err(reason.to_string())
+        }
+        Err(join_err) => {
+            let elapsed_us = t0.elapsed().as_micros() as u64;
+            tracing::warn!(
+                "hot reload: blocking task failed ({}µs): {}",
+                elapsed_us,
+                join_err
+            );
+            emit_reload_audit(shared, false, Some("build_failed".to_string()), elapsed_us);
+            Err("build_failed".to_string())
+        }
+    }
+}
+
 /// Run the SIGHUP-driven reload loop on the current task.
 ///
 /// On each SIGHUP, re-read the config from the env-or-default path, run
@@ -239,46 +282,88 @@ pub async fn run_reload_task(shared: SharedState, runtime: RuntimeHandles) {
 
     while sig.recv().await.is_some() {
         tracing::info!("hot reload: SIGHUP received, rebuilding state");
-        let t0 = std::time::Instant::now();
-        // The config + dict + policy reads and the matcher / redactor /
-        // schema rebuilds are all blocking I/O and CPU work. Run them
-        // on the blocking thread pool so they cannot stall the Tokio
-        // worker that's also responsible for the SIGHUP stream and the
-        // graceful-shutdown listener.
-        let shared_for_task = shared.clone();
-        let runtime_for_task = runtime.clone();
-        let result =
-            tokio::task::spawn_blocking(move || reload_once(&shared_for_task, &runtime_for_task))
-                .await;
-        match result {
-            Ok(Ok(())) => {
-                let elapsed_us = t0.elapsed().as_micros() as u64;
-                tracing::info!("hot reload: success ({}µs)", elapsed_us);
-                emit_reload_audit(&shared, true, None, elapsed_us);
-            }
-            Ok(Err(e)) => {
-                let elapsed_us = t0.elapsed().as_micros() as u64;
-                let reason = classify_reload_error(&e);
-                // Full chain is local-debug only; it can carry config /
-                // policy / schema content that we do not want to persist.
-                tracing::debug!("hot reload: error chain: {e:#}");
-                tracing::warn!(
-                    "hot reload: FAILED ({}µs) — live state retained: {}",
-                    elapsed_us,
-                    reason
-                );
-                emit_reload_audit(&shared, false, Some(reason.to_string()), elapsed_us);
-            }
-            Err(join_err) => {
-                let elapsed_us = t0.elapsed().as_micros() as u64;
-                tracing::warn!(
-                    "hot reload: blocking task failed ({}µs): {}",
-                    elapsed_us,
-                    join_err
-                );
-                emit_reload_audit(&shared, false, Some("build_failed".to_string()), elapsed_us);
-            }
+        let _ = execute_reload(&shared, &runtime).await;
+    }
+}
+
+/// Run a Unix-domain-socket listener that accepts `RELOAD\n` and replies
+/// `OK\n` or `ERR <reason>\n`.
+///
+/// The socket path is unlinked before bind so a stale socket from a prior
+/// process does not block startup.
+#[cfg(unix)]
+pub async fn run_socket_reload_task(
+    shared: SharedState,
+    runtime: RuntimeHandles,
+    socket_path: String,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    let path = std::path::Path::new(&socket_path);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!("failed to remove old reload socket file {socket_path}: {e}");
+            return;
         }
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!("failed to create reload socket parent dir {parent:?}: {e}");
+            return;
+        }
+    }
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("failed to bind reload socket {socket_path}: {e}");
+            return;
+        }
+    };
+
+    tracing::info!("hot reload: Unix socket listener on {socket_path}");
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("reload socket accept error: {e}");
+                continue;
+            }
+        };
+
+        let shared = shared.clone();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+
+            if let Err(e) = reader.read_line(&mut line).await {
+                let _ = write_half
+                    .write_all(format!("ERR read error: {e}\n").as_bytes())
+                    .await;
+                return;
+            }
+
+            if line.trim() != "RELOAD" {
+                let _ = write_half.write_all(b"ERR expected RELOAD\\n\n").await;
+                return;
+            }
+
+            tracing::info!("hot reload: socket received RELOAD, rebuilding state");
+            match execute_reload(&shared, &runtime).await {
+                Ok(()) => {
+                    let _ = write_half.write_all(b"OK\n").await;
+                }
+                Err(reason) => {
+                    let _ = write_half
+                        .write_all(format!("ERR {reason}\n").as_bytes())
+                        .await;
+                }
+            }
+        });
     }
 }
 
@@ -420,4 +505,147 @@ fn classify_reload_error(e: &anyhow::Error) -> &'static str {
         }
     }
     "build_failed"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn socket_reload_responds_ok_or_err() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let socket_path = format!("/tmp/ng-sock-test-{:x}", rand::random::<u32>());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let cfg = crate::config::Config {
+            nanoguard: crate::config::ServerConfig::default(),
+            backend: crate::config::BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            },
+            input: crate::config::InputConfig::default(),
+            output: crate::config::OutputConfig::default(),
+            budget: crate::config::BudgetConfig::default(),
+            audit: crate::config::AuditConfig::default(),
+            tools: crate::config::ToolsConfig::default(),
+            policies: crate::config::PoliciesConfig::default(),
+            auth: crate::config::AuthConfig::default(),
+            console: crate::config::ConsoleConfig {
+                listen: crate::config::ConsoleConfig::default_listen(),
+                session_secret: "test-secret-for-unit-tests-only-do-not-use".to_string(),
+                session_ttl_hours: 24,
+                audit_path: "console-audit.jsonl".to_string(),
+                backup_limit: 20,
+                auth: crate::config::ConsoleAuthConfig::default(),
+            },
+            reload: crate::config::ReloadConfig::default(),
+        };
+        let backend = crate::backend::Backend::new(cfg.backend.clone());
+        let http_client = reqwest::Client::new();
+        let runtime = RuntimeHandles {
+            backend,
+            http_client,
+            budget: None,
+            audit: None,
+            client_auth: None,
+        };
+
+        let state = build_app_state(cfg, runtime.clone()).unwrap();
+        let shared: SharedState = Arc::new(ArcSwap::from_pointee(state));
+
+        let listener_task =
+            tokio::spawn(run_socket_reload_task(shared, runtime, socket_path.clone()));
+
+        // Give the listener time to bind.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        stream.write_all(b"RELOAD\n").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.starts_with("OK") || resp.starts_with("ERR"),
+            "unexpected response: {resp}"
+        );
+
+        listener_task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn socket_reload_rejects_invalid_command() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let socket_path = format!("/tmp/ng-sock-badcmd-{:x}", rand::random::<u32>());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let cfg = crate::config::Config {
+            nanoguard: crate::config::ServerConfig::default(),
+            backend: crate::config::BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            },
+            input: crate::config::InputConfig::default(),
+            output: crate::config::OutputConfig::default(),
+            budget: crate::config::BudgetConfig::default(),
+            audit: crate::config::AuditConfig::default(),
+            tools: crate::config::ToolsConfig::default(),
+            policies: crate::config::PoliciesConfig::default(),
+            auth: crate::config::AuthConfig::default(),
+            console: crate::config::ConsoleConfig {
+                listen: crate::config::ConsoleConfig::default_listen(),
+                session_secret: "test-secret-for-unit-tests-only-do-not-use".to_string(),
+                session_ttl_hours: 24,
+                audit_path: "console-audit.jsonl".to_string(),
+                backup_limit: 20,
+                auth: crate::config::ConsoleAuthConfig::default(),
+            },
+            reload: crate::config::ReloadConfig::default(),
+        };
+        let backend = crate::backend::Backend::new(cfg.backend.clone());
+        let http_client = reqwest::Client::new();
+        let runtime = RuntimeHandles {
+            backend,
+            http_client,
+            budget: None,
+            audit: None,
+            client_auth: None,
+        };
+
+        let state = build_app_state(cfg, runtime.clone()).unwrap();
+        let shared: SharedState = Arc::new(ArcSwap::from_pointee(state));
+
+        let listener_task =
+            tokio::spawn(run_socket_reload_task(shared, runtime, socket_path.clone()));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        stream.write_all(b"PING\n").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.starts_with("ERR expected RELOAD"),
+            "unexpected response: {resp}"
+        );
+
+        listener_task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
 }

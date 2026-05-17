@@ -162,6 +162,19 @@ async fn main() -> Result<()> {
         })
     };
 
+    // Optional Unix-domain-socket reload listener.
+    #[cfg(unix)]
+    let _socket_task = if let Some(ref socket_path) = cfg.reload.socket {
+        let shared = shared.clone();
+        let runtime = runtime.clone();
+        let socket_path = socket_path.clone();
+        Some(tokio::spawn(async move {
+            reload::run_socket_reload_task(shared, runtime, socket_path).await;
+        }))
+    } else {
+        None
+    };
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
