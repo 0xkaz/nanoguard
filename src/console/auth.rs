@@ -616,8 +616,7 @@ session_idle_timeout_hours = 1
         let sid = generate_session_id();
         let csrf = generate_csrf_token();
         // Session last_seen 2 hours ago → idle
-        let old_last_seen =
-            (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let old_last_seen = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let expires = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
         db.with_conn(|c| {
             c.execute(

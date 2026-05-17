@@ -141,7 +141,10 @@ pub async fn run(
                 }
                 Err(e) => tracing::warn!("Session prune failed: {}", e),
             }
-            match prune_state.db.with_conn(|conn| db::prune_idle_sessions(conn, idle_hours)) {
+            match prune_state
+                .db
+                .with_conn(|conn| db::prune_idle_sessions(conn, idle_hours))
+            {
                 Ok(n) => {
                     if n > 0 {
                         tracing::info!("Pruned {} idle sessions", n);

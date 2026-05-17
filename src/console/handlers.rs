@@ -253,9 +253,9 @@ pub async fn api_login(
     let Some(user) = user else {
         // Record failed attempt even when user does not exist (username enumeration
         // defense: always return the same error and timing).
-        let _ = state.db.with_conn(|conn| {
-            db::record_login_attempt(conn, &body.username, ip)
-        });
+        let _ = state
+            .db
+            .with_conn(|conn| db::record_login_attempt(conn, &body.username, ip));
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
@@ -286,7 +286,9 @@ pub async fn api_login(
     }
 
     let Some(ref hash) = user.password_hash else {
-        let _ = state.db.with_conn(|conn| db::record_login_attempt(conn, &user.username, ip));
+        let _ = state
+            .db
+            .with_conn(|conn| db::record_login_attempt(conn, &user.username, ip));
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
@@ -295,9 +297,9 @@ pub async fn api_login(
     };
 
     if !verify_password(&body.password, hash) {
-        let _ = state.db.with_conn(|conn| {
-            db::record_login_attempt(conn, &user.username, ip)
-        });
+        let _ = state
+            .db
+            .with_conn(|conn| db::record_login_attempt(conn, &user.username, ip));
         // Check if we should lock the account
         let max_attempts = state.config.console.max_login_attempts;
         let lockout_minutes = state.config.console.lockout_duration_minutes;
@@ -309,8 +311,8 @@ pub async fn api_login(
             })
             .unwrap_or(false);
         if should_lock {
-            let until = (chrono::Utc::now() + chrono::Duration::minutes(lockout_minutes))
-                .to_rfc3339();
+            let until =
+                (chrono::Utc::now() + chrono::Duration::minutes(lockout_minutes)).to_rfc3339();
             let _ = state
                 .db
                 .with_conn(|conn| db::set_locked_until(conn, user.id, Some(&until)));

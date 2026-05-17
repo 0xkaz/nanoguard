@@ -456,10 +456,7 @@ pub fn prune_expired_sessions(conn: &Connection) -> anyhow::Result<usize> {
 }
 
 /// Prune sessions whose last_seen_at is older than the idle threshold.
-pub fn prune_idle_sessions(
-    conn: &Connection,
-    idle_timeout_hours: i64,
-) -> anyhow::Result<usize> {
+pub fn prune_idle_sessions(conn: &Connection, idle_timeout_hours: i64) -> anyhow::Result<usize> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(idle_timeout_hours);
     let n = conn.execute(
         "DELETE FROM user_sessions WHERE last_seen_at < ?",
