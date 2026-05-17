@@ -296,14 +296,29 @@ pub async fn run_socket_reload_task(
     runtime: RuntimeHandles,
     socket_path: String,
 ) {
+    use std::os::unix::fs::FileTypeExt;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
     let path = std::path::Path::new(&socket_path);
     if path.exists() {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!("failed to remove old reload socket file {socket_path}: {e}");
-            return;
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.file_type().is_socket() => {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!("failed to remove old reload socket file {socket_path}: {e}");
+                    return;
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "reload socket path {socket_path} exists but is not a Unix socket; refusing to remove"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("failed to stat reload socket path {socket_path}: {e}");
+                return;
+            }
         }
     }
     if let Some(parent) = path.parent() {
@@ -323,6 +338,8 @@ pub async fn run_socket_reload_task(
 
     tracing::info!("hot reload: Unix socket listener on {socket_path}");
 
+    let reload_sem = Arc::new(tokio::sync::Semaphore::new(1));
+
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
@@ -334,6 +351,7 @@ pub async fn run_socket_reload_task(
 
         let shared = shared.clone();
         let runtime = runtime.clone();
+        let reload_sem = reload_sem.clone();
         tokio::spawn(async move {
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
@@ -350,6 +368,14 @@ pub async fn run_socket_reload_task(
                 let _ = write_half.write_all(b"ERR expected RELOAD\\n\n").await;
                 return;
             }
+
+            let _permit = match reload_sem.try_acquire() {
+                Ok(p) => p,
+                Err(_) => {
+                    let _ = write_half.write_all(b"ERR busy\n").await;
+                    return;
+                }
+            };
 
             tracing::info!("hot reload: socket received RELOAD, rebuilding state");
             match execute_reload(&shared, &runtime).await {
@@ -648,6 +674,174 @@ mod tests {
         assert!(
             resp.starts_with("ERR expected RELOAD"),
             "unexpected response: {resp}"
+        );
+
+        listener_task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn socket_reload_refuses_to_delete_non_socket_file() {
+        use tokio::net::UnixStream;
+
+        let socket_path = format!("/tmp/ng-sock-regular-{:x}", rand::random::<u32>());
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Place a regular file where the socket path will be.
+        std::fs::write(&socket_path, b"not a socket").unwrap();
+
+        let cfg = crate::config::Config {
+            nanoguard: crate::config::ServerConfig::default(),
+            backend: crate::config::BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            },
+            input: crate::config::InputConfig::default(),
+            output: crate::config::OutputConfig::default(),
+            budget: crate::config::BudgetConfig::default(),
+            audit: crate::config::AuditConfig::default(),
+            tools: crate::config::ToolsConfig::default(),
+            policies: crate::config::PoliciesConfig::default(),
+            auth: crate::config::AuthConfig::default(),
+            console: crate::config::ConsoleConfig {
+                listen: crate::config::ConsoleConfig::default_listen(),
+                session_secret: "test-secret-for-unit-tests-only-do-not-use".to_string(),
+                session_ttl_hours: 24,
+                audit_path: "console-audit.jsonl".to_string(),
+                backup_limit: 20,
+                session_idle_timeout_hours: None,
+                max_login_attempts: 10,
+                lockout_duration_minutes: 15,
+                auth: crate::config::ConsoleAuthConfig::default(),
+            },
+            reload: crate::config::ReloadConfig::default(),
+        };
+        let backend = crate::backend::Backend::new(cfg.backend.clone());
+        let http_client = reqwest::Client::new();
+        let runtime = RuntimeHandles {
+            backend,
+            http_client,
+            budget: None,
+            audit: None,
+            client_auth: None,
+        };
+
+        let state = build_app_state(cfg, runtime.clone()).unwrap();
+        let shared: SharedState = Arc::new(ArcSwap::from_pointee(state));
+
+        let listener_task =
+            tokio::spawn(run_socket_reload_task(shared, runtime, socket_path.clone()));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Listener should have bailed out because the path is a regular file.
+        let result = UnixStream::connect(&socket_path).await;
+        assert!(
+            result.is_err(),
+            "expected connect to fail because listener did not start"
+        );
+
+        // Regular file must still exist (we did NOT delete it).
+        assert!(std::path::Path::new(&socket_path).exists());
+
+        listener_task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn socket_reload_returns_busy_when_concurrent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let socket_path = format!("/tmp/ng-sock-busy-{:x}", rand::random::<u32>());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let cfg = crate::config::Config {
+            nanoguard: crate::config::ServerConfig::default(),
+            backend: crate::config::BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            },
+            input: crate::config::InputConfig::default(),
+            output: crate::config::OutputConfig::default(),
+            budget: crate::config::BudgetConfig::default(),
+            audit: crate::config::AuditConfig::default(),
+            tools: crate::config::ToolsConfig::default(),
+            policies: crate::config::PoliciesConfig::default(),
+            auth: crate::config::AuthConfig::default(),
+            console: crate::config::ConsoleConfig {
+                listen: crate::config::ConsoleConfig::default_listen(),
+                session_secret: "test-secret-for-unit-tests-only-do-not-use".to_string(),
+                session_ttl_hours: 24,
+                audit_path: "console-audit.jsonl".to_string(),
+                backup_limit: 20,
+                session_idle_timeout_hours: None,
+                max_login_attempts: 10,
+                lockout_duration_minutes: 15,
+                auth: crate::config::ConsoleAuthConfig::default(),
+            },
+            reload: crate::config::ReloadConfig::default(),
+        };
+        let backend = crate::backend::Backend::new(cfg.backend.clone());
+        let http_client = reqwest::Client::new();
+        let runtime = RuntimeHandles {
+            backend,
+            http_client,
+            budget: None,
+            audit: None,
+            client_auth: None,
+        };
+
+        let state = build_app_state(cfg, runtime.clone()).unwrap();
+        let shared: SharedState = Arc::new(ArcSwap::from_pointee(state));
+
+        let listener_task =
+            tokio::spawn(run_socket_reload_task(shared, runtime, socket_path.clone()));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let path = socket_path.clone();
+            handles.push(tokio::spawn(async move {
+                let mut stream = UnixStream::connect(&path).await.unwrap();
+                stream.write_all(b"RELOAD\n").await.unwrap();
+                stream.flush().await.unwrap();
+
+                let mut buf = [0u8; 256];
+                let n = stream.read(&mut buf).await.unwrap();
+                String::from_utf8_lossy(&buf[..n]).to_string()
+            }));
+        }
+
+        let responses: Vec<String> = futures_util::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let busy_count = responses
+            .iter()
+            .filter(|r| r.starts_with("ERR busy"))
+            .count();
+        let bad_cmd_count = responses
+            .iter()
+            .filter(|r| r.starts_with("ERR expected RELOAD"))
+            .count();
+
+        assert!(
+            busy_count >= 1,
+            "expected at least one ERR busy, got: {responses:?}"
+        );
+        assert_eq!(
+            bad_cmd_count, 0,
+            "unexpected bad-command errors: {responses:?}"
         );
 
         listener_task.abort();
