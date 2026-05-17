@@ -116,9 +116,18 @@ wait_for_url() {
 # same port races EADDRINUSE and fail-fast kills the whole stack.
 # Force-kill + a tiny sleep removes the flake from the equation.
 kill_leftover_nanoguards() {
-    for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v -- "-admin\|-eval" || true); do
-        kill -9 "$pid" 2>/dev/null || true
-    done
+    # `pgrep -f` returns PIDs only; piping that to `grep -v ...`
+    # filters PID *strings*, never the cmdline, so `nanoguard-admin`
+    # / `nanoguard-eval` would have been swept too. Use `-af` to get
+    # `PID CMD` pairs and filter on CMD inside the loop. We're only
+    # trying to clean up zombie `nanoguard` proxies between e2e
+    # scenarios, never the offline CLIs.
+    while read -r pid cmd; do
+        case "$cmd" in
+            *nanoguard-admin*|*nanoguard-eval*) continue ;;
+        esac
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+    done < <(pgrep -af "target/release/nanoguard($|-)" 2>/dev/null || true)
     sleep 0.3
 }
 
@@ -131,20 +140,18 @@ cleanup() {
     # next e2e run sees flaky port-bind failures. Tear it down here so
     # the trap is honest about cleaning every child it knows about.
     [ -n "${CONSOLE_PID:-}" ] && kill "$CONSOLE_PID" 2>/dev/null || true
-    # Belt-and-suspenders: if a scenario re-used CONSOLE_PID across
-    # iterations and we never captured the intermediate value, sweep
-    # any remaining nanoguard-console process owned by this user.
-    for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do
-        kill "$pid" 2>/dev/null || true
-    done
+    # Sweep any zombie `nanoguard` proxy from a flaky tear-down so
+    # the next run doesn't see EADDRINUSE on $NG_PORT. The helper
+    # only targets the proxy binary, never `nanoguard-admin` or
+    # `nanoguard-eval`.
+    kill_leftover_nanoguards 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 # Make sure no leftover process is holding our ports.
 for pid in $(pgrep -f "tools/mock_backend.py" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
-for pid in $(pgrep -f "target/release/nanoguard" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
-for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
+kill_leftover_nanoguards
 sleep 0.3
 
 info "starting mock backend on :$MOCK_PORT"
@@ -1065,10 +1072,7 @@ info "scenario 26: console-UI-issued tokens are accepted (and revocable) by the 
 # Tear down the previous proxy. Console is a fresh process started below.
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
-# Make sure no leftover console from a previous run holds :18081.
-for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do
-    kill "$pid" 2>/dev/null || true
-done
+kill_leftover_nanoguards
 
 # The standalone nanoguard-console binary was retired when
 # single-process boot landed. Every scenario starts exactly one
@@ -2756,9 +2760,7 @@ info "scenario 35: multi-backend routing dispatches by model"
 # old process pointing at the old mock.
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
-for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
-    kill -9 "$pid" 2>/dev/null || true
-done
+kill_leftover_nanoguards
 sleep 0.5
 
 S35_DIR="$LOGDIR/e2e.s35.workdir"
@@ -2952,9 +2954,7 @@ info "scenario 36: Console Backends tab — list / create / delete"
 
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
-for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
-    kill -9 "$pid" 2>/dev/null || true
-done
+kill_leftover_nanoguards
 sleep 0.5
 
 S36_DIR="$LOGDIR/e2e.s36.workdir"
@@ -3243,8 +3243,12 @@ assert_eq "37b. single-process console / on :$S37_CONSOLE_PORT" "$CONSOLE" "200"
 
 # 37c. Exactly one nanoguard process is running — confirms the
 # console is in-process, not a forked child.
-PROC_COUNT=$(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null \
-    | grep -v nanoguard-console | wc -l | tr -d ' ')
+# Count proxy processes only — `nanoguard-admin` / `nanoguard-eval`
+# are unrelated CLIs and we filter them on the cmdline (pgrep -af),
+# not the PID output (which would not filter at all).
+PROC_COUNT=$(pgrep -af "target/release/nanoguard($|-)" 2>/dev/null \
+    | grep -vE -- "-admin|-eval" \
+    | wc -l | tr -d ' ')
 case "$PROC_COUNT" in
     1) ok "37c. exactly one nanoguard process serves both ports" ;;
     *) ng "37c. unexpected nanoguard process count: $PROC_COUNT" ;;
@@ -3264,9 +3268,7 @@ wait "$NG_PID" 2>/dev/null || true
 # this, the next `nanoguard` boot hits EADDRINUSE on $S37_CONSOLE_PORT
 # even though the process has exited — TCP TIME_WAIT lingers briefly.
 sleep 0.5
-for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
-    kill -9 "$pid" 2>/dev/null || true
-done
+kill_leftover_nanoguards
 
 # 37e. [console].enabled = false — `nanoguard` alone serves only the
 # proxy. The console port is silent.

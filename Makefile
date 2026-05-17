@@ -208,7 +208,16 @@ run: build ollama-start
 	    count=$$(sqlite3 "$$db_path" "SELECT COUNT(*) FROM users;" 2>/dev/null || echo 0); \
 	    [ "$$count" -gt 0 ] 2>/dev/null && users_exist=1; \
 	fi; \
-	if [ -z "$$CONSOLE_SESSION_SECRET" ]; then \
+	toml_secret=$$(awk ' \
+	    /^[[:space:]]*\[console\][[:space:]]*$$/ { in_console=1; next } \
+	    /^[[:space:]]*\[[^]]+\][[:space:]]*$$/   { in_console=0 } \
+	    in_console && /^[[:space:]]*session_secret[[:space:]]*=/ { \
+	        v=$$0; sub(/^[^=]*=[[:space:]]*/, "", v); \
+	        sub(/[[:space:]]*(#.*)?$$/, "", v); \
+	        gsub(/^"|"$$/, "", v); \
+	        print v; exit \
+	    }' nanoguard.toml); \
+	if [ -z "$$CONSOLE_SESSION_SECRET" ] && [ -z "$$toml_secret" ]; then \
 	    if ! command -v openssl >/dev/null 2>&1; then \
 	        echo "error: CONSOLE_SESSION_SECRET is not set and openssl is not installed."; \
 	        echo "       Either install openssl, set CONSOLE_SESSION_SECRET yourself,"; \
