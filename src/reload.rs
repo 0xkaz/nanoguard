@@ -210,9 +210,35 @@ pub fn build_app_state(mut cfg: config::Config, runtime: RuntimeHandles) -> Resu
     //     picks up new routing immediately.
     let mut pool = runtime.pool.clone();
     let (new_view, _warnings) = cfg.pool()?;
-    // Refresh routing-only fields. If the operator added or removed
-    // a [backends.NAME] entry, that change is intentionally ignored
-    // here — `warn_on_restart_only_drift` warns instead.
+
+    // Cross-validate the new routing against the LIVE pool: the
+    // operator may have added a [routing] rule whose backend is
+    // declared in the new [backends.*] but not yet running (because
+    // [backends.*] is restart-only). Reload-then-route-to-nothing
+    // would silently 400 every matching request. Refuse the reload
+    // with a clear reason so the operator sees the problem now
+    // (audit log gets a reload_failed entry), not in production
+    // when requests start failing.
+    for r in &new_view.rules {
+        if !pool.backends.contains_key(&r.backend) {
+            anyhow::bail!(
+                "[routing] rule for model `{}` references backend `{}` which is not in the LIVE pool. \
+                 Restart the proxy to pick up new [backends.*] entries before adding routes that reference them.",
+                r.model,
+                r.backend,
+            );
+        }
+    }
+    if !pool.backends.contains_key(&new_view.default_backend) {
+        anyhow::bail!(
+            "[routing].default = `{}` is not in the LIVE pool. \
+             Restart the proxy to pick up new [backends.*] entries before changing the default.",
+            new_view.default_backend,
+        );
+    }
+
+    // Validation passed — bind the refreshed routing-only fields.
+    // The runtime backend map stays as-is (restart-only).
     pool.rules = new_view.rules;
     pool.default_backend = new_view.default_backend;
 
@@ -446,9 +472,16 @@ fn reload_once(shared: &SharedState, runtime: &RuntimeHandles) -> anyhow::Result
 /// must stay in sync with `docs/design/hot-reload.md > What is not
 /// reloadable, and why` and with the `docs/operations.md` runbook.
 /// Compare two `Option<BackendConfig>` slots by some field accessor.
-/// Helper for the legacy `[backend]` drift detector: a missing slot
-/// on either side counts as "no change" so we don't warn an operator
-/// who migrated to `[backends.*]` and removed the legacy section.
+/// Helper for the legacy `[backend]` drift detector.
+///
+/// Migration-aware: when either side is `None` (the operator either
+/// hadn't configured `[backend]` yet, or has migrated to
+/// `[backends.*]` and dropped the legacy section), we report "no
+/// change". Only when BOTH sides carry a `[backend]` and a field
+/// genuinely differs does this return true. The earlier
+/// implementation flagged `Some(_)` → `None` as drift, which
+/// produced noisy "[backend].provider changed" warnings on every
+/// SIGHUP during migration.
 #[cfg(unix)]
 fn backend_changed<F>(
     live: &Option<crate::config::BackendConfig>,
@@ -458,7 +491,10 @@ fn backend_changed<F>(
 where
     F: Fn(&Option<crate::config::BackendConfig>) -> Option<&str>,
 {
-    f(live) != f(new)
+    match (live.is_some(), new.is_some()) {
+        (true, true) => f(live) != f(new),
+        _ => false,
+    }
 }
 
 /// Detect whether the `[backends.*]` map structure (label set,

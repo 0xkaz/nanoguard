@@ -713,11 +713,29 @@ function openBackendEditor(existing) {
   if (!provider) return;
   const endpoint = prompt('Endpoint URL:', existing?.endpoint || 'https://api.openai.com');
   if (!endpoint) return;
-  const apiKey = prompt('API key (leave blank to keep current or to send nothing):', '');
+  // 3-state api_key flow. Cancel = keep stored (most common when
+  // editing — operator should not have to retype the secret on
+  // every save). Blank = explicit clear. Non-blank = replace.
+  const apiKeyChoice = existing
+    ? prompt(
+        'API key:\n' +
+          '  • OK with blank input → CLEAR the stored key\n' +
+          '  • OK with a value     → REPLACE\n' +
+          '  • Cancel              → keep the stored key',
+        '',
+      )
+    : prompt('API key (blank = none):', '');
   const model = prompt('Default model (optional):', existing?.model || '');
 
   const body = { provider, endpoint };
-  if (apiKey) body.api_key = apiKey;
+  if (apiKeyChoice === null) {
+    // Cancel — field omitted from JSON → backend keeps current.
+  } else if (apiKeyChoice === '') {
+    // Blank input → explicit null → backend clears.
+    body.api_key = null;
+  } else {
+    body.api_key = apiKeyChoice;
+  }
   if (model) body.model = model;
 
   (async () => {

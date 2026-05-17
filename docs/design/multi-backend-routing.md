@@ -1,6 +1,24 @@
-> **Status:** partial (2026-05-17) — Phase 1 (multi-backend pool, model-name routing, legacy `[backend]` compat, Console Backends tab) shipped. Per-client `allowed_models`, per-route audit verdicts (`model_denied` / `model_unrouted`), and provider-side failover remain proposed.
+> **Status:** partial (2026-05-17)
 
 # Multi-Backend Routing
+
+> ## Shipped vs. Proposed
+>
+> **Shipped in Phase 1** (this iteration):
+> - `[backends.NAME]` schema, multi-pool runtime (one `reqwest` client per backend).
+> - `[routing]` block with `default` + `rules`. Rule patterns: exact string or trailing-`*` glob. Rules scan in declared order, first match wins.
+> - Legacy `[backend]` single-section auto-promoted to `[backends.default]` with synthesized routing default.
+> - Required: `[routing].default` MUST be set whenever more than one backend is configured (no silent first-pick fallback).
+> - `[backends.*]` is restart-only; `[routing]` is hot-reloadable. Reload validates that every new rule references a backend present in the live pool — invalid reloads are refused with a `reload_failed` audit entry.
+> - Console: admin-only Backends tab + `GET|POST /api/backends` and `PUT|DELETE /api/backends/:name`. `api_key` has 3-state semantics (omit = keep, null = clear, string = replace).
+>
+> **Proposed for Phase 2+** (everything below in this document that talks about):
+> - Per-client `allowed_models` and the audit verdicts `model_denied` / `model_unrouted`.
+> - The map-style routing schema (`[routing] "gpt-4o" = "openai"`) — superseded by `[routing.rules]` in the shipped form.
+> - `display_name` per backend, `/v1/models` allowlist intersection.
+> - Provider-side failover and per-backend budget partitioning (explicit non-goals of Phase 1).
+>
+> When reading the rest of this document, assume "shipped" means the bullets above and treat everything else as a future-state specification.
 
 Today `nanoguard.toml` defines a single `[backend]` section. Every
 request is forwarded to that one upstream — OpenAI, or Anthropic,

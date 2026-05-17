@@ -22,7 +22,18 @@ A single proxy can now hold N upstream backends (OpenAI, Anthropic, Ollama, Deep
 - **35** spawns two labelled mock backends on different ports, sets `[routing]` rules for `premium` (exact → `alpha`) and `fast-*` (glob → `beta`), and confirms each request reaches the right mock. Also: unmatched `model` falls back to `[routing].default`; `/api/overview` reports both backends and the rule list.
 - **36** drives the Console Backends API end-to-end: list shows the bootstrap entry, POST creates a new one with `restart_required: true` and the new section appears in `nanoguard.toml`, list now shows 2, duplicate POST is 409, DELETE drops the row, deleting the routing default is 409, viewer (non-admin) is 403 on every endpoint.
 
-`tools/e2e.sh` is now at 163 assertions (was 147 at PR #41 merge).
+`tools/e2e.sh` is now at 169 assertions (was 147 at PR #41 merge).
+
+CodeRabbit review fixes applied during the PR (each closes a real defect, not a stylistic nit):
+
+- **`[routing].default` is strictly required when N>1 backends are configured.** The earlier "pick BTreeMap-first and warn" path silently routed unmatched models to whichever backend sorted alphabetically first; a typo'd model name leaked to an unrelated upstream. `Config::pool()` now refuses to start in that state.
+- **`api_key` field is 3-state in the Console PUT body.** Previously, omitting `api_key` cleared the stored key — exactly the path an operator who hit Save without retyping their secret would take. The field is now `Option<Option<String>>` via a double-Option deserializer: omitted = keep current, explicit null = clear, string = replace. `upsert_backend_in_toml` preserves the rest of the existing entry instead of doing a full overwrite. SPA UI updated with a matching three-choice prompt.
+- **Reload validates `[routing]` against the LIVE pool, not the new TOML.** Because `[backends.*]` is restart-only, a SIGHUP that added a rule pointing at a not-yet-restarted backend used to graft an invalid route onto the live state and silently 400 every matching request. `reload_once` now refuses the swap with a clear `reload_failed` reason.
+- **Routing-miss errors are OpenAI/Anthropic-shaped.** `/v1/chat/completions` now returns the `{error: {message, type, code, param}}` envelope; `/v1/messages` returns `error.type = "invalid_request_error"` matching the Anthropic spec for client-side 400s.
+- **`/api/overview` legacy `backend` field comes from `routing.default`,** not `backends.first()`. Old SPA builds that only read the legacy key now see the active default upstream instead of an alphabetical accident.
+- **`/v1/models` aggregates the full pool.** Queries every backend in parallel, tags each model with `owned_by = <backend label>`, fails soft on per-backend errors (returns 502 only when every upstream fails), surfaces partial failures under `partial_errors`.
+- **`backend_changed` is migration-aware.** Removing legacy `[backend]` in favor of `[backends.*]` no longer fires spurious "[backend].provider changed" drift warnings on SIGHUP.
+- **`docs/design/multi-backend-routing.md`** opens with a "Shipped vs Proposed" call-out so a reader sees Phase 1 boundaries before scrolling into Phase 2 / proposed material.
 
 **Migration.** Existing single-`[backend]` deployments keep working as-is; no migration is required. To move a deployment to multi-backend, add a `[backends.NAME]` section and remove the legacy `[backend]` block (or leave it — the startup warning is informational).
 

@@ -1089,14 +1089,39 @@ pub async fn api_reset_budget_usage(
 // + reload trigger come from the same helpers the file-edit
 // machinery uses.
 
+/// Backend create/update request body.
+///
+/// `api_key` is a deliberate three-state value to avoid the
+/// "operator hit Save without retyping the key and we silently
+/// cleared it" footgun:
+///
+/// - field omitted from JSON  → `None`           → keep stored key
+/// - `"api_key": null`        → `Some(None)`     → clear stored key
+/// - `"api_key": "sk-..."`    → `Some(Some(s))`  → replace with `s`
+///
+/// `serde(default, with = ...)` realizes the distinction via the
+/// double-Option deserializer below.
 #[derive(Deserialize)]
 pub struct BackendUpsertRequest {
     pub provider: String,
     pub endpoint: String,
-    #[serde(default)]
-    pub api_key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub api_key: Option<Option<String>>,
     #[serde(default)]
     pub model: Option<String>,
+}
+
+fn deserialize_some_option<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // If the field is present, deserialize as Option<String> (null
+    // becomes Some(None) via the outer Option wrapping). If the
+    // field is absent, serde's `default` short-circuits to None,
+    // which the handler reads as "keep current".
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Re-parse nanoguard.toml from disk. The ConsoleState holds the
@@ -1441,12 +1466,36 @@ fn upsert_backend_in_toml(name: &str, body: &BackendUpsertRequest) -> anyhow::Re
     // standalone empty header — only [backends.NAME] subtables show.
     backends_tbl.set_implicit(true);
 
-    let mut entry = toml_edit::Table::new();
+    // Preserve the existing entry if there is one — so the api_key
+    // 3-state semantics work: "keep current" leaves the stored value
+    // exactly as it was on disk. A full insert would silently drop
+    // any field not explicitly sent in the request.
+    let existing = backends_tbl
+        .get(name)
+        .and_then(|i| i.as_table())
+        .cloned()
+        .unwrap_or_default();
+    let mut entry = existing;
+
     entry.insert("provider", toml_edit::value(body.provider.clone()));
     entry.insert("endpoint", toml_edit::value(body.endpoint.clone()));
-    if let Some(ref k) = body.api_key {
-        entry.insert("api_key", toml_edit::value(k.clone()));
+    match &body.api_key {
+        // Omitted: keep stored key. No mutation.
+        None => {}
+        // Explicit null: clear stored key.
+        Some(None) => {
+            entry.remove("api_key");
+        }
+        // String: replace.
+        Some(Some(k)) => {
+            entry.insert("api_key", toml_edit::value(k.clone()));
+        }
     }
+    // `model` mirrors `api_key`'s "field omitted = keep current"
+    // rule. Since `entry` is the cloned existing table, doing
+    // nothing here preserves the prior model field. If serde
+    // someday gives `model` the same 3-state shape, switch this
+    // branch to follow.
     if let Some(ref m) = body.model {
         entry.insert("model", toml_edit::value(m.clone()));
     }
@@ -1503,11 +1552,24 @@ fn record_backend_mutation(
         )
         .with_target(name.to_string());
         if let Some(b) = body {
+            // The audit shape for api_key reflects the request
+            // intent, NOT the stored result — because the stored
+            // value depends on the pre-mutation state (which the
+            // audit writer doesn't see). null/false = caller asked
+            // to clear; string/true = caller sent a new value;
+            // omitted = caller asked to keep current. Operators
+            // reading the audit log get the action, not just the
+            // resulting state.
+            let api_key_intent = match &b.api_key {
+                None => json!("keep"),
+                Some(None) => json!("clear"),
+                Some(Some(_)) => json!("replace"),
+            };
             rec = rec.with_after(json!({
                 "name": name,
                 "provider": b.provider,
                 "endpoint": b.endpoint,
-                "has_api_key": b.api_key.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                "api_key_intent": api_key_intent,
                 "model": b.model,
             }));
         }
@@ -1689,9 +1751,22 @@ pub async fn api_overview(
         })).collect::<Vec<_>>(),
     });
     // Legacy single-backend digest stays under `backend` for SPA
-    // compatibility — it's the first (only, in legacy mode) entry
-    // of `backends`. New SPA code reads `backends` + `routing`.
-    let backend = backends.first().cloned().unwrap_or_else(|| json!({}));
+    // compatibility. Pick the routing default rather than
+    // `backends.first()` — with multiple backends `.first()` is
+    // BTreeMap-alphabetical, which lies to old SPA builds about
+    // which upstream is actually serving unmatched requests. The
+    // default is what those callers used to see when only one
+    // backend was configured.
+    let backend = backends
+        .iter()
+        .find(|b| {
+            b.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n == pool_view.default_backend)
+        })
+        .cloned()
+        .or_else(|| backends.first().cloned())
+        .unwrap_or_else(|| json!({}));
 
     // Count this user's live (non-revoked) tokens so the SPA can
     // say "you have N tokens" inline, without making the operator

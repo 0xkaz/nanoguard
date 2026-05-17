@@ -191,14 +191,18 @@ impl Config {
         } else if backends.len() == 1 {
             backends.keys().next().unwrap().clone()
         } else {
-            let first = backends.keys().next().unwrap().clone();
-            warnings.push(format!(
-                "[routing].default not set with {} backends; falling back to `{}`. \
-                 Set [routing].default explicitly to avoid surprise.",
+            // With more than one backend the operator MUST declare which
+            // one catches unmatched models. Silently picking
+            // "BTreeMap-first" would route a typo'd model name to an
+            // unrelated upstream — a quiet correctness failure that
+            // costs money (wrong provider) or leaks data (wrong region).
+            // Fail loudly so the operator sees the choice at startup
+            // instead of in a billing line item later.
+            anyhow::bail!(
+                "[routing].default is required with {} backends configured. \
+                 Add `default = \"<backend-name>\"` to [routing] in nanoguard.toml.",
                 backends.len(),
-                first
-            ));
-            first
+            );
         };
 
         Ok((

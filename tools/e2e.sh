@@ -2843,12 +2843,53 @@ assert_eq "35d-default. routing default is alpha" "$ROUTING_DEFAULT" "alpha"
 N_RULES=$(echo "$OV" | jq -r '.routing.rules | length')
 assert_eq "35d-rules. routing has 2 rules" "$N_RULES" "2"
 
+# 35e. /v1/models aggregates the pool. Each backend's response
+# carries its label as `owned_by`, so a single GET /v1/models tells
+# the operator which upstream serves what.
+MODELS=$(curl -s "$NG_URL/v1/models")
+N_MODELS=$(echo "$MODELS" | jq -r '.data | length')
+case "$N_MODELS" in
+    [1-9]*) ok "35e. /v1/models aggregates across the pool (count = $N_MODELS)" ;;
+    *)      ng "35e. /v1/models returned no entries: $MODELS" ;;
+esac
+
+# At least one entry should be tagged with each backend label.
+HAS_ALPHA=$(echo "$MODELS" | jq -r '[.data[] | select(.owned_by == "alpha")] | length')
+HAS_BETA=$(echo "$MODELS" | jq -r '[.data[] | select(.owned_by == "beta")] | length')
+case "$HAS_ALPHA$HAS_BETA" in
+    0*|*0) ng "35e-labels. expected models tagged with both backend labels; got alpha=$HAS_ALPHA beta=$HAS_BETA" ;;
+    *)     ok "35e-labels. /v1/models entries are tagged with backend labels" ;;
+esac
+
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 kill "$S35_MOCK_A_PID" "$S35_MOCK_B_PID" 2>/dev/null || true
 wait "$S35_MOCK_A_PID" "$S35_MOCK_B_PID" 2>/dev/null || true
+
+# 35f. Strict default: two backends without [routing].default MUST
+# refuse to start. Without this guard the proxy silently picked
+# `BTreeMap-first` (alphabetical), and a typo'd model name would
+# leak to whatever backend happened to sort first.
+S35_BAD_TOML="$S35_DIR/no-default.toml"
+sed '/^default = /d' "$S35_TOML" > "$S35_BAD_TOML"
+sleep 0.3
+S35_BAD_LOG="$LOGDIR/ng.s35.bad.log"
+NANOGUARD_CONFIG="$S35_BAD_TOML" "$BIN" > "$S35_BAD_LOG" 2>&1 &
+BAD_PID=$!
+sleep 0.6
+if kill -0 "$BAD_PID" 2>/dev/null; then
+    ng "35f. proxy started without [routing].default with 2 backends — should have refused"
+    kill "$BAD_PID" 2>/dev/null
+else
+    if grep -q "\[routing\].default is required" "$S35_BAD_LOG"; then
+        ok "35f. proxy refuses to start without [routing].default when N>1"
+    else
+        ng "35f. proxy exited but for the wrong reason; log: $(tail -3 "$S35_BAD_LOG" | tr '\n' ' ')"
+    fi
+fi
+wait "$BAD_PID" 2>/dev/null || true
 
 # --- 36. Console Backends tab — list / create / delete via API ----------
 # Scenario 35 proved routing on the proxy side; 36 walks the Console
@@ -3029,6 +3070,54 @@ V_ADD=$(curl -s -o /dev/null -w "%{http_code}" \
     -d '{"provider":"openai","endpoint":"http://127.0.0.1:11700"}' \
     "$S36_CONSOLE_URL/api/backends?name=v-add")
 assert_eq "36i. viewer POST /api/backends is 403" "$V_ADD" "403"
+
+# 36j-l. api_key 3-state: omit / null / string. Seed a backend with
+# a known key, then exercise each path.
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+curl -s -o /dev/null -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11700","api_key":"sk-initial"}' \
+    "$S36_CONSOLE_URL/api/backends?name=keyed"
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# Omit api_key on PUT → should keep "sk-initial".
+curl -s -o /dev/null -X PUT -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11701"}' \
+    "$S36_CONSOLE_URL/api/backends/keyed"
+KEPT=$(grep -A 4 '^\[backends.keyed\]' "$S36_TOML" | grep '^api_key' | head -n1)
+case "$KEPT" in
+    *'sk-initial'*) ok "36j. api_key omit keeps stored key (sk-initial)" ;;
+    *) ng "36j. api_key omit cleared or mangled the stored key; got: $KEPT" ;;
+esac
+
+# Explicit null → should clear.
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+curl -s -o /dev/null -X PUT -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11701","api_key":null}' \
+    "$S36_CONSOLE_URL/api/backends/keyed"
+if grep -A 4 '^\[backends.keyed\]' "$S36_TOML" | grep -q '^api_key'; then
+    ng "36k. api_key null did not clear the stored key"
+else
+    ok "36k. api_key explicit null clears the stored key"
+fi
+
+# String → should replace.
+ADMIN_CSRF=$(curl -s -b "$S36_COOKIES" "$S36_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+curl -s -o /dev/null -X PUT -b "$S36_COOKIES" -c "$S36_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:11701","api_key":"sk-rotated"}' \
+    "$S36_CONSOLE_URL/api/backends/keyed"
+ROTATED=$(grep -A 4 '^\[backends.keyed\]' "$S36_TOML" | grep '^api_key' | head -n1)
+case "$ROTATED" in
+    *'sk-rotated'*) ok "36l. api_key string value replaces the stored key" ;;
+    *) ng "36l. api_key string did not replace; got: $ROTATED" ;;
+esac
 
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true

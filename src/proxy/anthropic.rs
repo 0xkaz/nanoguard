@@ -242,7 +242,13 @@ pub async fn messages(
             );
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"type":"error","error":{"type":"api_error","message":format!("no backend configured for model `{}`", req.model)}})),
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!("no backend configured for model `{}`", req.model),
+                    },
+                })),
             )
                 .into_response();
         }
