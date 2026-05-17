@@ -296,14 +296,29 @@ pub async fn run_socket_reload_task(
     runtime: RuntimeHandles,
     socket_path: String,
 ) {
+    use std::os::unix::fs::FileTypeExt;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
     let path = std::path::Path::new(&socket_path);
     if path.exists() {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!("failed to remove old reload socket file {socket_path}: {e}");
-            return;
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.file_type().is_socket() => {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!("failed to remove old reload socket file {socket_path}: {e}");
+                    return;
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "reload socket path {socket_path} exists but is not a Unix socket; refusing to remove"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("failed to stat reload socket path {socket_path}: {e}");
+                return;
+            }
         }
     }
     if let Some(parent) = path.parent() {
@@ -643,6 +658,74 @@ mod tests {
             resp.starts_with("ERR expected RELOAD"),
             "unexpected response: {resp}"
         );
+
+        listener_task.abort();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn socket_reload_refuses_to_delete_non_socket_file() {
+        use tokio::net::UnixStream;
+
+        let socket_path = format!("/tmp/ng-sock-regular-{:x}", rand::random::<u32>());
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Place a regular file where the socket path will be.
+        std::fs::write(&socket_path, b"not a socket").unwrap();
+
+        let cfg = crate::config::Config {
+            nanoguard: crate::config::ServerConfig::default(),
+            backend: crate::config::BackendConfig {
+                provider: "ollama".to_string(),
+                endpoint: "http://localhost:11434".to_string(),
+                api_key: None,
+                model: None,
+            },
+            input: crate::config::InputConfig::default(),
+            output: crate::config::OutputConfig::default(),
+            budget: crate::config::BudgetConfig::default(),
+            audit: crate::config::AuditConfig::default(),
+            tools: crate::config::ToolsConfig::default(),
+            policies: crate::config::PoliciesConfig::default(),
+            auth: crate::config::AuthConfig::default(),
+            console: crate::config::ConsoleConfig {
+                listen: crate::config::ConsoleConfig::default_listen(),
+                session_secret: "test-secret-for-unit-tests-only-do-not-use".to_string(),
+                session_ttl_hours: 24,
+                audit_path: "console-audit.jsonl".to_string(),
+                backup_limit: 20,
+                auth: crate::config::ConsoleAuthConfig::default(),
+            },
+            reload: crate::config::ReloadConfig::default(),
+        };
+        let backend = crate::backend::Backend::new(cfg.backend.clone());
+        let http_client = reqwest::Client::new();
+        let runtime = RuntimeHandles {
+            backend,
+            http_client,
+            budget: None,
+            audit: None,
+            client_auth: None,
+        };
+
+        let state = build_app_state(cfg, runtime.clone()).unwrap();
+        let shared: SharedState = Arc::new(ArcSwap::from_pointee(state));
+
+        let listener_task =
+            tokio::spawn(run_socket_reload_task(shared, runtime, socket_path.clone()));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Listener should have bailed out because the path is a regular file.
+        let result = UnixStream::connect(&socket_path).await;
+        assert!(
+            result.is_err(),
+            "expected connect to fail because listener did not start"
+        );
+
+        // Regular file must still exist (we did NOT delete it).
+        assert!(std::path::Path::new(&socket_path).exists());
 
         listener_task.abort();
         let _ = std::fs::remove_file(&socket_path);
