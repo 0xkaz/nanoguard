@@ -48,9 +48,8 @@ pub async fn run(
         let secret = hex::encode(bytes);
 
         tracing::warn!(
-            "[console] session_secret is empty; using ephemeral secret '{}'. \
-             Set CONSOLE_SESSION_SECRET (or [console] session_secret in nanoguard.toml) to persist sessions across restarts.",
-            secret
+            "[console] session_secret is empty; generated ephemeral secret. \
+             Set CONSOLE_SESSION_SECRET (or [console] session_secret in nanoguard.toml) to persist sessions across restarts."
         );
         config.console.session_secret = secret;
     }
