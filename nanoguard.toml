@@ -69,6 +69,8 @@ hash_only = true                       # true = SHA-256 hash of prompt only (pri
 listen         = "127.0.0.1:8081"          # loopback only by default; non-loopback auto-enables Secure cookies
 # session_secret = "${CONSOLE_SESSION_SECRET}"
 session_ttl_hours = 24
+# audit_path     = "console-audit.jsonl"     # admin-edit log (Phase 2)
+# backup_limit   = 20                        # max .nanoguard-backups/ per file (Phase 2; 0 disables pruning)
 
 [console.auth]
 mode = "local"                              # Phase 1 supports "local" only; OIDC is Phase 4

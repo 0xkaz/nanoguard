@@ -469,6 +469,11 @@ pub struct ConsoleConfig {
     pub session_ttl_hours: i64,
     #[serde(default = "default_console_audit_path")]
     pub audit_path: String,
+    /// Maximum number of backup files retained per edited config file
+    /// under `.nanoguard-backups/`. Older backups are pruned after each
+    /// successful write.
+    #[serde(default = "default_backup_limit")]
+    pub backup_limit: usize,
     #[serde(default)]
     pub auth: ConsoleAuthConfig,
 }
@@ -490,6 +495,7 @@ impl Default for ConsoleConfig {
             session_secret: String::new(),
             session_ttl_hours: default_session_ttl_hours(),
             audit_path: default_console_audit_path(),
+            backup_limit: default_backup_limit(),
             auth: ConsoleAuthConfig::default(),
         }
     }
@@ -501,6 +507,10 @@ fn default_session_ttl_hours() -> i64 {
 
 fn default_console_audit_path() -> String {
     "console-audit.jsonl".to_string()
+}
+
+fn default_backup_limit() -> usize {
+    20
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

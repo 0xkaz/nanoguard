@@ -1244,8 +1244,10 @@ pub async fn api_edit_file(
     }
 
     let validator = |content: &str| super::edit::validate_by_path(path, content);
-    let write_result =
-        std::panic::catch_unwind(|| super::edit::atomic_write(path, &body.content, validator));
+    let backup_limit = state.config.console.backup_limit;
+    let write_result = std::panic::catch_unwind(|| {
+        super::edit::atomic_write_with_limit(path, &body.content, validator, backup_limit)
+    });
 
     let (before_hash, after_hash) = match write_result {
         Ok(Ok(pair)) => pair,

@@ -8,8 +8,9 @@ use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
-/// Maximum backups per file (default).
-const DEFAULT_BACKUP_LIMIT: usize = 20;
+/// Maximum backups per file when the caller does not pass an explicit
+/// limit. Mirrored by `default_backup_limit()` in `config/mod.rs`.
+pub const DEFAULT_BACKUP_LIMIT: usize = 20;
 
 /// The result of a validation attempt.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -160,13 +161,27 @@ pub fn hash_content(content: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Write `content` to `path` atomically with backup and validation.
+/// Write `content` to `path` atomically with backup and validation,
+/// using the default backup retention ([`DEFAULT_BACKUP_LIMIT`]).
 ///
 /// Returns `(before_hash, after_hash)` on success.
 pub fn atomic_write(
     path: impl AsRef<Path>,
     content: &str,
     validator: impl FnOnce(&str) -> ValidationResult,
+) -> Result<(String, String)> {
+    atomic_write_with_limit(path, content, validator, DEFAULT_BACKUP_LIMIT)
+}
+
+/// Like [`atomic_write`] but with an explicit per-file backup retention
+/// count. A limit of zero disables pruning (older backups are kept until
+/// removed manually); the caller is expected to pass a positive value
+/// drawn from `[console].backup_limit`.
+pub fn atomic_write_with_limit(
+    path: impl AsRef<Path>,
+    content: &str,
+    validator: impl FnOnce(&str) -> ValidationResult,
+    backup_limit: usize,
 ) -> Result<(String, String)> {
     let path = path.as_ref();
     let before = std::fs::read_to_string(path).unwrap_or_default();
@@ -189,7 +204,7 @@ pub fn atomic_write(
 
     // Backup before writing.
     if !before.is_empty() {
-        backup_file(path, &before)?;
+        backup_file(path, &before, backup_limit)?;
     }
 
     // Atomic write: temp file in same directory, fsync, rename.
@@ -232,7 +247,10 @@ pub fn atomic_write(
 }
 
 /// Copy the current content of `path` into `.nanoguard-backups/`.
-fn backup_file(path: &Path, content: &str) -> Result<()> {
+///
+/// `limit` caps how many backups are retained for this file's stem;
+/// zero means do not prune. See [`prune_backups`].
+fn backup_file(path: &Path, content: &str, limit: usize) -> Result<()> {
     let backup_dir = if let Some(parent) = path.parent() {
         if parent.as_os_str().is_empty() {
             PathBuf::from(".nanoguard-backups")
@@ -257,7 +275,9 @@ fn backup_file(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("writing backup {:?}", backup_path))?;
 
     // Prune old backups.
-    prune_backups(&backup_dir, &stem, DEFAULT_BACKUP_LIMIT)?;
+    if limit > 0 {
+        prune_backups(&backup_dir, &stem, limit)?;
+    }
 
     Ok(())
 }
@@ -488,6 +508,42 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "original\t0\t1.0\n"
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn atomic_write_respects_backup_limit() {
+        let dir = tmp_dir();
+        let path = dir.join("test.txt");
+        // Seed an initial file, then write 5 times with a limit of 2 so we
+        // end up with at most 2 backups after pruning.
+        std::fs::write(&path, "seed\t0\t1.0\n").unwrap();
+        for i in 0..5 {
+            let body = format!("line{}\t0\t1.0\n", i);
+            atomic_write_with_limit(&path, &body, validate_dict, 2).unwrap();
+            // Backup file names use a nanosecond-resolution timestamp, but
+            // some filesystems collapse mtimes to whole seconds, which would
+            // make prune pick a non-deterministic survivor set. Sleep just
+            // long enough to push each backup into a distinct mtime bucket.
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let backups = list_backups(&path).unwrap();
+        assert_eq!(backups.len(), 2, "expected pruning to cap at 2");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn atomic_write_zero_limit_disables_pruning() {
+        let dir = tmp_dir();
+        let path = dir.join("test.txt");
+        std::fs::write(&path, "seed\t0\t1.0\n").unwrap();
+        for i in 0..3 {
+            let body = format!("line{}\t0\t1.0\n", i);
+            atomic_write_with_limit(&path, &body, validate_dict, 0).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let backups = list_backups(&path).unwrap();
+        assert_eq!(backups.len(), 3, "limit=0 should not prune");
         cleanup(&dir);
     }
 

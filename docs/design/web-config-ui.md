@@ -1,4 +1,4 @@
-> **Status:** partial (commit cdc795c, 2026-05-17 — Phase 1 shipped; Phase 2+ open. File editing, CSRF, reload trigger, `console-audit.jsonl`, model-allowlist editor, and force-revoke-all-tokens are deferred to later phases.)
+> **Status:** partial (commit ef5b188 — Phase 1 (read-only console + own-token self-service + admin user CRUD) shipped in cdc795c, Phase 2 (file-write contract, reload trigger, console-audit) shipped in ef5b188. Phase 3 (remaining reloadable TOML sections), Phase 4 (OIDC), and Phase 5 (change-request mode) remain proposed.)
 
 # Web Configuration UI
 
@@ -479,17 +479,17 @@ model). File editing depends on hot reload.
    - `nanoguard-console` binary in the same workspace, with a
      vendored static asset bundle (HTML/CSS/JS, no Node toolchain
      at runtime).
-   - No OIDC yet, no file editing, no CSRF token, no reload
-     trigger, no `console-audit.jsonl`, no force-revoke-all-tokens,
-     no `[routing]`-aware model picker — those are Phase 2+.
 2. **Phase 2 — file editing for dicts, policies, and security
-   hardening of admin mutations.** Depends on hot reload (already
-   landed) and on `multi-backend-routing.md` for the routing-aware
-   pieces. Adds:
-   - File-write contract (atomic rename + backup) for dicts /
-     policies / TOML keys that are reload-safe
-   - Reload trigger (SIGHUP via PID file, optional Unix-domain
-     socket)
+   hardening of admin mutations.** *Shipped in commit `ef5b188`
+   (2026-05-17).* Depends on hot reload (already landed) and on
+   `multi-backend-routing.md` for the routing-aware pieces. Adds:
+   - File-write contract (atomic rename + validation + backup) for
+     dicts / policies / TOML keys that are reload-safe. Backup
+     retention is per-file count, default 20, configurable via
+     `[console] backup_limit` (set to `0` to disable pruning).
+   - Reload trigger (SIGHUP via `[reload] pid_file`, or `RELOAD
+`
+     on a Unix socket via `[reload] socket`)
    - Per-session double-submit CSRF token on all mutating endpoints
    - `console-audit.jsonl` for admin mutations (the existing user
      editor backfills into this stream once it lands)
@@ -521,9 +521,10 @@ model). File editing depends on hot reload.
   to the binary? Binary inclusion is simpler for the single-binary
   story; a directory is easier to patch in production. Direction:
   bundle in the binary, accept a `--assets-dir` override.
-- **Backup retention policy**: a flat per-file count (the default
-  here) is the simplest. Time-based (`older than 30 days`) is
-  another option. Open until phase 2.
+- **Backup retention policy**: resolved as flat per-file count in
+  Phase 2 (`[console] backup_limit`, default 20). Time-based
+  retention (`older than 30 days`) remains a future option if the
+  count-based knob proves insufficient.
 - **Multi-process safety**: two console instances writing
   concurrently to the same file. The atomic rename keeps the file
   consistent, but two edits can lose work. A file-lock on the
