@@ -4,6 +4,17 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — Console e2e Phase C: session lifecycle, cross-user revoke, backup pruning, audit shape
+
+Four new scenarios that fence the remaining operational surface of the Web Console:
+
+- **Scenario 30 (session lifecycle)** — back-dating `user_sessions.expires_at` in SQLite makes `/api/me` return 401 on the next call (no wall-clock wait); the expired row is then deleted by the extractor (no reaper to depend on); flipping `users.disabled = 1` mid-session also returns 401 on the very next request; a fresh login for a now-disabled user is also 401.
+- **Scenario 31 (cross-user revoke)** — a non-admin user trying to `DELETE /api/tokens/:id` against an id that belongs to admin returns 403 (not a quiet 200 + no-op, which would let a viewer fingerprint other users' token ids), and the row's `revoked_at` stays NULL. Viewer is also forbidden from `POST /api/users/:id/force-revoke-tokens`.
+- **Scenario 32 (`backup_limit` pruning)** — sets `[console] backup_limit = 3`, performs 6 edits against a seeded dict file, and confirms `/api/backups` returns exactly 3 entries and the disk view agrees. Catches a regression where retention was off by one or pruning silently disabled.
+- **Scenario 33 (audit JSON shape)** — provokes a `user_create` mutation, parses the JSONL line with `jq`, and asserts the documented envelope field by field: `actor`, `action`, `target`, `request_id` (locked to the 48-hex-char form documented at `src/audit/mod.rs:186`), `timestamp` (RFC3339-shaped), `actor_id` (stringified i64 — same column will hold OIDC subjects in Phase 4), and that `after.password_hash` is absent (password hash leak across operator logs would be a real bug).
+
+`tools/e2e.sh` now carries 129 assertions (was 109 at PR #39 merge). Each scenario spawns a `nanoguard-console` (and a `nanoguard` proxy when the test exercises a proxy-side path) on isolated ports under a per-scenario workdir.
+
 ### Changed — `nanoguard-admin` tty prompt is now in-process
 
 `nanoguard-admin set-password` no longer forks `test -t 0` and `stty -echo` to manage the controlling terminal. It now uses `std::io::IsTerminal` for the TTY check and `libc::tcgetattr` / `tcsetattr` (via the `libc` crate already used by the reload trigger) to mask `ECHO` off and restore on drop. CLAUDE.md absolute rule #2 — "single binary, no runtime dependencies beyond the binary itself" — applies as much to operator tools as to the proxy, so the shell-out was a quiet violation. No new crate dependency.

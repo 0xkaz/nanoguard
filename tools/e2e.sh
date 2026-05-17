@@ -1907,6 +1907,569 @@ assert_eq "29k. the new password set via CLI authenticates (200)" "$NEW_PW_CODE"
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
 
+# --- 30. Session lifecycle: expiry, idle timeout, disabled accounts -------
+# Scenario 27 fenced the auth perimeter (wrong-pw 401, CSRF 403). 30 walks
+# the session lifecycle once the perimeter is past: a session row that has
+# aged out, an account that gets disabled mid-session.
+info "scenario 30: session expiry + disabled-account login"
+
+S30_DIR="$LOGDIR/e2e.s30.workdir"
+rm -rf "$S30_DIR"
+mkdir -p "$S30_DIR"
+
+S30_PORT=18085
+S30_CONSOLE_URL="http://127.0.0.1:$S30_PORT"
+S30_DB="$S30_DIR/nanoguard.db"
+S30_TOML="$S30_DIR/nanoguard.toml"
+S30_CONSOLE_LOG="$LOGDIR/ng.s30.console.log"
+S30_COOKIES="$LOGDIR/e2e.s30.cookies"
+rm -f "$S30_COOKIES"
+
+cat > "$S30_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S30_DB"
+
+[console]
+listen = "127.0.0.1:$S30_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S30_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S30_BOOTSTRAP_PW" }
+EOF
+
+S30_PW="s30-pw-$(openssl rand -hex 8)"
+(cd "$S30_DIR" && NANOGUARD_CONFIG="$S30_TOML" \
+    S30_BOOTSTRAP_PW="$S30_PW" \
+    "$CONSOLE_BIN" > "$S30_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+wait_for_url "30-pre. nanoguard-console boot" "$S30_CONSOLE_URL/" 15 || exit 1
+
+# 30a. Login → valid session → /api/me 200. Establishes baseline.
+LOGIN_RESP=$(curl -s -c "$S30_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S30_PW\"}" \
+    "$S30_CONSOLE_URL/api/login")
+ME_OK=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    "$S30_CONSOLE_URL/api/me")
+assert_eq "30a. fresh session reads /api/me (200)" "$ME_OK" "200"
+
+# 30b. Sneak into SQLite and back-date the session's expires_at. This
+# is the same effect as waiting `session_ttl_hours` for the cookie to
+# expire, without paying the wall-clock cost. The extractor at
+# src/console/auth.rs:208 compares `expires_at` against now and 401s
+# on miss, so the next /api/me must come back unauthorized.
+sqlite3 "$S30_DB" "UPDATE user_sessions SET expires_at = '2000-01-01T00:00:00Z';" 2>/dev/null
+ME_EXPIRED=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    "$S30_CONSOLE_URL/api/me")
+assert_eq "30b. /api/me after expires_at is in the past returns 401" "$ME_EXPIRED" "401"
+
+# 30c. The expired session row was deleted by the extractor, not just
+# rejected. Re-issuing the cookie does not re-grant access.
+SESS_COUNT=$(sqlite3 "$S30_DB" "SELECT COUNT(*) FROM user_sessions;" 2>/dev/null)
+assert_eq "30c. the expired session row was reaped by the extractor" "$SESS_COUNT" "0"
+
+# 30c-idle. The idle timeout is a separate path from absolute expiry
+# (src/console/auth.rs:215-220). expires_at is in the future but
+# last_seen_at is older than session_idle_timeout_hours (defaults to
+# session_ttl_hours) — the extractor must still 401 + sweep the row.
+rm -f "$S30_COOKIES"
+curl -s -o /dev/null -c "$S30_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S30_PW\"}" \
+    "$S30_CONSOLE_URL/api/login"
+# Far-future expires_at, far-past last_seen_at — only the idle gate
+# can produce the 401 we're about to assert.
+sqlite3 "$S30_DB" "UPDATE user_sessions SET expires_at='2099-01-01T00:00:00Z', last_seen_at='2000-01-01T00:00:00Z';" 2>/dev/null
+ME_IDLE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    "$S30_CONSOLE_URL/api/me")
+assert_eq "30c-idle. /api/me after the idle timeout returns 401" "$ME_IDLE" "401"
+IDLE_REAPED=$(sqlite3 "$S30_DB" "SELECT COUNT(*) FROM user_sessions;" 2>/dev/null)
+assert_eq "30c-idle-reap. idle-expired session row was also reaped" "$IDLE_REAPED" "0"
+
+# 30d. Re-login → new session → mark the user disabled in SQL →
+# /api/me must immediately 401. This is the "fire an admin RIGHT NOW"
+# escalation path. The extractor at src/console/auth.rs:239 reads
+# users.disabled on every request, so the new state lands without a
+# reload.
+rm -f "$S30_COOKIES"
+curl -s -o /dev/null -c "$S30_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S30_PW\"}" \
+    "$S30_CONSOLE_URL/api/login"
+ME_OK2=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    "$S30_CONSOLE_URL/api/me")
+assert_eq "30d-pre. /api/me on fresh re-login returns 200" "$ME_OK2" "200"
+
+sqlite3 "$S30_DB" "UPDATE users SET disabled = 1 WHERE username='admin';" 2>/dev/null
+ME_DISABLED=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    "$S30_CONSOLE_URL/api/me")
+assert_eq "30d. /api/me after the user is disabled returns 401" "$ME_DISABLED" "401"
+
+# 30d-other. The disabled check runs in the auth extractor used by
+# every authenticated endpoint, not just /api/me. Make sure a
+# mutating endpoint also 401s — a regression that special-cased
+# /api/me but missed POST /api/tokens would let a disabled admin
+# keep minting tokens.
+TOKENS_DISABLED=$(curl -s -o /dev/null -w "%{http_code}" -b "$S30_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"should-not-mint"}' \
+    "$S30_CONSOLE_URL/api/tokens")
+assert_eq "30d-other. mutating endpoint also 401s for a disabled user" "$TOKENS_DISABLED" "401"
+
+# 30e. A fresh login attempt for a disabled user also fails. Without
+# this check an attacker who learned the password could keep getting
+# new sessions even after the operator clicked "disable".
+LOGIN_DISABLED=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S30_PW\"}" \
+    "$S30_CONSOLE_URL/api/login")
+assert_eq "30e. login as a disabled user returns 401" "$LOGIN_DISABLED" "401"
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+
+# --- 31. Viewer cannot revoke someone else's token ------------------------
+# Scenario 27g already proved a non-admin cannot create users. 31 goes
+# the next step: a non-admin cannot revoke a token they don't own.
+# The handler at src/console/handlers.rs:640 looks up tokens via
+# list_for_user(conn, user.id), so a stranger's id silently returns
+# "not yours". This MUST be a 403, not a 200 with no-op.
+info "scenario 31: viewer cannot revoke another user's token"
+
+S31_DIR="$LOGDIR/e2e.s31.workdir"
+rm -rf "$S31_DIR"
+mkdir -p "$S31_DIR"
+
+S31_PORT=18086
+S31_CONSOLE_URL="http://127.0.0.1:$S31_PORT"
+S31_DB="$S31_DIR/nanoguard.db"
+S31_TOML="$S31_DIR/nanoguard.toml"
+S31_CONSOLE_LOG="$LOGDIR/ng.s31.console.log"
+S31_COOKIES_ADMIN="$LOGDIR/e2e.s31.admin.cookies"
+S31_COOKIES_VIEWER="$LOGDIR/e2e.s31.viewer.cookies"
+rm -f "$S31_COOKIES_ADMIN" "$S31_COOKIES_VIEWER"
+
+cat > "$S31_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S31_DB"
+
+[console]
+listen = "127.0.0.1:$S31_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S31_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S31_BOOTSTRAP_PW" }
+EOF
+
+S31_ADMIN_PW="s31-admin-$(openssl rand -hex 8)"
+(cd "$S31_DIR" && NANOGUARD_CONFIG="$S31_TOML" \
+    S31_BOOTSTRAP_PW="$S31_ADMIN_PW" \
+    "$CONSOLE_BIN" > "$S31_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+wait_for_url "31-pre. nanoguard-console boot" "$S31_CONSOLE_URL/" 15 || exit 1
+
+# Log in as admin, mint an admin-owned token.
+ADMIN_LOGIN=$(curl -s -c "$S31_COOKIES_ADMIN" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S31_ADMIN_PW\"}" \
+    "$S31_CONSOLE_URL/api/login")
+ADMIN_CSRF=$(echo "$ADMIN_LOGIN" | jq -r '.csrf_token // empty')
+
+ADMIN_MINT_HDR="$LOGDIR/e2e.s31.admin-mint.hdr"
+ADMIN_MINT=$(curl -s -b "$S31_COOKIES_ADMIN" -c "$S31_COOKIES_ADMIN" \
+    -D "$ADMIN_MINT_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d '{"label":"admin-only-token"}' \
+    "$S31_CONSOLE_URL/api/tokens")
+ADMIN_TOKEN_ID=$(echo "$ADMIN_MINT" | jq -r '.id // empty')
+ADMIN_CSRF=$(grep -i '^x-csrf-token-next:' "$ADMIN_MINT_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$ADMIN_CSRF" ] && ADMIN_CSRF=$(echo "$ADMIN_MINT" | jq -r '.csrf_token // empty')
+
+# Create a viewer and log them in.
+S31_VIEWER_PW="s31-viewer-$(openssl rand -hex 8)"
+curl -s -o /dev/null -b "$S31_COOKIES_ADMIN" -c "$S31_COOKIES_ADMIN" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S31_VIEWER_PW\",\"role\":\"user\"}" \
+    "$S31_CONSOLE_URL/api/users"
+
+VIEWER_LOGIN=$(curl -s -c "$S31_COOKIES_VIEWER" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S31_VIEWER_PW\"}" \
+    "$S31_CONSOLE_URL/api/login")
+VIEWER_CSRF=$(echo "$VIEWER_LOGIN" | jq -r '.csrf_token // empty')
+
+# 31a. Viewer DELETE /api/tokens/:id where id belongs to admin must
+# be 403. Quiet 200 + no-op would be a privacy leak (lets viewer
+# fingerprint other users' token ids).
+CROSS_REVOKE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+    -b "$S31_COOKIES_VIEWER" -c "$S31_COOKIES_VIEWER" \
+    -H "X-CSRF-Token: $VIEWER_CSRF" \
+    "$S31_CONSOLE_URL/api/tokens/$ADMIN_TOKEN_ID")
+assert_eq "31a. viewer revoking admin's token is rejected (403)" "$CROSS_REVOKE" "403"
+
+# 31b. The admin's token is STILL present (the cross-user revoke did
+# not silently succeed at the DB level despite the 403).
+STILL=$(sqlite3 "$S31_DB" \
+    "SELECT COUNT(*) FROM client_tokens WHERE id=$ADMIN_TOKEN_ID AND revoked_at IS NULL;" \
+    2>/dev/null)
+assert_eq "31b. cross-user revoke did not touch the row" "$STILL" "1"
+
+# 31c. Viewer also cannot fire the force-revoke-all admin endpoint.
+ADMIN_ID=$(sqlite3 "$S31_DB" "SELECT id FROM users WHERE username='admin';")
+VIEWER_FORCE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -b "$S31_COOKIES_VIEWER" -c "$S31_COOKIES_VIEWER" \
+    -H "X-CSRF-Token: $VIEWER_CSRF" \
+    "$S31_CONSOLE_URL/api/users/$ADMIN_ID/force-revoke-tokens")
+assert_eq "31c. viewer force-revoke-tokens is rejected (403)" "$VIEWER_FORCE" "403"
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+
+# --- 32. backup_limit pruning ---------------------------------------------
+# `[console].backup_limit = N` says "keep at most N .nanoguard-backups/
+# entries per edited file"; the (N+1)th edit must evict the oldest.
+# Defaults to 20 in code, but a small N makes the regression test fast.
+# `backup_limit = 0` is a documented "keep everything" mode.
+info "scenario 32: backup_limit prunes oldest backup once N is exceeded"
+
+S32_DIR="$LOGDIR/e2e.s32.workdir"
+rm -rf "$S32_DIR"
+mkdir -p "$S32_DIR/dicts"
+
+S32_PORT=18087
+S32_CONSOLE_URL="http://127.0.0.1:$S32_PORT"
+S32_DB="$S32_DIR/nanoguard.db"
+S32_TOML="$S32_DIR/nanoguard.toml"
+S32_CONSOLE_LOG="$LOGDIR/ng.s32.console.log"
+S32_RELOAD_SOCK="$LOGDIR/e2e.s32.reload.sock"
+S32_COOKIES="$LOGDIR/e2e.s32.cookies"
+S32_BACKUP_LIMIT=3
+rm -f "$S32_COOKIES" "$S32_RELOAD_SOCK"
+
+cat > "$S32_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.keyword]
+engine = "aho-corasick"
+dict_paths = []
+inline_block = ["seed-block"]
+inline_alert = []
+inline_flag = []
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S32_DB"
+
+[reload]
+socket = "$S32_RELOAD_SOCK"
+
+[console]
+listen = "127.0.0.1:$S32_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S32_DIR/console-audit.jsonl"
+backup_limit = $S32_BACKUP_LIMIT
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S32_BOOTSTRAP_PW" }
+EOF
+
+(cd "$S32_DIR" && NANOGUARD_CONFIG="$S32_TOML" "$BIN" > "$LOGDIR/ng.s32.proxy.log" 2>&1) &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+S32_PW="s32-pw-$(openssl rand -hex 8)"
+(cd "$S32_DIR" && NANOGUARD_CONFIG="$S32_TOML" \
+    S32_BOOTSTRAP_PW="$S32_PW" \
+    "$CONSOLE_BIN" > "$S32_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+wait_for_url "32-pre. nanoguard-console boot" "$S32_CONSOLE_URL/" 15 || exit 1
+
+LOGIN_RESP=$(curl -s -c "$S32_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S32_PW\"}" \
+    "$S32_CONSOLE_URL/api/login")
+S32_CSRF=$(echo "$LOGIN_RESP" | jq -r '.csrf_token // empty')
+
+# Edit `dicts/test-32.txt` repeatedly. Each /api/edit backs up the
+# previous content before the rename. With backup_limit=3 and 6 edits
+# we expect:
+#   edit 1 — first write, no prior content => 0 backups
+#   edit 2 — backs up edit-1 content        => 1 backup
+#   edit 3 — backs up edit-2                => 2 backups
+#   edit 4 — backs up edit-3                => 3 backups
+#   edit 5 — backs up edit-4, evicts oldest => 3 backups (cap)
+#   edit 6 — backs up edit-5, evicts oldest => 3 backups (cap)
+# Seed an initial file on disk so the first /api/edit also produces a
+# backup, exercising the prune path even sooner. The seed itself is
+# not a backup.
+DICT_PATH="dicts/test-32.txt"
+# Dict format is `<pattern>\t<key>` per line, key in {0,1,2}. Seed a
+# valid file so the first /api/edit's pre-write content can be backed
+# up (and itself is a valid existing file the proxy can load if it
+# were configured to use this dict).
+printf 'seed\t0\n' > "$S32_DIR/$DICT_PATH"
+
+for i in 1 2 3 4 5 6; do
+    # tab-separated keyword\tkey so validate_dict accepts it
+    CONTENT=$(printf 'word-%s\t0\n' "$i")
+    PAYLOAD=$(jq -nc \
+        --arg path "$DICT_PATH" \
+        --arg content "$CONTENT" \
+        --arg summary "s32 edit $i" \
+        '{path:$path, content:$content, summary:$summary}')
+    HDR="$LOGDIR/e2e.s32.edit$i.hdr"
+    curl -s -o /dev/null -b "$S32_COOKIES" -c "$S32_COOKIES" \
+        -D "$HDR" \
+        -H "Content-Type: application/json" \
+        -H "X-CSRF-Token: $S32_CSRF" \
+        -d "$PAYLOAD" \
+        "$S32_CONSOLE_URL/api/edit"
+    NEXT=$(grep -i '^x-csrf-token-next:' "$HDR" 2>/dev/null | awk '{print $2}' | tr -d '\r')
+    [ -n "$NEXT" ] && S32_CSRF="$NEXT"
+done
+
+# 32a. /api/backups should now report exactly backup_limit entries.
+BACKUP_LIST=$(curl -s -b "$S32_COOKIES" \
+    "$S32_CONSOLE_URL/api/backups?path=$DICT_PATH")
+BACKUP_LEN=$(echo "$BACKUP_LIST" | jq -r '.data | length // 0')
+assert_eq "32a. /api/backups returns exactly backup_limit entries after N+ edits" \
+    "$BACKUP_LEN" "$S32_BACKUP_LIMIT"
+
+# 32b. Disk view agrees: count files under .nanoguard-backups/ matching
+# the dict stem. Belt-and-suspenders in case /api/backups ever starts
+# paginating without updating the e2e.
+DISK_COUNT=$(find "$S32_DIR/dicts/.nanoguard-backups" -name "test-32.*" 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "32b. disk has exactly backup_limit backup files for the dict" \
+    "$DISK_COUNT" "$S32_BACKUP_LIMIT"
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+# --- 33. Audit JSON shape deep-validation ---------------------------------
+# Phase 1+2 promised every mutating console action lands in
+# console-audit.jsonl with a fixed envelope: request_id, timestamp,
+# actor, actor_id, action, target?, before?, after?, summary. Scenario
+# 28h grepped for `"action":"edit"`; this scenario asserts the full
+# JSON shape so a future refactor cannot silently rename a field.
+info "scenario 33: console-audit.jsonl carries the documented JSON envelope"
+
+S33_DIR="$LOGDIR/e2e.s33.workdir"
+rm -rf "$S33_DIR"
+mkdir -p "$S33_DIR"
+
+S33_PORT=18088
+S33_CONSOLE_URL="http://127.0.0.1:$S33_PORT"
+S33_DB="$S33_DIR/nanoguard.db"
+S33_TOML="$S33_DIR/nanoguard.toml"
+S33_AUDIT="$S33_DIR/console-audit.jsonl"
+S33_CONSOLE_LOG="$LOGDIR/ng.s33.console.log"
+S33_COOKIES="$LOGDIR/e2e.s33.cookies"
+rm -f "$S33_COOKIES" "$S33_AUDIT"
+
+cat > "$S33_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S33_DB"
+
+[console]
+listen = "127.0.0.1:$S33_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S33_AUDIT"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S33_BOOTSTRAP_PW" }
+EOF
+
+S33_PW="s33-pw-$(openssl rand -hex 8)"
+(cd "$S33_DIR" && NANOGUARD_CONFIG="$S33_TOML" \
+    S33_BOOTSTRAP_PW="$S33_PW" \
+    "$CONSOLE_BIN" > "$S33_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+wait_for_url "33-pre. nanoguard-console boot" "$S33_CONSOLE_URL/" 15 || exit 1
+
+# Provoke a user_create mutation — it's the cleanest action that
+# carries target + after.
+LOGIN=$(curl -s -c "$S33_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S33_PW\"}" \
+    "$S33_CONSOLE_URL/api/login")
+S33_CSRF=$(echo "$LOGIN" | jq -r '.csrf_token // empty')
+
+curl -s -o /dev/null -b "$S33_COOKIES" -c "$S33_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S33_CSRF" \
+    -d '{"username":"audit-victim","password":"s33-audit-pw-zzzzz","role":"user"}' \
+    "$S33_CONSOLE_URL/api/users"
+
+# Wait for the user_create line specifically, not just any line. The
+# login mutation also writes to this file and lands first, so a
+# non-empty-file check exits the loop too early and the next grep
+# can intermittently miss user_create.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if grep -q '"action":"user_create"' "$S33_AUDIT" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+# 33a. login record is a valid JSON line. Login is the simplest
+# audit shape — no `target`, no `before`/`after` — so all that has
+# to hold is `action == "login"` and `actor == "admin"`.
+LOGIN_LINE=$(grep '"action":"login"' "$S33_AUDIT" | head -n1)
+if [ -n "$LOGIN_LINE" ] && echo "$LOGIN_LINE" | jq . >/dev/null 2>&1; then
+    ok "33a. login mutation is a valid JSON line"
+else
+    ng "33a. login record missing or invalid JSON; line: $LOGIN_LINE"
+fi
+
+LOGIN_ACTOR=$(echo "$LOGIN_LINE" | jq -r '.actor // empty')
+assert_eq "33a-actor. login.actor is admin" "$LOGIN_ACTOR" "admin"
+LOGIN_ACTION=$(echo "$LOGIN_LINE" | jq -r '.action // empty')
+assert_eq "33a-action. login.action == login" "$LOGIN_ACTION" "login"
+
+# 33b-h. The envelope fields. Every assertion targets one promised key.
+USER_CREATE=$(grep '"action":"user_create"' "$S33_AUDIT" | head -n1)
+if [ -z "$USER_CREATE" ]; then
+    ng "33b-pre. user_create record never appeared in $S33_AUDIT"
+fi
+
+ACTOR=$(echo "$USER_CREATE" | jq -r '.actor // empty')
+assert_eq "33b. user_create.actor is the logged-in admin" "$ACTOR" "admin"
+
+ACTION=$(echo "$USER_CREATE" | jq -r '.action // empty')
+assert_eq "33c. user_create.action == user_create" "$ACTION" "user_create"
+
+TARGET=$(echo "$USER_CREATE" | jq -r '.target // empty')
+assert_eq "33d. user_create.target is the new username" "$TARGET" "audit-victim"
+
+# 33e. request_id is a 48-hex-char string (see src/audit/mod.rs:186 —
+# 32 nanos + 16 counter, no uuid dep). Locked to that shape so a
+# future refactor that switches to UUIDs has to update both producer
+# and any external log consumer.
+REQ_ID=$(echo "$USER_CREATE" | jq -r '.request_id // empty')
+if printf '%s' "$REQ_ID" | grep -qE '^[0-9a-f]{48}$'; then
+    ok "33e. request_id is the documented 48-hex-char shape"
+else
+    ng "33e. request_id unexpected: $REQ_ID"
+fi
+
+# 33f. timestamp parses as RFC3339 — anchor at both ends and accept
+# the fractional-second + offset shapes `chrono::Utc::now().to_rfc3339()`
+# produces.
+TS=$(echo "$USER_CREATE" | jq -r '.timestamp // empty')
+if printf '%s' "$TS" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'; then
+    ok "33f. timestamp is RFC3339-shaped"
+else
+    ng "33f. timestamp unexpected: $TS"
+fi
+
+# 33g. `after` records the newly-created user fields (id, username,
+# role) and the password hash is NOT in the audit log — that would be
+# a hash-leak across operator-visible logs.
+HAS_AFTER_USERNAME=$(echo "$USER_CREATE" | jq -r '.after.username // empty')
+assert_eq "33g. after.username matches the created user" "$HAS_AFTER_USERNAME" "audit-victim"
+
+LEAKED=$(echo "$USER_CREATE" | jq -r '.after.password_hash // empty')
+if [ -z "$LEAKED" ]; then
+    ok "33h. after does NOT include the password hash"
+else
+    ng "33h. password_hash leaked into audit: $LEAKED"
+fi
+
+# 33i. actor_id is a stringified i64 (the schema documents this — OIDC
+# subjects will live in the same column eventually).
+ACTOR_ID=$(echo "$USER_CREATE" | jq -r '.actor_id // empty')
+if printf '%s' "$ACTOR_ID" | grep -Eq '^-?[0-9]+$'; then
+    ok "33i. actor_id is numeric (stringified i64)"
+else
+    ng "33i. actor_id unexpected shape: $ACTOR_ID"
+fi
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"
