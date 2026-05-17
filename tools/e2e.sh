@@ -78,9 +78,40 @@ if [ ! -x "$BIN" ]; then
     }
 fi
 
+# Poll a URL until it responds 2xx, or fail-fast the scenario after
+# `max_iters` quarter-second iterations. Use this around every proxy /
+# console boot in the console scenarios — a silent boot failure
+# otherwise cascades into a long string of meaningless "got 000"
+# assertions and obscures what actually broke.
+wait_for_url() {
+    local label="$1" url="$2" max_iters="${3:-15}"
+    local i=0
+    while [ "$i" -lt "$max_iters" ]; do
+        if curl -sf -o /dev/null "$url"; then
+            return 0
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
+    ng "${label}: did not become ready at ${url} after ${max_iters} polls"
+    return 1
+}
+
 cleanup() {
     [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null || true
     [ -n "${NG_PID:-}" ] && kill "$NG_PID" 2>/dev/null || true
+    # Console scenarios (26+) spawn a `nanoguard-console` alongside the
+    # proxy. If a scenario fails mid-flight before its own kill, the
+    # console keeps holding its port and the SQLite write lock and the
+    # next e2e run sees flaky port-bind failures. Tear it down here so
+    # the trap is honest about cleaning every child it knows about.
+    [ -n "${CONSOLE_PID:-}" ] && kill "$CONSOLE_PID" 2>/dev/null || true
+    # Belt-and-suspenders: if a scenario re-used CONSOLE_PID across
+    # iterations and we never captured the intermediate value, sweep
+    # any remaining nanoguard-console process owned by this user.
+    for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do
+        kill "$pid" 2>/dev/null || true
+    done
     wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -88,6 +119,7 @@ trap cleanup EXIT INT TERM
 # Make sure no leftover process is holding our ports.
 for pid in $(pgrep -f "tools/mock_backend.py" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
 for pid in $(pgrep -f "target/release/nanoguard" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
+for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
 sleep 0.3
 
 info "starting mock backend on :$MOCK_PORT"
@@ -1088,19 +1120,12 @@ NANOGUARD_CONFIG="$S26_CONSOLE_TOML" \
     S26_BOOTSTRAP_PASSWORD="$S26_PASSWORD" \
     "$CONSOLE_BIN" > "$S26_CONSOLE_LOG" 2>&1 &
 CONSOLE_PID=$!
-S26_READY=0
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    sleep 0.2
-    # `/` returns the SPA shell when the console is up.
-    if curl -sf -o /dev/null "$S26_CONSOLE_URL/"; then
-        S26_READY=1
-        break
-    fi
-done
-if [ "$S26_READY" -ne 1 ]; then
-    ng "26-pre. nanoguard-console did not become ready; see $S26_CONSOLE_LOG"
-    kill "$CONSOLE_PID" "$NG_PID" 2>/dev/null || true
-fi
+# Bail out of this scenario the instant the console fails to come up;
+# otherwise every downstream `curl` returns 000 and produces a long
+# chain of misleading assertion failures that hide the real cause.
+# cleanup() in this script kills the proxy + console + mock children
+# on exit, so the trap handles teardown.
+wait_for_url "26-pre. nanoguard-console boot" "$S26_CONSOLE_URL/" 15 || exit 1
 
 # 26a. Log in as the bootstrap admin and capture the session cookie +
 # initial CSRF token.
@@ -1267,10 +1292,7 @@ NANOGUARD_CONFIG="$S27_CONSOLE_TOML" \
     S27_BOOTSTRAP_PASSWORD="$S27_ADMIN_PW" \
     "$CONSOLE_BIN" > "$S27_CONSOLE_LOG" 2>&1 &
 CONSOLE_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    sleep 0.2
-    curl -sf -o /dev/null "$S27_CONSOLE_URL/" && break
-done
+wait_for_url "27-pre. nanoguard-console boot" "$S27_CONSOLE_URL/" 15 || exit 1
 
 # 27a. Wrong password is a 401, and the response body never contains
 # the literal username or password the caller sent.
@@ -1513,10 +1535,7 @@ S28_PW="s28-pw-$(openssl rand -hex 8)"
     S28_BOOTSTRAP_PASSWORD="$S28_PW" \
     "$CONSOLE_BIN" > "$S28_CONSOLE_LOG" 2>&1) &
 CONSOLE_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    sleep 0.2
-    curl -sf -o /dev/null "$S28_CONSOLE_URL/" && break
-done
+wait_for_url "28-pre. nanoguard-console boot" "$S28_CONSOLE_URL/" 15 || exit 1
 
 LOGIN_RESP=$(curl -s -c "$S28_COOKIES" \
     -H "Content-Type: application/json" \
@@ -1758,18 +1777,28 @@ S29_FORGOTTEN_PW="s29-forgotten-$(openssl rand -hex 8)"
     S29_BOOTSTRAP_PW="$S29_FORGOTTEN_PW" \
     "$CONSOLE_BIN" > "$S29_CONSOLE_LOG" 2>&1) &
 CONSOLE_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    sleep 0.2
-    curl -sf -o /dev/null "$S29_CONSOLE_URL/" && break
-done
+wait_for_url "29-pre. nanoguard-console boot (first)" "$S29_CONSOLE_URL/" 15 || exit 1
 
-# 29a. The forgotten password works at this point (proves the test
-# baseline is sane before we reset).
-BASELINE=$(curl -s -o /dev/null -w "%{http_code}" \
+# 29a. The forgotten password works at this point AND establishes a
+# real session row in the DB. The session count check after the CLI
+# reset (29d-sessions) needs at least one row to delete; without this
+# step the assertion can pass trivially against an empty user_sessions
+# table.
+S29_BASELINE_COOKIES="$LOGDIR/e2e.s29.baseline.cookies"
+rm -f "$S29_BASELINE_COOKIES"
+BASELINE=$(curl -s -o /dev/null -w "%{http_code}" -c "$S29_BASELINE_COOKIES" \
     -H "Content-Type: application/json" \
     -d "{\"username\":\"admin\",\"password\":\"$S29_FORGOTTEN_PW\"}" \
     "$S29_CONSOLE_URL/api/login")
 assert_eq "29a. baseline: original bootstrap password authenticates (200)" "$BASELINE" "200"
+
+# Confirm the row actually landed in user_sessions so the post-reset
+# delta is measuring real state, not zero-vs-zero.
+SESS_BEFORE=$(sqlite3 "$S29_DB" "SELECT COUNT(*) FROM user_sessions;" 2>/dev/null || echo 0)
+case "$SESS_BEFORE" in
+    [1-9]*) ok "29a-sess. baseline login creates a row in user_sessions" ;;
+    *)      ng "29a-sess. expected user_sessions to have a row; got $SESS_BEFORE" ;;
+esac
 
 # 29b. Stop the console so the admin CLI can take the SQLite write lock
 # without racing the running process. The CLI itself only needs the
@@ -1797,6 +1826,16 @@ case "$SETPW_OUT" in
     *"password updated for 'admin'"*) ok "29d. set-password --password-stdin reports success" ;;
     *)                                ng "29d. set-password unexpected output: $SETPW_OUT" ;;
 esac
+
+# 29d-sessions. The CLI wraps the password UPDATE and the per-user
+# session DELETE in one SQLite transaction. After a successful reset
+# the user_sessions table must have zero rows for the admin user;
+# leaving a row would mean an attacker-held cookie still grants
+# access after the operator thought they killed it.
+SESS_AFTER=$(sqlite3 "$S29_DB" \
+    "SELECT COUNT(*) FROM user_sessions WHERE user_id = (SELECT id FROM users WHERE username='admin');" \
+    2>/dev/null || echo "?")
+assert_eq "29d-sessions. set-password wipes the target user's live sessions" "$SESS_AFTER" "0"
 
 # 29e. set-password rejects a known-weak password from the common list,
 # so a tired operator cannot accidentally land "password123" as the
@@ -1846,10 +1885,7 @@ fi
 (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
     "$CONSOLE_BIN" > "$S29_CONSOLE_LOG" 2>&1) &
 CONSOLE_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    sleep 0.2
-    curl -sf -o /dev/null "$S29_CONSOLE_URL/" && break
-done
+wait_for_url "29-pre. nanoguard-console boot (second)" "$S29_CONSOLE_URL/" 15 || exit 1
 
 # 29j. The OLD password is now rejected — the CLI write actually
 # replaced the hash, not appended to a list.

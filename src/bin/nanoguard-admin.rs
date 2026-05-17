@@ -120,11 +120,23 @@ fn cmd_set_password(args: Vec<String>) -> Result<()> {
 
     let hash = auth::hash_password(&password).context("hashing password")?;
 
+    // Wrap the hash UPDATE and the session-sweep in one SQLite
+    // transaction. SQLite auto-commits per statement otherwise, and a
+    // failure between `set_password_hash` and `delete_user_sessions`
+    // would leave the account in a half-rotated state: the new
+    // password is live, but any session cookie still in an attacker's
+    // possession keeps working. The whole point of running this CLI
+    // is to recover from a compromise, so that window is exactly what
+    // we cannot allow.
     let updated = db.with_conn(|conn| {
         let user = db::user_by_username(conn, &username)?
             .ok_or_else(|| anyhow!("no user named '{}' in {}", username, cfg.budget.db_path))?;
-        db::set_password_hash(conn, user.id, &hash)?;
-        db::delete_user_sessions(conn, user.id)?;
+        let tx = conn
+            .unchecked_transaction()
+            .context("BEGIN transaction for password reset")?;
+        db::set_password_hash(&tx, user.id, &hash)?;
+        db::delete_user_sessions(&tx, user.id)?;
+        tx.commit().context("COMMIT password-reset transaction")?;
         Ok(user.id)
     })?;
 
@@ -200,8 +212,12 @@ fn prompt_password_tty(username: &str) -> Result<Zeroizing<String>> {
         ));
     }
 
-    print!("New password for '{}': ", username);
-    io::stdout().flush().ok();
+    // Prompt goes to stderr so a caller that redirected stdout (to
+    // capture the "password updated" success line in scripts, say)
+    // still sees the prompt instead of staring at a hung-looking
+    // process waiting for input.
+    eprint!("New password for '{}': ", username);
+    io::stderr().flush().ok();
 
     // RAII: take a snapshot of termios, mask ECHO off, restore on drop.
     // Stays in-process — no fork/exec of `stty`. CLAUDE.md absolute rule
