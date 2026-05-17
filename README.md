@@ -427,12 +427,12 @@ Phase 1 (commit `cdc795c`) shipped read-only browsing of audit log, budget state
 
 ### 1. Configure `nanoguard.toml`
 
-The default `nanoguard.toml` ships with the `[console]` section already enabled. You can optionally set a persistent secret, but it is not required for local development:
+The default `nanoguard.toml` ships with the `[console]` section already enabled. `session_secret = ""` is fine for local development — leave it empty and `nanoguard-console` will generate a random ephemeral secret at startup. To persist sessions across restarts, set a random string of at least 32 bytes (the underlying `cookie::Key` requires it; `nanoguard-console` fails fast with a clear error otherwise) — `openssl rand -hex 32` produces a suitable value. You can put it directly in TOML or export `CONSOLE_SESSION_SECRET`:
 
 ```toml
 [console]
 listen            = "127.0.0.1:8081"           # loopback only; non-loopback auto-enables Secure cookies
-# session_secret    = "${CONSOLE_SESSION_SECRET}"
+session_secret    = ""                          # empty => ephemeral secret generated at startup; set a long random string to persist
 session_ttl_hours = 24
 # audit_path        = "console-audit.jsonl"    # Phase 2: where the admin-edit log is written
 # backup_limit      = 20                       # Phase 2: per-file cap under .nanoguard-backups/ (0 disables pruning)
@@ -445,11 +445,19 @@ allow_signup    = false
 bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
 ```
 
-If you don't provide a `session_secret` in the TOML or via `CONSOLE_SESSION_SECRET`, `nanoguard-console` will generate a random ephemeral secret and print it to `stderr`. This is convenient for testing but will log all users out on restart.
+If `CONSOLE_SESSION_SECRET` is set in the environment and non-empty, it overrides `[console].session_secret`. If both are empty, `nanoguard-console` generates a random ephemeral secret and logs a `WARN` line at startup. This is convenient for testing but logs all users out on restart. TOML does not perform `${VAR}` expansion — pass secrets via env, not via `"${VAR}"` strings in the TOML file.
 
 If `listen` is non-loopback, cookies are automatically marked `Secure` — terminate TLS in front of the console in that case.
 
-### 2. Set the env vars and start the console
+### 2. Start the console
+
+The fastest path is `make run-console`. It builds, generates a `CONSOLE_SESSION_SECRET` if you don't have one set, generates a `BOOTSTRAP_PASSWORD` and prints it once when the user table is empty (otherwise it tells you to log in with the existing admin), then starts the listener:
+
+```bash
+make run-console
+```
+
+For full manual control:
 
 ```bash
 export CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)"
@@ -460,7 +468,7 @@ cargo run --bin nanoguard-console
 ./target/release/nanoguard-console
 ```
 
-`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell** — the bootstrap is one-shot and the variable is no longer needed.
+`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. The bootstrap is **one-shot** — the user table is only seeded when it is empty. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell**; on subsequent restarts that env var is ignored (the existing admin owns the password, recoverable only by deleting `nanoguard.db` or editing the row).
 
 ### 3. Open the console
 
@@ -537,7 +545,7 @@ hash_only = true
 | `BACKEND_MODEL` | — | Default model name |
 | `RUST_LOG` | `info` | Log level |
 | `ADMIN_API_KEY` | — | Enables `/v1/admin/budget/*` endpoints |
-| `CONSOLE_SESSION_SECRET` | — | Required by `nanoguard-console`; referenced from `[console].session_secret` |
+| `CONSOLE_SESSION_SECRET` | — | Optional. If set and non-empty, overrides `[console].session_secret` for `nanoguard-console`. If unset and the TOML value is empty, an ephemeral secret is generated at startup (sessions reset on restart). |
 | `BOOTSTRAP_PASSWORD` | — | One-shot plaintext password for the bootstrap admin user; unset after first start |
 
 ### Budget tracking
