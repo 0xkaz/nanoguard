@@ -298,7 +298,8 @@ for the full schema:
 ```toml
 [console]
 listen            = "127.0.0.1:8081"     # default: loopback only
-session_secret    = "${CONSOLE_SESSION_SECRET}"
+session_secret    = ""                    # empty => ephemeral; set a long random
+                                          # string to persist sessions across restarts
 session_ttl_hours = 24                    # default; cookie + DB session lifetime
 
 [console.auth]
@@ -311,7 +312,10 @@ mode = "local"                         # "oidc" | "local" | "both"
 [console.auth.oidc]
 issuer       = "https://idp.example.com"
 client_id    = "nanoguard-console"
-client_secret = "${OIDC_CLIENT_SECRET}"
+# OIDC client secret. Phase 4 will read from the OIDC_CLIENT_SECRET env var
+# directly (TOML does not perform ${VAR} expansion in this codebase); for
+# now this field is a forward-reference and ignored.
+client_secret = ""
 redirect_uri = "https://console.example.com/oauth/callback"
 admin_claim  = { name = "groups", value = "nanoguard-admins" }
 auto_provision = true
@@ -321,12 +325,18 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
 ```
 
-- **`session_secret` is required but has a fallback.** If the
-  value in the config (or `CONSOLE_SESSION_SECRET` environment
-  variable) is empty, `nanoguard-console` generates a random
-  32-byte ephemeral secret at startup and logs it to `stderr`.
-  This allows the console to be used for local development without
-  configuration, though sessions will not persist across restarts.
+- **`session_secret` is optional with an ephemeral fallback.** The
+  field is `#[serde(default)]` — leaving it empty or omitting it is
+  valid TOML. `CONSOLE_SESSION_SECRET` in the environment, when set
+  and non-empty, overrides whatever the TOML file carries (12-factor:
+  secrets via env, dev-safe defaults in the file). If both are empty,
+  `nanoguard-console` generates a random 32-byte ephemeral secret at
+  startup and emits a `WARN` log line. Sessions then do not persist
+  across restarts.
+- **TOML does not expand `${VAR}` placeholders.** A literal
+  `"${CONSOLE_SESSION_SECRET}"` in the TOML is taken as the string
+  `${CONSOLE_SESSION_SECRET}`, not the env variable's value. Pass
+  secrets via env, not via a placeholder string in the file.
 - **Listen address defaults to `127.0.0.1`** — loopback only. To
   expose the console on a network interface, the operator changes
   `listen` explicitly. This is opt-in, not the default, because a
