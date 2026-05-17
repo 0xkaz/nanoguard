@@ -196,7 +196,24 @@ run: build ollama-start
 # nanoguard.toml). Run this in a separate terminal from `make run` — the
 # proxy (:8080) and the console (:8081) are independent processes.
 run-console: build
-	@db_path=$$(awk -F'=' '/^[[:space:]]*db_path[[:space:]]*=/ {gsub(/[" ]/,"",$$2); print $$2; exit}' nanoguard.toml); \
+	@command -v openssl >/dev/null 2>&1 || { \
+	    echo "error: openssl not installed."; \
+	    echo "       \`make run-console\` uses \`openssl rand\` to generate"; \
+	    echo "       CONSOLE_SESSION_SECRET and BOOTSTRAP_PASSWORD when they"; \
+	    echo "       aren't already set in the environment."; \
+	    echo "       Install openssl, or set both env vars yourself and"; \
+	    echo "       run ./target/release/nanoguard-console directly."; \
+	    exit 1; \
+	}
+	@db_path=$$(awk ' \
+	    /^[[:space:]]*\[budget\][[:space:]]*$$/ { in_budget=1; next } \
+	    /^[[:space:]]*\[[^]]+\][[:space:]]*$$/  { in_budget=0 } \
+	    in_budget && /^[[:space:]]*db_path[[:space:]]*=/ { \
+	        v=$$0; sub(/^[^=]*=[[:space:]]*/, "", v); \
+	        sub(/[[:space:]]*(#.*)?$$/, "", v); \
+	        gsub(/^"|"$$/, "", v); \
+	        print v; exit \
+	    }' nanoguard.toml); \
 	db_path=$${db_path:-nanoguard.db}; \
 	users_exist=0; \
 	if [ -f "$$db_path" ] && command -v sqlite3 >/dev/null 2>&1; then \

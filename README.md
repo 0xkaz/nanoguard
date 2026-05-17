@@ -427,7 +427,7 @@ Phase 1 (commit `cdc795c`) shipped read-only browsing of audit log, budget state
 
 ### 1. Configure `nanoguard.toml`
 
-The default `nanoguard.toml` ships with the `[console]` section already enabled. `session_secret = ""` is fine for local development — leave it empty and `nanoguard-console` will generate a random ephemeral secret at startup. Set a long random string here (or export `CONSOLE_SESSION_SECRET`) to persist sessions across restarts:
+The default `nanoguard.toml` ships with the `[console]` section already enabled. `session_secret = ""` is fine for local development — leave it empty and `nanoguard-console` will generate a random ephemeral secret at startup. To persist sessions across restarts, set a random string of at least 32 bytes (the underlying `cookie::Key` requires it; `nanoguard-console` fails fast with a clear error otherwise) — `openssl rand -hex 32` produces a suitable value. You can put it directly in TOML or export `CONSOLE_SESSION_SECRET`:
 
 ```toml
 [console]

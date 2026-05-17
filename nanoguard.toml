@@ -69,8 +69,9 @@ hash_only = true                       # true = SHA-256 hash of prompt only (pri
 listen         = "127.0.0.1:8081"          # loopback only by default; non-loopback auto-enables Secure cookies
 # session_secret left empty / omitted => an ephemeral secret is generated at
 # `nanoguard-console` startup (sessions reset on restart). Set a long random
-# string here (or via CONSOLE_SESSION_SECRET when env-expansion lands) to
-# persist sessions across restarts.
+# string here (minimum 32 bytes; e.g. `openssl rand -hex 32`) or export
+# CONSOLE_SESSION_SECRET in the environment — the env var, when non-empty,
+# overrides this field — to persist sessions across restarts.
 session_secret = ""
 session_ttl_hours = 24
 # audit_path     = "console-audit.jsonl"     # admin-edit log (Phase 2)
