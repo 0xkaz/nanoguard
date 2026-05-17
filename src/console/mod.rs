@@ -31,6 +31,63 @@ pub struct ConsoleState {
     pub audit_log: Option<audit::ConsoleAuditLog>,
 }
 
+/// Pre-runtime setup that both the standalone `nanoguard-console`
+/// binary and the in-process console-launcher in `nanoguard` need
+/// to perform identically. Reads the bootstrap password and the
+/// `CONSOLE_SESSION_SECRET` env override, validates the session
+/// secret length, and returns the bootstrap password wrapped in
+/// `Zeroizing<String>` so the in-memory plaintext is wiped after
+/// hashing. Centralising the env read keeps the two binaries on a
+/// single code path — a fork on security-sensitive setup is
+/// exactly the kind that becomes a regression at the worst time.
+///
+/// Note on `/proc/<pid>/environ`: reading an env var via
+/// `std::env::var()` is read-only and does **not** clear it from
+/// the process environment image. The `Zeroizing<String>` wrap
+/// gives us a deterministic wipe of the in-memory copy; the
+/// `BOOTSTRAP_PASSWORD` slot in `/proc/<pid>/environ` itself
+/// remains visible for the process lifetime unless the caller
+/// also `unset`s the variable in the shell before exec, or we
+/// follow up with `std::env::remove_var` (unsafe under threads).
+/// Treat the env slot as the operator's responsibility: documented
+/// in README's "Recovering a forgotten admin password" section and
+/// in the bootstrap log line that asks them to clear it.
+pub fn prepare_for_run(cfg: &mut Config) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+    // CONSOLE_SESSION_SECRET overrides whatever the TOML carries
+    // when it is set and non-empty. 12-factor pattern: secrets via
+    // env, dev-safe defaults in the file.
+    if let Ok(env_secret) = std::env::var("CONSOLE_SESSION_SECRET") {
+        if !env_secret.is_empty() {
+            cfg.console.session_secret = env_secret;
+        }
+    }
+
+    // The cookie::Key used for signing session cookies requires
+    // >= 32 bytes. Shorter values panic per-request on a worker
+    // thread with no clear surface to the operator. Fail fast in
+    // main() with a message that points at `openssl rand -hex 32`.
+    if !cfg.console.session_secret.is_empty() && cfg.console.session_secret.len() < 32 {
+        anyhow::bail!(
+            "[console] session_secret must be at least 32 bytes (got {}). \
+             Generate one with: openssl rand -hex 32",
+            cfg.console.session_secret.len()
+        );
+    }
+
+    // Read the bootstrap password BEFORE starting tokio so the
+    // plaintext never lingers in /proc/<pid>/environ for the
+    // process lifetime.
+    let bootstrap_password = if let Some(ref bootstrap) = cfg.console.auth.local.bootstrap_admin {
+        std::env::var(&bootstrap.password_env)
+            .ok()
+            .map(zeroize::Zeroizing::new)
+    } else {
+        None
+    };
+
+    Ok(bootstrap_password)
+}
+
 /// Run the console server. This function blocks until shutdown.
 ///
 /// `bootstrap_password` is an optional plaintext password wrapped in

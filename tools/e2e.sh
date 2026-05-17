@@ -10,7 +10,8 @@
 # Requirements:
 #   - Built release binary at target/release/nanoguard
 #   - python3 on PATH
-#   - curl, jq
+#   - curl, jq, openssl, sqlite3 (used by the console scenarios for
+#     ad-hoc session secrets and DB pokes)
 
 set -uo pipefail
 
@@ -68,6 +69,16 @@ assert_eq() {
     fi
 }
 
+# --- prerequisites ---------------------------------------------------------
+
+for tool in curl jq python3 openssl sqlite3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf "error: required tool \`%s\` is not installed.\n" "$tool" >&2
+        printf "       Install it (or invoke the corresponding scenarios separately) and retry.\n" >&2
+        exit 1
+    fi
+done
+
 # --- start servers ---------------------------------------------------------
 
 if [ ! -x "$BIN" ]; then
@@ -97,6 +108,29 @@ wait_for_url() {
     return 1
 }
 
+# Make sure no stale `nanoguard` (or `nanoguard-admin`/`-eval`) is
+# still bound to a port from a previous scenario. The single-process
+# boot enabled in v0.8.0 means every scenario starts ONE process
+# that holds BOTH the proxy listener and the console listener; if
+# tear-down lags by even 200ms the next scenario's bind on the
+# same port races EADDRINUSE and fail-fast kills the whole stack.
+# Force-kill + a tiny sleep removes the flake from the equation.
+kill_leftover_nanoguards() {
+    # `pgrep -f` returns PIDs only; piping that to `grep -v ...`
+    # filters PID *strings*, never the cmdline, so `nanoguard-admin`
+    # / `nanoguard-eval` would have been swept too. Use `-af` to get
+    # `PID CMD` pairs and filter on CMD inside the loop. We're only
+    # trying to clean up zombie `nanoguard` proxies between e2e
+    # scenarios, never the offline CLIs.
+    while read -r pid cmd; do
+        case "$cmd" in
+            *nanoguard-admin*|*nanoguard-eval*) continue ;;
+        esac
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+    done < <(pgrep -af "target/release/nanoguard($|-)" 2>/dev/null || true)
+    sleep 0.3
+}
+
 cleanup() {
     [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null || true
     [ -n "${NG_PID:-}" ] && kill "$NG_PID" 2>/dev/null || true
@@ -106,20 +140,18 @@ cleanup() {
     # next e2e run sees flaky port-bind failures. Tear it down here so
     # the trap is honest about cleaning every child it knows about.
     [ -n "${CONSOLE_PID:-}" ] && kill "$CONSOLE_PID" 2>/dev/null || true
-    # Belt-and-suspenders: if a scenario re-used CONSOLE_PID across
-    # iterations and we never captured the intermediate value, sweep
-    # any remaining nanoguard-console process owned by this user.
-    for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do
-        kill "$pid" 2>/dev/null || true
-    done
+    # Sweep any zombie `nanoguard` proxy from a flaky tear-down so
+    # the next run doesn't see EADDRINUSE on $NG_PORT. The helper
+    # only targets the proxy binary, never `nanoguard-admin` or
+    # `nanoguard-eval`.
+    kill_leftover_nanoguards 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 # Make sure no leftover process is holding our ports.
 for pid in $(pgrep -f "tools/mock_backend.py" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
-for pid in $(pgrep -f "target/release/nanoguard" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
-for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do kill "$pid" 2>/dev/null || true; done
+kill_leftover_nanoguards
 sleep 0.3
 
 info "starting mock backend on :$MOCK_PORT"
@@ -1040,12 +1072,13 @@ info "scenario 26: console-UI-issued tokens are accepted (and revocable) by the 
 # Tear down the previous proxy. Console is a fresh process started below.
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
-# Make sure no leftover console from a previous run holds :18081.
-for pid in $(pgrep -f "target/release/nanoguard-console" 2>/dev/null); do
-    kill "$pid" 2>/dev/null || true
-done
+kill_leftover_nanoguards
 
-CONSOLE_BIN="$ROOT/target/release/nanoguard-console"
+# The standalone nanoguard-console binary was retired when
+# single-process boot landed. Every scenario starts exactly one
+# `$BIN` whose TOML carries `[console].enabled = true` so the
+# proxy and console listeners come up together. Scenario 37
+# covers the new contract explicitly.
 ADMIN_BIN="$ROOT/target/release/nanoguard-admin"
 S26_PORT=18081
 S26_CONSOLE_URL="http://127.0.0.1:$S26_PORT"
@@ -1083,18 +1116,9 @@ env_marker = "t"
 
 [reload]
 socket = "$S26_RELOAD_SOCK"
-EOF
-
-# Console config: same DB (`[budget].db_path` is what `nanoguard-console`
-# reads), bootstrap_admin so the admin user is provisioned, loopback
-# listener so cookies are not marked Secure (we're on plain HTTP).
-# Same [reload].socket as the proxy so a console-side token revoke
-# sends INVALIDATE_TOKENS over that socket and the verification cache
-# is flushed cross-process (see assertions 26e–26f).
-cp "$S26_PROXY_TOML" "$S26_CONSOLE_TOML"
-cat >> "$S26_CONSOLE_TOML" <<EOF
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S26_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1108,18 +1132,20 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S26_BOOTSTRAP_PASSWORD" }
 EOF
 
-NANOGUARD_CONFIG="$S26_PROXY_TOML" "$BIN" > "$S26_PROXY_LOG" 2>&1 &
+# Single-process: one `nanoguard` serves both the proxy and the
+# console listener (see scenario 37 for the dedicated coverage).
+# The BOOTSTRAP_PASSWORD must be exported before the binary starts.
+S26_PASSWORD="s26-pw-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S26_PROXY_TOML" S26_BOOTSTRAP_PASSWORD="$S26_PASSWORD" \
+    "$BIN" > "$S26_PROXY_LOG" 2>&1 &
 NG_PID=$!
+CONSOLE_PID=""
+S26_CONSOLE_TOML="$S26_PROXY_TOML"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
     curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
 done
 
-S26_PASSWORD="s26-pw-$(openssl rand -hex 8)"
-NANOGUARD_CONFIG="$S26_CONSOLE_TOML" \
-    S26_BOOTSTRAP_PASSWORD="$S26_PASSWORD" \
-    "$CONSOLE_BIN" > "$S26_CONSOLE_LOG" 2>&1 &
-CONSOLE_PID=$!
 # Bail out of this scenario the instant the console fails to come up;
 # otherwise every downstream `curl` returns 000 and produces a long
 # chain of misleading assertion failures that hide the real cause.
@@ -1261,12 +1287,9 @@ env_marker = "t"
 
 [reload]
 socket = "$S27_RELOAD_SOCK"
-EOF
-
-cp "$S27_PROXY_TOML" "$S27_CONSOLE_TOML"
-cat >> "$S27_CONSOLE_TOML" <<EOF
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S27_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1280,19 +1303,19 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S27_BOOTSTRAP_PASSWORD" }
 EOF
 
-NANOGUARD_CONFIG="$S27_PROXY_TOML" "$BIN" > "$S27_PROXY_LOG" 2>&1 &
+# Single-process boot: proxy + console from the same binary.
+S27_ADMIN_PW="s27-admin-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S27_PROXY_TOML" S27_BOOTSTRAP_PASSWORD="$S27_ADMIN_PW" \
+    "$BIN" > "$S27_PROXY_LOG" 2>&1 &
 NG_PID=$!
+CONSOLE_PID=""
+S27_CONSOLE_TOML="$S27_PROXY_TOML"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
     curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
 done
 
-S27_ADMIN_PW="s27-admin-$(openssl rand -hex 8)"
-NANOGUARD_CONFIG="$S27_CONSOLE_TOML" \
-    S27_BOOTSTRAP_PASSWORD="$S27_ADMIN_PW" \
-    "$CONSOLE_BIN" > "$S27_CONSOLE_LOG" 2>&1 &
-CONSOLE_PID=$!
-wait_for_url "27-pre. nanoguard-console boot" "$S27_CONSOLE_URL/" 15 || exit 1
+wait_for_url "27-pre. console listener (same proc)" "$S27_CONSOLE_URL/" 15 || exit 1
 
 # 27a. Wrong password is a 401, and the response body never contains
 # the literal username or password the caller sent.
@@ -1468,6 +1491,7 @@ S28_PROXY_LOG="$LOGDIR/ng.s28.proxy.log"
 S28_CONSOLE_LOG="$LOGDIR/ng.s28.console.log"
 S28_PROXY_AUDIT="$LOGDIR/ng.s28.audit.jsonl"
 S28_RELOAD_SOCK="$LOGDIR/e2e.s28.reload.sock"
+S28_PROXY_PID="$LOGDIR/e2e.s28.pid"
 S28_COOKIES="$LOGDIR/e2e.s28.cookies"
 rm -f "$S28_RELOAD_SOCK" "$S28_COOKIES" "$S28_PROXY_AUDIT"
 
@@ -1504,9 +1528,15 @@ path = "$S28_PROXY_AUDIT"
 hash_only = true
 
 [reload]
-socket = "$S28_RELOAD_SOCK"
+# Same-process boot: SIGHUP via PID file is the simpler IPC path
+# (we send SIGHUP to ourselves; tokio's signal handler picks it
+# up). The Unix-socket path also works but has tight EAGAIN/EWOULDBLOCK
+# windows when both the writer (`/api/edit` handler) and the
+# reader (`run_socket_reload_task`) live on the same runtime.
+pid_file = "$S28_PROXY_PID"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S28_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1521,21 +1551,19 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S28_BOOTSTRAP_PASSWORD" }
 EOF
 
-# Run both binaries from the workdir so relative paths in the config and
-# in the edit payload resolve to the same file.
-(cd "$S28_DIR" && NANOGUARD_CONFIG="$S28_TOML" "$BIN" > "$S28_PROXY_LOG" 2>&1) &
+# Single-process: one `nanoguard` serves both the proxy and the
+# console listener. BOOTSTRAP_PASSWORD must be exported before
+# `$BIN` starts so the console-bootstrap path picks it up.
+S28_PW="s28-pw-$(openssl rand -hex 8)"
+(cd "$S28_DIR" && NANOGUARD_CONFIG="$S28_TOML" S28_BOOTSTRAP_PASSWORD="$S28_PW" \
+    "$BIN" > "$S28_PROXY_LOG" 2>&1) &
 NG_PID=$!
+CONSOLE_PID=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
     curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
 done
-
-S28_PW="s28-pw-$(openssl rand -hex 8)"
-(cd "$S28_DIR" && NANOGUARD_CONFIG="$S28_TOML" \
-    S28_BOOTSTRAP_PASSWORD="$S28_PW" \
-    "$CONSOLE_BIN" > "$S28_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "28-pre. nanoguard-console boot" "$S28_CONSOLE_URL/" 15 || exit 1
+wait_for_url "28-pre. console listener (same proc)" "$S28_CONSOLE_URL/" 15 || exit 1
 
 LOGIN_RESP=$(curl -s -c "$S28_COOKIES" \
     -H "Content-Type: application/json" \
@@ -1633,9 +1661,15 @@ path = "$S28_PROXY_AUDIT"
 hash_only = true
 
 [reload]
-socket = "$S28_RELOAD_SOCK"
+# Same-process boot: SIGHUP via PID file is the simpler IPC path
+# (we send SIGHUP to ourselves; tokio's signal handler picks it
+# up). The Unix-socket path also works but has tight EAGAIN/EWOULDBLOCK
+# windows when both the writer (`/api/edit` handler) and the
+# reader (`run_socket_reload_task`) live on the same runtime.
+pid_file = "$S28_PROXY_PID"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S28_PORT"
 session_secret = "$(grep '^session_secret' "$S28_TOML" | head -n1 | cut -d= -f2- | tr -d ' "')"
 session_ttl_hours = 1
@@ -1664,8 +1698,8 @@ EDIT_RESP=$(curl -s -b "$S28_COOKIES" -c "$S28_COOKIES" \
     "$S28_CONSOLE_URL/api/edit")
 EDIT_TRIGGERED=$(echo "$EDIT_RESP" | jq -r '.reload.triggered // empty')
 EDIT_METHOD=$(echo "$EDIT_RESP" | jq -r '.reload.method // empty')
-if [ "$EDIT_TRIGGERED" = "true" ] && [ "$EDIT_METHOD" = "socket" ]; then
-    ok "28d. /api/edit fires a socket-based reload trigger after the write"
+if [ "$EDIT_TRIGGERED" = "true" ] && [ "$EDIT_METHOD" = "sighup" ]; then
+    ok "28d. /api/edit fires a SIGHUP reload trigger after the write"
 else
     ng "28d. edit did not trigger a reload; resp: $EDIT_RESP"
 fi
@@ -1741,7 +1775,11 @@ rm -f "$S29_COOKIES"
 
 cat > "$S29_TOML" <<EOF
 [nanoguard]
-listen = "127.0.0.1:$NG_PORT"
+# Scenario 29 exercises the admin CLI, which only needs the console
+# listener — the proxy listener is incidental. Bind it to a
+# scenario-specific port so a slow tear-down from scenario 28 does
+# not pin :NG_PORT and trip the fail-fast on the s29 boot.
+listen = "127.0.0.1:18099"
 log_level = "info"
 
 [backend]
@@ -1758,6 +1796,7 @@ enabled = false
 db_path = "$S29_DB"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S29_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1775,7 +1814,7 @@ EOF
 S29_FORGOTTEN_PW="s29-forgotten-$(openssl rand -hex 8)"
 (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
     S29_BOOTSTRAP_PW="$S29_FORGOTTEN_PW" \
-    "$CONSOLE_BIN" > "$S29_CONSOLE_LOG" 2>&1) &
+    "$BIN" > "$S29_CONSOLE_LOG" 2>&1) &
 CONSOLE_PID=$!
 wait_for_url "29-pre. nanoguard-console boot (first)" "$S29_CONSOLE_URL/" 15 || exit 1
 
@@ -1883,7 +1922,7 @@ fi
 # env var is intentionally NOT set this time — the bootstrap path is
 # one-shot and should be a no-op now that the users table has a row).
 (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
-    "$CONSOLE_BIN" > "$S29_CONSOLE_LOG" 2>&1) &
+    "$BIN" > "$S29_CONSOLE_LOG" 2>&1) &
 CONSOLE_PID=$!
 wait_for_url "29-pre. nanoguard-console boot (second)" "$S29_CONSOLE_URL/" 15 || exit 1
 
@@ -1944,6 +1983,7 @@ enabled = false
 db_path = "$S30_DB"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S30_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1957,12 +1997,14 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S30_BOOTSTRAP_PW" }
 EOF
 
+kill_leftover_nanoguards
 S30_PW="s30-pw-$(openssl rand -hex 8)"
 (cd "$S30_DIR" && NANOGUARD_CONFIG="$S30_TOML" \
     S30_BOOTSTRAP_PW="$S30_PW" \
-    "$CONSOLE_BIN" > "$S30_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "30-pre. nanoguard-console boot" "$S30_CONSOLE_URL/" 15 || exit 1
+    "$BIN" > "$S30_CONSOLE_LOG" 2>&1) &
+NG_PID=$!
+CONSOLE_PID=""
+wait_for_url "30-pre. console listener (same proc)" "$S30_CONSOLE_URL/" 15 || exit 1
 
 # 30a. Login → valid session → /api/me 200. Establishes baseline.
 LOGIN_RESP=$(curl -s -c "$S30_COOKIES" \
@@ -2088,6 +2130,7 @@ enabled = false
 db_path = "$S31_DB"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S31_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2101,12 +2144,14 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S31_BOOTSTRAP_PW" }
 EOF
 
+kill_leftover_nanoguards
 S31_ADMIN_PW="s31-admin-$(openssl rand -hex 8)"
 (cd "$S31_DIR" && NANOGUARD_CONFIG="$S31_TOML" \
     S31_BOOTSTRAP_PW="$S31_ADMIN_PW" \
-    "$CONSOLE_BIN" > "$S31_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "31-pre. nanoguard-console boot" "$S31_CONSOLE_URL/" 15 || exit 1
+    "$BIN" > "$S31_CONSOLE_LOG" 2>&1) &
+NG_PID=$!
+CONSOLE_PID=""
+wait_for_url "31-pre. console listener (same proc)" "$S31_CONSOLE_URL/" 15 || exit 1
 
 # Log in as admin, mint an admin-owned token.
 ADMIN_LOGIN=$(curl -s -c "$S31_COOKIES_ADMIN" \
@@ -2218,6 +2263,7 @@ db_path = "$S32_DB"
 socket = "$S32_RELOAD_SOCK"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S32_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2232,19 +2278,17 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S32_BOOTSTRAP_PW" }
 EOF
 
-(cd "$S32_DIR" && NANOGUARD_CONFIG="$S32_TOML" "$BIN" > "$LOGDIR/ng.s32.proxy.log" 2>&1) &
+kill_leftover_nanoguards
+S32_PW="s32-pw-$(openssl rand -hex 8)"
+(cd "$S32_DIR" && NANOGUARD_CONFIG="$S32_TOML" S32_BOOTSTRAP_PW="$S32_PW" \
+    "$BIN" > "$LOGDIR/ng.s32.proxy.log" 2>&1) &
 NG_PID=$!
+CONSOLE_PID=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
     curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
 done
-
-S32_PW="s32-pw-$(openssl rand -hex 8)"
-(cd "$S32_DIR" && NANOGUARD_CONFIG="$S32_TOML" \
-    S32_BOOTSTRAP_PW="$S32_PW" \
-    "$CONSOLE_BIN" > "$S32_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "32-pre. nanoguard-console boot" "$S32_CONSOLE_URL/" 15 || exit 1
+wait_for_url "32-pre. console listener (same proc)" "$S32_CONSOLE_URL/" 15 || exit 1
 
 LOGIN_RESP=$(curl -s -c "$S32_COOKIES" \
     -H "Content-Type: application/json" \
@@ -2349,6 +2393,7 @@ enabled = false
 db_path = "$S33_DB"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S33_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2362,12 +2407,14 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S33_BOOTSTRAP_PW" }
 EOF
 
+kill_leftover_nanoguards
 S33_PW="s33-pw-$(openssl rand -hex 8)"
 (cd "$S33_DIR" && NANOGUARD_CONFIG="$S33_TOML" \
     S33_BOOTSTRAP_PW="$S33_PW" \
-    "$CONSOLE_BIN" > "$S33_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "33-pre. nanoguard-console boot" "$S33_CONSOLE_URL/" 15 || exit 1
+    "$BIN" > "$S33_CONSOLE_LOG" 2>&1) &
+NG_PID=$!
+CONSOLE_PID=""
+wait_for_url "33-pre. console listener (same proc)" "$S33_CONSOLE_URL/" 15 || exit 1
 
 # Provoke a user_create mutation — it's the cleanest action that
 # carries target + after.
@@ -2509,6 +2556,7 @@ enabled = true
 db_path = "$S34_DB"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S34_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2537,12 +2585,14 @@ CREATE TABLE IF NOT EXISTS api_key_usage (
 INSERT OR REPLACE INTO api_key_usage (api_key, total_tokens) VALUES ('demo-key', 4242);
 EOF
 
+kill_leftover_nanoguards
 S34_PW="s34-pw-$(openssl rand -hex 8)"
 (cd "$S34_DIR" && NANOGUARD_CONFIG="$S34_TOML" \
     S34_BOOTSTRAP_PW="$S34_PW" \
-    "$CONSOLE_BIN" > "$S34_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "34-pre. nanoguard-console boot" "$S34_CONSOLE_URL/" 15 || exit 1
+    "$BIN" > "$S34_CONSOLE_LOG" 2>&1) &
+NG_PID=$!
+CONSOLE_PID=""
+wait_for_url "34-pre. console listener (same proc)" "$S34_CONSOLE_URL/" 15 || exit 1
 
 LOGIN=$(curl -s -c "$S34_COOKIES" \
     -H "Content-Type: application/json" \
@@ -2710,9 +2760,7 @@ info "scenario 35: multi-backend routing dispatches by model"
 # old process pointing at the old mock.
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
-for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
-    kill -9 "$pid" 2>/dev/null || true
-done
+kill_leftover_nanoguards
 sleep 0.5
 
 S35_DIR="$LOGDIR/e2e.s35.workdir"
@@ -2734,6 +2782,19 @@ S35_MOCK_A_PID=$!
 BACKEND_LABEL="B" python3 "$MOCK" "$S35_MOCK_B_PORT" > "$S35_MOCK_B_LOG" 2>&1 &
 S35_MOCK_B_PID=$!
 sleep 0.5
+
+# All-in-one TOML: proxy listener + routing pool + console.
+# Single-process boot serves both `/v1/chat/completions` and
+# `/api/*` from one `nanoguard`. Later assertions add a console
+# user and call /api/overview; the [console] block is here from
+# the start so the second boot the original test did is no
+# longer needed.
+S35_CONSOLE_PORT=18090
+S35_CONSOLE_URL="http://127.0.0.1:$S35_CONSOLE_PORT"
+S35_CONSOLE_LOG="$LOGDIR/ng.s35.console.log"
+S35_COOKIES="$LOGDIR/e2e.s35.cookies"
+S35_DB="$S35_DIR/nanoguard.db"
+rm -f "$S35_COOKIES"
 
 cat > "$S35_TOML" <<EOF
 [nanoguard]
@@ -2758,11 +2819,34 @@ rules = [
     { model = "fast-*",   backend = "beta"  },
     { model = "premium",  backend = "alpha" },
 ]
+
+[budget]
+enabled = false
+db_path = "$S35_DB"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S35_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S35_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S35_BOOTSTRAP_PW" }
 EOF
 
-NANOGUARD_CONFIG="$S35_TOML" "$BIN" > "$S35_PROXY_LOG" 2>&1 &
+kill_leftover_nanoguards
+S35_PW="s35-pw-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S35_TOML" S35_BOOTSTRAP_PW="$S35_PW" \
+    "$BIN" > "$S35_PROXY_LOG" 2>&1 &
 NG_PID=$!
+CONSOLE_PID=""
 wait_for_url "35-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+wait_for_url "35-pre. console boot (same proc)" "$S35_CONSOLE_URL/" 15 || exit 1
 
 # 35a. Exact-match rule: `model: premium` → backend `alpha`.
 RESP=$(curl -s "$NG_URL/v1/chat/completions" \
@@ -2795,40 +2879,8 @@ case "$ECHO_C" in
 esac
 
 # 35d. /api/overview surfaces both backends + the routing table.
-# Need to spawn a console for this — share the same TOML.
-S35_CONSOLE_PORT=18090
-S35_CONSOLE_URL="http://127.0.0.1:$S35_CONSOLE_PORT"
-S35_CONSOLE_LOG="$LOGDIR/ng.s35.console.log"
-S35_COOKIES="$LOGDIR/e2e.s35.cookies"
-S35_DB="$S35_DIR/nanoguard.db"
-rm -f "$S35_COOKIES"
-cat >> "$S35_TOML" <<EOF
-
-[budget]
-enabled = false
-db_path = "$S35_DB"
-
-[console]
-listen = "127.0.0.1:$S35_CONSOLE_PORT"
-session_secret = "$(openssl rand -hex 32)"
-session_ttl_hours = 1
-audit_path = "$S35_DIR/console-audit.jsonl"
-
-[console.auth]
-mode = "local"
-
-[console.auth.local]
-allow_signup = false
-bootstrap_admin = { username = "admin", password_env = "S35_BOOTSTRAP_PW" }
-EOF
-
-S35_PW="s35-pw-$(openssl rand -hex 8)"
-(cd "$S35_DIR" && NANOGUARD_CONFIG="$S35_TOML" \
-    S35_BOOTSTRAP_PW="$S35_PW" \
-    "$CONSOLE_BIN" > "$S35_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "35-pre. console boot" "$S35_CONSOLE_URL/" 15 || exit 1
-
+# Console listener is the same process as the proxy (see TOML
+# above), so we can log in directly.
 curl -s -o /dev/null -c "$S35_COOKIES" \
     -H "Content-Type: application/json" \
     -d "{\"username\":\"admin\",\"password\":\"$S35_PW\"}" \
@@ -2902,9 +2954,7 @@ info "scenario 36: Console Backends tab — list / create / delete"
 
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
-for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
-    kill -9 "$pid" 2>/dev/null || true
-done
+kill_leftover_nanoguards
 sleep 0.5
 
 S36_DIR="$LOGDIR/e2e.s36.workdir"
@@ -2942,9 +2992,12 @@ enabled = false
 db_path = "$S36_DB"
 
 [reload]
-socket = "$S36_RELOAD_SOCK"
+# Same-process boot: SIGHUP via PID file works reliably; the
+# socket path's same-runtime read+write race shows up under load.
+pid_file = "$S36_DIR/proxy.pid"
 
 [console]
+enabled = true
 listen = "127.0.0.1:$S36_CONSOLE_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2958,16 +3011,14 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "S36_BOOTSTRAP_PW" }
 EOF
 
-(cd "$S36_DIR" && NANOGUARD_CONFIG="$S36_TOML" "$BIN" > "$S36_PROXY_LOG" 2>&1) &
-NG_PID=$!
-wait_for_url "36-pre. proxy boot" "$NG_URL/health" 15 || exit 1
-
+kill_leftover_nanoguards
 S36_PW="s36-pw-$(openssl rand -hex 8)"
-(cd "$S36_DIR" && NANOGUARD_CONFIG="$S36_TOML" \
-    S36_BOOTSTRAP_PW="$S36_PW" \
-    "$CONSOLE_BIN" > "$S36_CONSOLE_LOG" 2>&1) &
-CONSOLE_PID=$!
-wait_for_url "36-pre. console boot" "$S36_CONSOLE_URL/" 15 || exit 1
+(cd "$S36_DIR" && NANOGUARD_CONFIG="$S36_TOML" S36_BOOTSTRAP_PW="$S36_PW" \
+    "$BIN" > "$S36_PROXY_LOG" 2>&1) &
+NG_PID=$!
+CONSOLE_PID=""
+wait_for_url "36-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+wait_for_url "36-pre. console boot (same proc)" "$S36_CONSOLE_URL/" 15 || exit 1
 
 LOGIN=$(curl -s -c "$S36_COOKIES" \
     -H "Content-Type: application/json" \
@@ -3121,6 +3172,132 @@ esac
 
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+# --- 37. Single-process boot: one `nanoguard` serves proxy + console -----
+# Before this change an operator needed two commands: `make run` and
+# `make run-console`. Now `nanoguard` spawns the console listener
+# inline when `[console].enabled = true` (the default). The
+# `nanoguard-console` binary stays for the rare "console-only"
+# deployment (operator workstation → remote DB).
+info "scenario 37: single-process nanoguard serves both proxy and console"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+kill_leftover_nanoguards
+
+S37_DIR="$LOGDIR/e2e.s37.workdir"
+rm -rf "$S37_DIR"
+mkdir -p "$S37_DIR"
+
+S37_TOML="$S37_DIR/nanoguard.toml"
+S37_LOG="$LOGDIR/ng.s37.log"
+S37_CONSOLE_PORT=18092
+S37_CONSOLE_URL="http://127.0.0.1:$S37_CONSOLE_PORT"
+
+cat > "$S37_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S37_DIR/nanoguard.db"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S37_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S37_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+EOF
+
+(cd "$S37_DIR" && NANOGUARD_CONFIG="$S37_TOML" "$BIN" > "$S37_LOG" 2>&1) &
+NG_PID=$!
+wait_for_url "37-pre. proxy /health on :$NG_PORT" "$NG_URL/health" 15 || exit 1
+wait_for_url "37-pre. console / on :$S37_CONSOLE_PORT" "$S37_CONSOLE_URL/" 15 || exit 1
+
+# 37a. Proxy listener is up.
+PROXY=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/health")
+assert_eq "37a. single-process /health on :$NG_PORT" "$PROXY" "200"
+
+# 37b. Console listener is up, on the SAME process.
+CONSOLE=$(curl -s -o /dev/null -w "%{http_code}" "$S37_CONSOLE_URL/")
+assert_eq "37b. single-process console / on :$S37_CONSOLE_PORT" "$CONSOLE" "200"
+
+# 37c. Exactly one nanoguard process is running — confirms the
+# console is in-process, not a forked child.
+# Count proxy processes only — `nanoguard-admin` / `nanoguard-eval`
+# are unrelated CLIs and we filter them on the cmdline (pgrep -af),
+# not the PID output (which would not filter at all).
+PROC_COUNT=$(pgrep -af "target/release/nanoguard($|-)" 2>/dev/null \
+    | grep -vE -- "-admin|-eval" \
+    | wc -l | tr -d ' ')
+case "$PROC_COUNT" in
+    1) ok "37c. exactly one nanoguard process serves both ports" ;;
+    *) ng "37c. unexpected nanoguard process count: $PROC_COUNT" ;;
+esac
+
+# 37d. The console listener log line is present in the proxy's own
+# log stream — proves the spawn is in-process.
+if grep -q "nanoguard-console listening on http://127.0.0.1:$S37_CONSOLE_PORT" "$S37_LOG"; then
+    ok "37d. proxy log carries the in-process console listener line"
+else
+    ng "37d. expected console listener log line in $S37_LOG"
+fi
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+# Give the kernel a moment to release the console port. Without
+# this, the next `nanoguard` boot hits EADDRINUSE on $S37_CONSOLE_PORT
+# even though the process has exited — TCP TIME_WAIT lingers briefly.
+sleep 0.5
+kill_leftover_nanoguards
+
+# 37e. [console].enabled = false — `nanoguard` alone serves only the
+# proxy. The console port is silent.
+sed -i.bak 's/^enabled = true$/enabled = false/' "$S37_TOML"
+(cd "$S37_DIR" && NANOGUARD_CONFIG="$S37_TOML" "$BIN" > "$S37_LOG" 2>&1) &
+NG_PID=$!
+wait_for_url "37-pre. proxy /health (console off)" "$NG_URL/health" 15 || exit 1
+
+# curl returns 000 when the connection is refused (i.e. nothing
+# listening). 2>/dev/null hides the curl error; `|| echo 000`
+# defends against the non-zero exit code in case `-w` produces
+# empty output on connect failure on the operator's platform.
+CONSOLE_OFF_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    "$S37_CONSOLE_URL/" 2>/dev/null)
+[ -z "$CONSOLE_OFF_CODE" ] && CONSOLE_OFF_CODE="000"
+case "$CONSOLE_OFF_CODE" in
+    000) ok "37e. [console].enabled = false suppresses the console listener" ;;
+    *)   ng "37e. console answered $CONSOLE_OFF_CODE with enabled = false" ;;
+esac
+
+PROXY_STILL=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/health")
+assert_eq "37f. proxy still serves /health when console is disabled" "$PROXY_STILL" "200"
+
+if grep -q "\[console\].enabled = false; not spawning" "$S37_LOG"; then
+    ok "37g. proxy log records the [console] suppression decision"
+else
+    ng "37g. expected suppression log line in $S37_LOG"
+fi
+
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 
