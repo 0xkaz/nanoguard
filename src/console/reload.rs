@@ -287,7 +287,10 @@ mod tests {
         let result = trigger_via_pid_file("/nonexistent/path/proxy.pid");
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
-        assert!(msg.contains("reading pid file"), "error should mention reading pid file: {msg}");
+        assert!(
+            msg.contains("reading pid file"),
+            "error should mention reading pid file: {msg}"
+        );
     }
 
     #[test]
@@ -298,7 +301,10 @@ mod tests {
         let result = trigger_via_pid_file(path.to_str().unwrap());
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
-        assert!(msg.contains("parsing PID"), "error should mention parsing PID: {msg}");
+        assert!(
+            msg.contains("parsing PID"),
+            "error should mention parsing PID: {msg}"
+        );
         cleanup(&dir);
     }
 
@@ -350,7 +356,10 @@ mod tests {
         let result = trigger_via_socket(&socket_path);
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
-        assert!(msg.contains("something_broken"), "error should contain proxy error: {msg}");
+        assert!(
+            msg.contains("something_broken"),
+            "error should contain proxy error: {msg}"
+        );
         handle.join().unwrap();
         let _ = std::fs::remove_file(&socket_path);
     }

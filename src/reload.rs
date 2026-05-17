@@ -220,8 +220,7 @@ async fn execute_reload(shared: &SharedState, runtime: &RuntimeHandles) -> Resul
     let shared_for_task = shared.clone();
     let runtime_for_task = runtime.clone();
     let result =
-        tokio::task::spawn_blocking(move || reload_once(&shared_for_task, &runtime_for_task))
-            .await;
+        tokio::task::spawn_blocking(move || reload_once(&shared_for_task, &runtime_for_task)).await;
     match result {
         Ok(Ok(())) => {
             let elapsed_us = t0.elapsed().as_micros() as u64;
