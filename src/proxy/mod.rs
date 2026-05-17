@@ -559,8 +559,19 @@ pub async fn list_models(State(shared): State<SharedState>) -> Response {
         let url = format!("{}/v1/models", backend.endpoint());
         let client = state.http_client.clone();
         let label = label.clone();
+        // Per-backend api_key has to ride along on the /v1/models
+        // call too — OpenAI, Anthropic, DeepSeek and other paid
+        // providers reject anonymous GETs on /v1/models. The
+        // forward_chat path already sends the bearer for POSTs; we
+        // mirror that here so the aggregation works against a
+        // production pool, not just Ollama.
+        let api_key = backend.api_key().map(|s| s.to_string());
         tasks.push(tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, client.get(&url).send()).await;
+            let mut req = client.get(&url);
+            if let Some(k) = api_key {
+                req = req.bearer_auth(k);
+            }
+            let result = tokio::time::timeout(timeout, req.send()).await;
             (label, result)
         }));
     }

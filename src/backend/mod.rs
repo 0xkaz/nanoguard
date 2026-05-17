@@ -57,6 +57,15 @@ impl Backend {
     pub fn provider(&self) -> &str {
         &self.cfg.provider
     }
+
+    /// Configured api_key for this backend, if any. Used by the
+    /// /v1/models aggregator (and any future GET that talks to the
+    /// upstream directly) so authenticated providers like OpenAI /
+    /// Anthropic / DeepSeek answer the request instead of returning
+    /// 401.
+    pub fn api_key(&self) -> Option<&str> {
+        self.cfg.api_key.as_deref()
+    }
 }
 
 /// Runtime view of the resolved backend pool. Holds a `Backend`
