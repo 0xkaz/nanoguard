@@ -425,25 +425,19 @@ A separate binary, `nanoguard-console`, ships an optional read-only operator con
 
 Phase 1 (in `main`) is read-only browsing of audit log, budget state, and the current config, plus self-service proxy-token issue/revoke for the logged-in user and admin user CRUD (allowed models, budget limit, role, enable/disable). File-based config editing, CSRF tokens, reload trigger, and `console-audit.jsonl` are Phase 2 and not yet implemented.
 
-### 1. Add `[console]` to `nanoguard.toml`
+### 1. Configure `nanoguard.toml`
 
-The default `nanoguard.toml` ships with the section commented out. Uncomment it (or paste the minimal form below) before starting `nanoguard-console`:
+The default `nanoguard.toml` ships with the `[console]` section already enabled. You can optionally set a persistent secret, but it is not required for local development:
 
 ```toml
 [console]
-listen         = "127.0.0.1:8081"          # loopback only; non-loopback auto-enables Secure cookies
-session_secret = "${CONSOLE_SESSION_SECRET}"
-session_ttl_hours = 24
-
-[console.auth]
-mode = "local"                              # Phase 1 supports "local" only; OIDC is Phase 4
-
-[console.auth.local]
-allow_signup    = false
-bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
+listen         = "127.0.0.1:8081"
+# session_secret = "..."   # If empty, an ephemeral secret is generated at startup
 ```
 
-`session_secret` is **required**; `nanoguard-console` refuses to start if it is empty. If `listen` is non-loopback, cookies are automatically marked `Secure` — terminate TLS in front of the console in that case.
+If you don't provide a `session_secret` in the TOML or via `CONSOLE_SESSION_SECRET`, `nanoguard-console` will generate a random ephemeral secret and print it to `stderr`. This is convenient for testing but will log all users out on restart.
+
+If `listen` is non-loopback, cookies are automatically marked `Secure` — terminate TLS in front of the console in that case.
 
 ### 2. Set the env vars and start the console
 

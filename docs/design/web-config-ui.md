@@ -1,4 +1,4 @@
-> **Status:** proposed (2026-05-16, revised 2026-05-16 to incorporate user-management and multi-backend routing)
+> **Status:** partial (commit cdc795c, 2026-05-17 — Phase 1 shipped; Phase 2+ open. File editing, CSRF, reload trigger, `console-audit.jsonl`, model-allowlist editor, and force-revoke-all-tokens are deferred to later phases.)
 
 # Web Configuration UI
 
@@ -179,9 +179,12 @@ Non-editable surfaces (require restart, surfaced as read-only in
 the UI with an explanatory note):
 
 - `[nanoguard] listen`, `[nanoguard] log_level`
-- `[backends.*]` endpoint, api_key, and provider (see
-  `multi-backend-routing.md`; entries added/removed require restart;
-  `[routing]` and per-user allowed_models are hot-reloadable)
+- `[backends.*]` endpoint, api_key, and provider — depends on
+  `multi-backend-routing.md` landing first; today the proxy still
+  uses a single `[backend]` section, so the UI surfaces the legacy
+  shape until that doc moves out of `proposed`. Entries added or
+  removed will require restart; `[routing]` and per-user
+  `allowed_models` will be hot-reloadable.
 - `[budget] db_path`, `[audit] path`
 
 ### User self-service views
@@ -218,12 +221,15 @@ audit/budget dashboards, admin users see:
    service_account). Row actions: edit, force-revoke-all-tokens,
    disable/enable, delete. The "edit user" panel exposes the
    per-user policy form:
-   - **Allowed models.** A multi-select populated from the current
-     `[routing]` table. The UI prevents selecting a model that has
-     no route — the misconfig case from
-     `multi-backend-routing.md` step 5 can't happen through the UI.
-     Wildcard entries (`*`, `claude-*`) are typed in a free-text
-     field alongside the picker.
+   - **Allowed models.** Today (Phase 1) the field is a free-text
+     editor stored as a TEXT column on the user row; there is no
+     route-aware validation because `[routing]` does not exist yet.
+     Once `multi-backend-routing.md` lands, the UI will switch to a
+     multi-select populated from the current `[routing]` table that
+     prevents selecting a model with no route — the misconfig case
+     from `multi-backend-routing.md` step 5 can't happen through the
+     UI. Wildcard entries (`*`, `claude-*`) will continue to be
+     typed in a free-text field alongside the picker.
    - **Budget limit.** Integer tokens, with a "no limit" toggle.
    - **Role.** `user` / `admin`. Changing to `admin` requires the
      current admin to type the target username as a confirmation —
@@ -236,18 +242,24 @@ audit/budget dashboards, admin users see:
    OIDC mode: manual `oidc_sub` entry (rare; usually auto-
    provisioned at first login). The form sets defaults from
    `[console.auth].default_role` and `default_allowed_models`.
-3. **Model allowlist editor.** A view of the current `[routing]`
+3. **Model allowlist editor.** (Depends on
+   `multi-backend-routing.md`.) A view of the current `[routing]`
    table with an "Add model" form. Each row picks a backend from
    the configured `[backends.*]`. Saving updates `[routing]` in
    `nanoguard.toml` and triggers reload. The form refuses to save
    a model whose only matching backend has no `api_key` configured
    (so the operator catches the misconfig at edit time, not at
-   request time).
-4. **Backends overview.** Read-only summary of `[backends.*]`:
-   provider, endpoint, whether `api_key` is set. Editing a
-   backend entry (or adding/removing one) currently requires a
-   restart; the UI explains this and offers a downloadable
-   updated `nanoguard.toml` instead of an in-place edit.
+   request time). Phase 1 ships a free-text `allowed_models` field
+   on the user editor instead — the routing-aware editor lands once
+   `[routing]` lands in `nanoguard.toml`.
+4. **Backends overview.** (Depends on `multi-backend-routing.md`.)
+   Read-only summary of `[backends.*]`: provider, endpoint, whether
+   `api_key` is set. Editing a backend entry (or adding/removing
+   one) currently requires a restart; the UI explains this and
+   offers a downloadable updated `nanoguard.toml` instead of an
+   in-place edit. Until multi-backend routing lands, the UI surfaces
+   the existing single `[backend]` section in the same read-only
+   shape.
 5. **Console-audit viewer.** The `console-audit.jsonl` log:
    "admin alice changed allowed_models for carol from [X] to
    [X, Y] at 14:32." Filterable by actor and by target. This is
@@ -285,11 +297,16 @@ for the full schema:
 
 ```toml
 [console]
-listen         = "127.0.0.1:8081"     # default: loopback only
-session_secret = "${CONSOLE_SESSION_SECRET}"
+listen            = "127.0.0.1:8081"     # default: loopback only
+session_secret    = "${CONSOLE_SESSION_SECRET}"
+session_ttl_hours = 24                    # default; cookie + DB session lifetime
 
 [console.auth]
-mode = "oidc"                          # "oidc" | "local" | "both"
+mode = "local"                         # "oidc" | "local" | "both"
+                                       # Phase 1 only implements "local";
+                                       # the "oidc" block below is a
+                                       # Phase 4 forward-reference, not
+                                       # yet wired up.
 
 [console.auth.oidc]
 issuer       = "https://idp.example.com"
@@ -304,11 +321,33 @@ allow_signup = false
 bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
 ```
 
+- **`session_secret` is required but has a fallback.** If the
+  value in the config (or `CONSOLE_SESSION_SECRET` environment
+  variable) is empty, `nanoguard-console` generates a random
+  32-byte ephemeral secret at startup and logs it to `stderr`.
+  This allows the console to be used for local development without
+  configuration, though sessions will not persist across restarts.
 - **Listen address defaults to `127.0.0.1`** — loopback only. To
   expose the console on a network interface, the operator changes
   `listen` explicitly. This is opt-in, not the default, because a
   misconfigured console on a public IP is the canonical "remote
   config" disaster.
+- **Cookie `Secure` flag is decided at startup from the listen
+  address.** If `listen` resolves to a loopback IP, the session
+  cookie is issued without `Secure` so it works over plain HTTP on
+  localhost. If `listen` is any other interface, the cookie is
+  marked `Secure` and the operator is expected to terminate TLS in
+  front of the console (`src/console/mod.rs`). The cookie is always
+  `HttpOnly` and `SameSite=Lax` regardless of listen address.
+- **Session lifetime** is controlled by `session_ttl_hours`
+  (default 24). Sessions are stored in the SQLite DB and a
+  background task prunes expired rows every 5 minutes.
+- **Bootstrap password handling.** `bootstrap_admin.password_env`
+  is read into a `Zeroizing<String>` before the tokio runtime
+  starts, so the plaintext is cleared from memory after the bcrypt
+  hash is computed. The startup log reminds the operator to clear
+  the variable from the shell environment after first boot — the
+  zeroize step does not touch the parent shell's exported value.
 - **CSRF**: every mutating endpoint requires a per-session
   double-submit token (`X-CSRF-Token` request header, hex-encoded
   32 bytes). The token is generated at session creation, stored on
@@ -320,14 +359,19 @@ bootstrap_admin = { username = "admin", password_env = "BOOTSTRAP_PASSWORD" }
   refreshes its cached value. `POST /api/login` is the only
   mutating endpoint exempt from the check, since the session
   required to hold a token does not yet exist.
-- **Audit context**: every edit records the authenticated subject
-  (`actor`) in `console-audit.jsonl`. The `actor` is the username
-  (local mode) or the OIDC `sub`.
+- **Audit context**: every edit will record the authenticated
+  subject (`actor`) in `console-audit.jsonl`. The `actor` is the
+  username (local mode) or the OIDC `sub`. The audit file itself
+  lands in Phase 2.
 
 ## Reload trigger
 
-How the console tells the proxy to reload is intentionally
-narrow:
+Not implemented in Phase 1. Phase 1 is read-only against the
+configuration files, so the console never asks the proxy to
+reload. The trigger lands in Phase 2 alongside file editing.
+
+How the console tells the proxy to reload, once that lands, is
+intentionally narrow:
 
 1. **SIGHUP via PID file** (default). The console reads
    `proxy_pid_file`, checks the PID exists, then sends SIGHUP. The
@@ -397,8 +441,11 @@ The console depends on hot reload, but it does not replace it.
   separate credential and is HttpOnly / Secure / SameSite=Lax.
 - **The console cannot delete proxy audit log entries.** The
   proxy's audit log file is opened read-only by the console.
-  Admin actions are appended to the separate
-  `console-audit.jsonl`, which the proxy does not write to.
+  Admin actions will be appended to the separate
+  `console-audit.jsonl`, which the proxy does not write to. The
+  `console-audit.jsonl` file itself lands in Phase 2; Phase 1's
+  admin mutations (user CRUD, token revoke) are not yet recorded
+  to a separate audit stream, only to standard application logs.
 - **Budget DB writes go through the proxy's admin API.** The
   console opens the SQLite file read-only for dashboards;
   changing limits posts to `/v1/admin/budget/*` on the proxy
@@ -415,35 +462,52 @@ for issuing tokens) and `user-management.md` (for the user data
 model). File editing depends on hot reload.
 
 1. **Phase 1 — read-only console + local-password auth + own-token
-   self-service.** Depends on `client-auth.md` + Phase 1/2 of
-   `user-management.md`. Ships:
-   - Local-password login (bootstrap admin from env)
+   self-service + admin user CRUD.** *Shipped in commit `cdc795c`
+   (PR #23, 2026-05-17).* Depended on `client-auth.md` Stage 1; the
+   `users`/`sessions` schema landed inside this PR (the dedicated
+   user-management doc is still `proposed`). Ships:
+   - Local-password login (bootstrap admin from
+     `BOOTSTRAP_PASSWORD`, hashed and zeroized before runtime)
    - "My tokens" / "My budget" / "My audit slice" for every user
    - Read-only audit viewer, budget dashboard, current-config view
      for admins
-   - No file editing yet, no OIDC yet
-   `nanoguard-console` binary in the same workspace, vendored
-   static asset bundle (HTML/CSS/JS, no Node toolchain at runtime).
-2. **Phase 2 — file editing for dicts, policies, and the
-   per-user policy editor.** Depends on hot reload landing. Adds:
+   - **Admin user editor** (`api_list_users` / `api_create_user` /
+     `api_update_user` in `src/console/handlers.rs`): create user,
+     edit `allowed_models` / `budget_limit` / `disabled` / `role`.
+     `allowed_models` is a free-text TEXT column at this stage —
+     no `[routing]`-aware validation yet.
+   - `nanoguard-console` binary in the same workspace, with a
+     vendored static asset bundle (HTML/CSS/JS, no Node toolchain
+     at runtime).
+   - No OIDC yet, no file editing, no CSRF token, no reload
+     trigger, no `console-audit.jsonl`, no force-revoke-all-tokens,
+     no `[routing]`-aware model picker — those are Phase 2+.
+2. **Phase 2 — file editing for dicts, policies, and security
+   hardening of admin mutations.** Depends on hot reload (already
+   landed) and on `multi-backend-routing.md` for the routing-aware
+   pieces. Adds:
    - File-write contract (atomic rename + backup) for dicts /
      policies / TOML keys that are reload-safe
-   - Admin user editor (allowed_models, budget_limit, disabled,
-     role)
-   - Model allowlist editor backed by `[routing]`
-   - Force-revoke-all-tokens, console-audit log surface
+   - Reload trigger (SIGHUP via PID file, optional Unix-domain
+     socket)
+   - Per-session double-submit CSRF token on all mutating endpoints
+   - `console-audit.jsonl` for admin mutations (the existing user
+     editor backfills into this stream once it lands)
+   - Model allowlist editor backed by `[routing]` — gated on
+     `multi-backend-routing.md` landing
+   - Force-revoke-all-tokens action on the user editor
 3. **Phase 3 — full TOML section editor.** Adds structured editing
    of remaining reloadable `nanoguard.toml` keys (input,
    spotlight, schema, tool gate). Restart-only keys (listen,
    backends.*, audit.path, budget.db_path) remain read-only in the
    UI.
-4. **Phase 4 — OIDC + CSRF hardening.** Adds the OIDC login flow
+4. **Phase 4 — OIDC integration.** Adds the OIDC login flow
    from `user-management.md`, with auto-provisioning and
-   admin-claim mapping. Per-session double-submit CSRF token.
-   Documents how to put the console behind a reverse proxy.
-   Static-token auth (the simpler single-operator mode that was
-   the earlier version of this doc) is dropped: local password and
-   OIDC are the two supported modes.
+   admin-claim mapping. CSRF protection is already in place from
+   Phase 2; this phase documents how to put the console behind a
+   reverse proxy. Static-token auth (the simpler single-operator
+   mode that was the earlier version of this doc) is dropped:
+   local password and OIDC are the two supported modes.
 5. **Phase 5 (optional) — change-request mode.** Instead of
    writing the file directly, the console writes to a worktree
    branch and opens a PR via the local `gh` CLI. The reload only
