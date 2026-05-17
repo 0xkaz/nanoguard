@@ -1186,6 +1186,519 @@ wait "$CONSOLE_PID" 2>/dev/null || true
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 
+# --- 27. Console auth + permission boundary -------------------------------
+# Scenario 26 proves the *happy path* (admin logs in, mints, revokes).
+# Scenario 27 fences the security perimeter:
+#   - wrong password is rejected without leaking which field is wrong
+#   - CSRF header is genuinely required for mutating endpoints
+#   - logout clears the session
+#   - admin role gates the user-management endpoints
+#   - force-revoke-all flushes the proxy cache (same contract as
+#     per-token revoke; XKA-61 shipped this handler without an e2e)
+info "scenario 27: console auth + permission boundary"
+
+# Reuse the scenario-26 config skeleton; fresh DB so the bootstrap
+# admin path runs again and we know exactly what users exist.
+S27_PORT=18082
+S27_CONSOLE_URL="http://127.0.0.1:$S27_PORT"
+S27_DB="$LOGDIR/e2e.s27.db"
+S27_PROXY_TOML="$LOGDIR/e2e.s27.proxy.toml"
+S27_CONSOLE_TOML="$LOGDIR/e2e.s27.console.toml"
+S27_CONSOLE_AUDIT="$LOGDIR/e2e.s27.console-audit.jsonl"
+S27_PROXY_LOG="$LOGDIR/ng.s27.proxy.log"
+S27_CONSOLE_LOG="$LOGDIR/ng.s27.console.log"
+S27_PROXY_AUDIT="$LOGDIR/ng.s27.audit.jsonl"
+S27_RELOAD_SOCK="$LOGDIR/e2e.s27.reload.sock"
+S27_COOKIES_ADMIN="$LOGDIR/e2e.s27.admin.cookies"
+S27_COOKIES_VIEWER="$LOGDIR/e2e.s27.viewer.cookies"
+rm -f "$S27_DB" "$S27_CONSOLE_AUDIT" "$S27_PROXY_AUDIT" \
+      "$S27_COOKIES_ADMIN" "$S27_COOKIES_VIEWER" "$S27_RELOAD_SOCK"
+
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" \
+    | awk '/^\[audit\]/{skip=1; next} skip && /^\[/{skip=0} !skip' \
+    > "$S27_PROXY_TOML"
+cat >> "$S27_PROXY_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S27_DB"
+admin_api_key = "s27-admin"
+
+[audit]
+enabled = true
+path = "$S27_PROXY_AUDIT"
+hash_only = true
+
+[auth]
+enabled = true
+env_marker = "t"
+
+[reload]
+socket = "$S27_RELOAD_SOCK"
+EOF
+
+cp "$S27_PROXY_TOML" "$S27_CONSOLE_TOML"
+cat >> "$S27_CONSOLE_TOML" <<EOF
+
+[console]
+listen = "127.0.0.1:$S27_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S27_CONSOLE_AUDIT"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S27_BOOTSTRAP_PASSWORD" }
+EOF
+
+NANOGUARD_CONFIG="$S27_PROXY_TOML" "$BIN" > "$S27_PROXY_LOG" 2>&1 &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+S27_ADMIN_PW="s27-admin-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S27_CONSOLE_TOML" \
+    S27_BOOTSTRAP_PASSWORD="$S27_ADMIN_PW" \
+    "$CONSOLE_BIN" > "$S27_CONSOLE_LOG" 2>&1 &
+CONSOLE_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 0.2
+    curl -sf -o /dev/null "$S27_CONSOLE_URL/" && break
+done
+
+# 27a. Wrong password is a 401, and the response body never contains
+# the literal username or password the caller sent.
+WRONG_BODY=$(curl -s -w "\n__HTTP_%{http_code}" -o - \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S27_ADMIN_PW-WRONG\"}" \
+    "$S27_CONSOLE_URL/api/login")
+WRONG_CODE=$(echo "$WRONG_BODY" | tail -n1 | sed 's/.*__HTTP_//')
+assert_eq "27a. login with a wrong password returns 401" "$WRONG_CODE" "401"
+
+WRONG_BODY_ONLY=$(echo "$WRONG_BODY" | sed '$ d')
+if echo "$WRONG_BODY_ONLY" | grep -qF "$S27_ADMIN_PW-WRONG"; then
+    ng "27a-leak. wrong-password response echoed the submitted password"
+else
+    ok "27a-leak. wrong-password response does not echo the submitted password"
+fi
+
+# 27b. The correct password works; capture cookies + initial CSRF.
+ADMIN_LOGIN=$(curl -s -c "$S27_COOKIES_ADMIN" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S27_ADMIN_PW\"}" \
+    "$S27_CONSOLE_URL/api/login")
+ADMIN_CSRF=$(echo "$ADMIN_LOGIN" | jq -r '.csrf_token // empty')
+if [ -n "$ADMIN_CSRF" ] && [ "$ADMIN_CSRF" != "null" ]; then
+    ok "27b. correct admin login returns a csrf_token"
+else
+    ng "27b. admin login failed; body: $ADMIN_LOGIN"
+fi
+
+# 27c. Mutating endpoint without the CSRF header is rejected with 403,
+# even though the session cookie is valid. This is the double-submit
+# guarantee that was added in XKA-59.
+NO_CSRF_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S27_COOKIES_ADMIN" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"no-csrf"}' \
+    "$S27_CONSOLE_URL/api/tokens")
+assert_eq "27c. mutating endpoint without X-CSRF-Token is rejected (403)" "$NO_CSRF_CODE" "403"
+
+# 27d. Wrong (non-empty) CSRF header is also 403 — the server doesn't
+# fall back to "any non-empty value" on the constant-time compare.
+BAD_CSRF_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S27_COOKIES_ADMIN" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: deadbeef-not-the-real-token" \
+    -d '{"label":"bad-csrf"}' \
+    "$S27_CONSOLE_URL/api/tokens")
+assert_eq "27d. mutating endpoint with wrong X-CSRF-Token is rejected (403)" "$BAD_CSRF_CODE" "403"
+
+# 27e. Admin creates a viewer user. We need to capture both the rotation
+# header AND parse the created-user JSON so we can log in as them next.
+CREATE_HDR="$LOGDIR/e2e.s27.create.hdr"
+VIEWER_PW="s27-viewer-$(openssl rand -hex 8)"
+CREATE_RESP=$(curl -s -b "$S27_COOKIES_ADMIN" -c "$S27_COOKIES_ADMIN" \
+    -D "$CREATE_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    -d "{\"username\":\"viewer1\",\"password\":\"$VIEWER_PW\",\"role\":\"user\"}" \
+    "$S27_CONSOLE_URL/api/users")
+VIEWER_ID=$(echo "$CREATE_RESP" | jq -r '.id // empty')
+if [ -n "$VIEWER_ID" ] && [ "$VIEWER_ID" != "null" ]; then
+    ok "27e. admin creates a non-admin user via POST /api/users"
+else
+    ng "27e. user create failed; resp: $CREATE_RESP"
+fi
+
+ADMIN_CSRF=$(grep -i '^x-csrf-token-next:' "$CREATE_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$ADMIN_CSRF" ] && ADMIN_CSRF=$(echo "$CREATE_RESP" | jq -r '.csrf_token // empty')
+
+# 27f. The viewer logs in and gets their own session + CSRF.
+VIEWER_LOGIN=$(curl -s -c "$S27_COOKIES_VIEWER" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"viewer1\",\"password\":\"$VIEWER_PW\"}" \
+    "$S27_CONSOLE_URL/api/login")
+VIEWER_CSRF=$(echo "$VIEWER_LOGIN" | jq -r '.csrf_token // empty')
+if [ -n "$VIEWER_CSRF" ] && [ "$VIEWER_CSRF" != "null" ]; then
+    ok "27f. non-admin user can sign in"
+else
+    ng "27f. viewer login failed; body: $VIEWER_LOGIN"
+fi
+
+# 27g. Non-admin trying to create a user is forbidden — admin-only
+# endpoint, gated by require_admin().
+VIEWER_CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S27_COOKIES_VIEWER" -c "$S27_COOKIES_VIEWER" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $VIEWER_CSRF" \
+    -d '{"username":"escalation","password":"this-should-not-work-12345","role":"admin"}' \
+    "$S27_CONSOLE_URL/api/users")
+assert_eq "27g. non-admin POST /api/users is rejected (403)" "$VIEWER_CREATE_CODE" "403"
+
+# 27h. Viewer mints their own proxy token (allowed — self-service),
+# then uses it against the proxy. This verifies the user_id path
+# carries through (token belongs to viewer1, not admin).
+VIEWER_MINT_HDR="$LOGDIR/e2e.s27.viewer-mint.hdr"
+VIEWER_MINT=$(curl -s -b "$S27_COOKIES_VIEWER" -c "$S27_COOKIES_VIEWER" \
+    -D "$VIEWER_MINT_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $VIEWER_CSRF" \
+    -d '{"label":"viewer-self-service"}' \
+    "$S27_CONSOLE_URL/api/tokens")
+S27_VIEWER_TOKEN=$(echo "$VIEWER_MINT" | jq -r '.token // empty')
+S27_VIEWER_TOKEN_ID=$(echo "$VIEWER_MINT" | jq -r '.id // empty')
+VIEWER_USE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $S27_VIEWER_TOKEN" \
+    -d '{"model":"test","messages":[{"role":"user","content":"viewer self-service"}]}')
+assert_eq "27h. viewer-minted token authenticates against the proxy (200)" "$VIEWER_USE_CODE" "200"
+
+# 27i. Admin force-revokes all the viewer's tokens. The proxy verification
+# cache MUST be flushed; otherwise the leaked token keeps working for
+# up to the 60s TTL. Same contract as the per-token revoke (26f).
+ADMIN_CSRF=$(grep -i '^x-csrf-token-next:' "$CREATE_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$ADMIN_CSRF" ] && ADMIN_CSRF=$(echo "$CREATE_RESP" | jq -r '.csrf_token // empty')
+
+FORCE_HDR="$LOGDIR/e2e.s27.force.hdr"
+FORCE_RESP=$(curl -s -b "$S27_COOKIES_ADMIN" -c "$S27_COOKIES_ADMIN" \
+    -D "$FORCE_HDR" \
+    -X POST \
+    -H "X-CSRF-Token: $ADMIN_CSRF" \
+    "$S27_CONSOLE_URL/api/users/$VIEWER_ID/force-revoke-tokens")
+FORCE_COUNT=$(echo "$FORCE_RESP" | jq -r '.revoked // empty')
+case "$FORCE_COUNT" in
+    [1-9]*) ok "27i. force-revoke-tokens reports a non-zero revoked count" ;;
+    *)      ng "27i. force-revoke-tokens did not revoke anything; resp: $FORCE_RESP" ;;
+esac
+
+S27_AFTER_FORCE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $S27_VIEWER_TOKEN" \
+    -d '{"model":"test","messages":[{"role":"user","content":"after force-revoke"}]}')
+assert_eq "27j. force-revoked token is rejected by the proxy immediately (401)" "$S27_AFTER_FORCE_CODE" "401"
+
+# 27k. Logout clears the session — subsequent /api/me on the same cookie
+# is 401. This catches a server-side logout that only deletes the cookie
+# in the response without invalidating the row.
+LOGOUT_CSRF=$(grep -i '^x-csrf-token-next:' "$FORCE_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$LOGOUT_CSRF" ] && LOGOUT_CSRF="$ADMIN_CSRF"
+curl -s -o /dev/null -b "$S27_COOKIES_ADMIN" -c "$S27_COOKIES_ADMIN" \
+    -X POST -H "X-CSRF-Token: $LOGOUT_CSRF" \
+    "$S27_CONSOLE_URL/api/logout"
+ME_AFTER_LOGOUT_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S27_COOKIES_ADMIN" "$S27_CONSOLE_URL/api/me")
+assert_eq "27k. /api/me after logout returns 401" "$ME_AFTER_LOGOUT_CODE" "401"
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+# --- 28. Console file edit → proxy hot-reload round-trip ------------------
+# The Phase 2 file-edit machinery is the most invasive thing the console
+# can do: it writes through the proxy's own validator, atomically renames
+# over the on-disk file, fires a reload trigger, and expects the proxy to
+# pick the change up without a restart. None of that had an e2e until now;
+# the unit tests cover the helpers but not the cross-process round-trip.
+info "scenario 28: console file edit reaches the proxy via reload trigger"
+
+# Each scenario-28 run gets its own working directory so the proxy and
+# console resolve `nanoguard.toml` to the file the console is about to
+# overwrite. Without this, the edit would land in LOGDIR but the proxy
+# would still be reading the repo-root config.
+S28_DIR="$LOGDIR/e2e.s28.workdir"
+rm -rf "$S28_DIR"
+mkdir -p "$S28_DIR/dicts"
+
+S28_PORT=18083
+S28_CONSOLE_URL="http://127.0.0.1:$S28_PORT"
+S28_DB="$S28_DIR/nanoguard.db"
+S28_TOML="$S28_DIR/nanoguard.toml"
+S28_CONSOLE_AUDIT="$S28_DIR/console-audit.jsonl"
+S28_PROXY_LOG="$LOGDIR/ng.s28.proxy.log"
+S28_CONSOLE_LOG="$LOGDIR/ng.s28.console.log"
+S28_PROXY_AUDIT="$LOGDIR/ng.s28.audit.jsonl"
+S28_RELOAD_SOCK="$LOGDIR/e2e.s28.reload.sock"
+S28_COOKIES="$LOGDIR/e2e.s28.cookies"
+rm -f "$S28_RELOAD_SOCK" "$S28_COOKIES" "$S28_PROXY_AUDIT"
+
+# Minimal proxy config the same shape the rest of e2e uses. [auth] off
+# in this scenario — we want to focus on file edit behavior, not auth.
+cat > "$S28_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.keyword]
+engine = "aho-corasick"
+dict_paths = []
+inline_block = ["pre-edit-marker"]
+inline_alert = []
+inline_flag = []
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S28_DB"
+
+[audit]
+enabled = true
+path = "$S28_PROXY_AUDIT"
+hash_only = true
+
+[reload]
+socket = "$S28_RELOAD_SOCK"
+
+[console]
+listen = "127.0.0.1:$S28_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S28_CONSOLE_AUDIT"
+backup_limit = 5
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S28_BOOTSTRAP_PASSWORD" }
+EOF
+
+# Run both binaries from the workdir so relative paths in the config and
+# in the edit payload resolve to the same file.
+(cd "$S28_DIR" && NANOGUARD_CONFIG="$S28_TOML" "$BIN" > "$S28_PROXY_LOG" 2>&1) &
+NG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    curl -sf "$NG_URL/health" > /dev/null 2>&1 && break
+done
+
+S28_PW="s28-pw-$(openssl rand -hex 8)"
+(cd "$S28_DIR" && NANOGUARD_CONFIG="$S28_TOML" \
+    S28_BOOTSTRAP_PASSWORD="$S28_PW" \
+    "$CONSOLE_BIN" > "$S28_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 0.2
+    curl -sf -o /dev/null "$S28_CONSOLE_URL/" && break
+done
+
+LOGIN_RESP=$(curl -s -c "$S28_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S28_PW\"}" \
+    "$S28_CONSOLE_URL/api/login")
+S28_CSRF=$(echo "$LOGIN_RESP" | jq -r '.csrf_token // empty')
+
+# 28a. Confirm the pre-edit keyword `pre-edit-marker` is in fact blocked
+# so the post-edit assertion later is measuring a real difference, not
+# a default block.
+PRE_BLOCK=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"pre-edit-marker shows up"}]}')
+assert_eq "28a. pre-edit keyword is blocked by the live ruleset (400)" "$PRE_BLOCK" "400"
+
+# Sanity: a request that mentions a not-yet-blocked keyword is allowed
+# pre-edit. We will block it via the edit and re-check.
+PRE_ALLOW=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"please mention frobnitz"}]}')
+assert_eq "28b. as-yet-unblocked keyword passes pre-edit (200)" "$PRE_ALLOW" "200"
+
+# 28c. POST /api/validate against intentionally-broken TOML returns
+# `{valid:false, error:"..."}`. The endpoint always answers 200 — the
+# UI surfaces the validator verdict from the body, not from the HTTP
+# code — so we assert on the JSON payload here.
+BAD_VALIDATE_BODY='{"path":"nanoguard.toml","content":"this is = = not toml at all ["}'
+BAD_VALIDATE_RESP=$(curl -s \
+    -b "$S28_COOKIES" -c "$S28_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S28_CSRF" \
+    -d "$BAD_VALIDATE_BODY" \
+    "$S28_CONSOLE_URL/api/validate")
+# The validator echoes the raw TOML parser error verbatim, which can
+# contain literal newlines, so piping through `jq` rejects the line
+# under strict JSON. Match the wire format directly instead — `valid`
+# is a bare bool, `error` is a non-empty string.
+if printf '%s' "$BAD_VALIDATE_RESP" | grep -q '"valid":false' \
+    && printf '%s' "$BAD_VALIDATE_RESP" | grep -q '"error"'; then
+    ok "28c. invalid TOML is flagged by /api/validate (valid=false + error message)"
+else
+    ng "28c. invalid TOML was not flagged; resp: $BAD_VALIDATE_RESP"
+fi
+
+# 28c-edit. The harder gate: even if a caller skips /api/validate, the
+# /api/edit handler runs the same validator before the atomic rename, so
+# a syntactically broken payload returns 400 and the on-disk file is
+# unchanged.
+BAD_EDIT_PAYLOAD=$(jq -nc \
+    --arg path "nanoguard.toml" \
+    --arg content "this is not = toml [" \
+    '{path:$path, content:$content, summary:"invalid"}')
+BAD_EDIT_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S28_COOKIES" -c "$S28_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S28_CSRF" \
+    -d "$BAD_EDIT_PAYLOAD" \
+    "$S28_CONSOLE_URL/api/edit")
+case "$BAD_EDIT_CODE" in
+    400) ok "28c-edit. invalid TOML edit is rejected before the rename (400)" ;;
+    *)   ng "28c-edit. invalid TOML edit did not yield 400, got $BAD_EDIT_CODE" ;;
+esac
+
+# 28d. Edit the config to add a new inline_block keyword and trigger
+# reload. The edit handler `trigger_reload`s after the rename so the
+# proxy picks it up before this curl returns.
+NEW_TOML_CONTENT=$(cat <<EOFTOML
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.keyword]
+engine = "aho-corasick"
+dict_paths = []
+inline_block = ["pre-edit-marker", "frobnitz"]
+inline_alert = []
+inline_flag = []
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S28_DB"
+
+[audit]
+enabled = true
+path = "$S28_PROXY_AUDIT"
+hash_only = true
+
+[reload]
+socket = "$S28_RELOAD_SOCK"
+
+[console]
+listen = "127.0.0.1:$S28_PORT"
+session_secret = "$(grep '^session_secret' "$S28_TOML" | head -n1 | cut -d= -f2- | tr -d ' "')"
+session_ttl_hours = 1
+audit_path = "$S28_CONSOLE_AUDIT"
+backup_limit = 5
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S28_BOOTSTRAP_PASSWORD" }
+EOFTOML
+)
+EDIT_PAYLOAD=$(jq -nc \
+    --arg path "nanoguard.toml" \
+    --arg content "$NEW_TOML_CONTENT" \
+    --arg summary "e2e-28: add frobnitz to inline_block" \
+    '{path:$path, content:$content, summary:$summary}')
+EDIT_HDR="$LOGDIR/e2e.s28.edit.hdr"
+EDIT_RESP=$(curl -s -b "$S28_COOKIES" -c "$S28_COOKIES" \
+    -D "$EDIT_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S28_CSRF" \
+    -d "$EDIT_PAYLOAD" \
+    "$S28_CONSOLE_URL/api/edit")
+EDIT_TRIGGERED=$(echo "$EDIT_RESP" | jq -r '.reload.triggered // empty')
+EDIT_METHOD=$(echo "$EDIT_RESP" | jq -r '.reload.method // empty')
+if [ "$EDIT_TRIGGERED" = "true" ] && [ "$EDIT_METHOD" = "socket" ]; then
+    ok "28d. /api/edit fires a socket-based reload trigger after the write"
+else
+    ng "28d. edit did not trigger a reload; resp: $EDIT_RESP"
+fi
+
+# The reload returns OK synchronously over the socket, but the audit
+# log line might be flushed a few ms later. Wait briefly for it before
+# the post-edit assertion.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if grep -q '"verdict":"reload_ok"' "$S28_PROXY_AUDIT" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+# 28e. The proxy now blocks `frobnitz`. This is the actual operator-
+# value of Phase 2: the change in the file flowed all the way through
+# to the live filtering ruleset without a restart.
+POST_BLOCK=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"please mention frobnitz"}]}')
+assert_eq "28e. post-edit, the new keyword is blocked by the proxy (400)" "$POST_BLOCK" "400"
+
+# 28f. The pre-edit keyword `pre-edit-marker` is still in the list, so
+# the edit didn't accidentally truncate the existing rules.
+STILL_BLOCK=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"pre-edit-marker survives"}]}')
+assert_eq "28f. pre-edit keyword is still blocked after the edit (400)" "$STILL_BLOCK" "400"
+
+# 28g. The edit produced a backup file under .nanoguard-backups/. The
+# revert path can list them and undo the change.
+BACKUP_LIST=$(curl -s -b "$S28_COOKIES" \
+    "$S28_CONSOLE_URL/api/backups?path=nanoguard.toml")
+BACKUP_COUNT=$(echo "$BACKUP_LIST" | jq -r '.data | length // 0')
+case "$BACKUP_COUNT" in
+    0) ng "28g. no backup file was created for nanoguard.toml; list: $BACKUP_LIST" ;;
+    *) ok "28g. /api/backups reports at least one backup for the edited file" ;;
+esac
+
+# 28h. Console-audit log records both the edit and the reload outcome
+# the operator can read out of band.
+if [ -f "$S28_CONSOLE_AUDIT" ] && grep -q '"action":"edit"' "$S28_CONSOLE_AUDIT"; then
+    ok "28h. console-audit.jsonl records the file edit"
+else
+    ng "28h. console-audit.jsonl missing an edit record; path=$S28_CONSOLE_AUDIT"
+fi
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

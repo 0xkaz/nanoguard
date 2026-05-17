@@ -1274,6 +1274,11 @@ pub async fn api_force_revoke_user_tokens(
         );
     }
 
+    // Same cross-process invalidation story as `api_revoke_token`:
+    // a forced mass-revoke is exactly the scenario where leaving up to
+    // 60s of cached "verified" results on the proxy would be a security
+    // bug. See `api_revoke_token` for the design rationale.
+    let reload = super::reload::trigger_invalidate_tokens(&state.config.reload);
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (
@@ -1283,6 +1288,11 @@ pub async fn api_force_revoke_user_tokens(
             "user_id": id,
             "username": target.username,
             "revoked": revoked,
+            "reload": {
+                "triggered": reload.triggered,
+                "method": reload.method,
+                "error": reload.error,
+            },
         })),
     )
         .into_response()

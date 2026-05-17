@@ -4,6 +4,15 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — Console e2e: auth, permission boundary, file edit round-trip
+
+`tools/e2e.sh` grows two scenarios that fence the Web Console operationally:
+
+- **Scenario 27 (auth + permission boundary)** — wrong-password is 401 and does not echo the submitted secret; mutating endpoints with no `X-CSRF-Token` or a wrong one are 403; an admin can create a non-admin user; the non-admin can sign in and self-service-mint a proxy token; the non-admin cannot create users (403); admin force-revoke flushes the proxy verification cache so the previously-minted token immediately 401s; logout invalidates the session row, not just the cookie.
+- **Scenario 28 (file edit round-trip)** — the Phase 2 file-edit machinery now has end-to-end coverage. The console writes a new `inline_block` keyword to `nanoguard.toml` through `POST /api/edit`, the edit handler fires a socket-based reload trigger, and the proxy starts blocking the new keyword without a restart. Invalid TOML is rejected by both `/api/validate` (returns `valid:false` in the body) and `/api/edit` (HTTP 400 before the atomic rename) — the pre-rename validator is what keeps a fat-fingered edit from bricking the proxy. The edit produces a backup file under `.nanoguard-backups/` (visible via `GET /api/backups`), the pre-existing keyword still blocks after the edit (no truncation regression), and `console-audit.jsonl` records the edit action.
+
+While here, `api_force_revoke_user_tokens` (XKA-61) gains the same `trigger_invalidate_tokens` call the per-token revoke uses — without it, a mass-revoke would have left up to 60s of cached "verified" results on the proxy, which is exactly the scenario where that latency is a security bug.
+
 ### Fixed — console-issued token revoke now takes effect on the proxy immediately
 
 The Web Console and the proxy run as separate binaries, so the proxy's in-memory client-token verification cache (default 60s TTL) used to keep a console-revoked token usable for up to a minute. A new `INVALIDATE_TOKENS\n` command on the `[reload].socket` channel asks the proxy to drop the cache only (no matcher / redactor / policy rebuild). `console::reload::trigger_invalidate_tokens` sends it from `DELETE /api/tokens/:id` and surfaces the trigger outcome in the response body so a misconfigured `[reload]` shows up at exactly the moment it bites. PID-file deployments fall back to SIGHUP, same as before. Scenario 26 in `tools/e2e.sh` stands up both binaries against a shared SQLite DB and asserts the full round-trip: console UI mints a token → proxy `/v1/chat/completions` accepts it (200) → console UI revokes it → proxy rejects it (401).
