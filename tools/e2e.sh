@@ -10,7 +10,8 @@
 # Requirements:
 #   - Built release binary at target/release/nanoguard
 #   - python3 on PATH
-#   - curl, jq
+#   - curl, jq, openssl, sqlite3 (used by the console scenarios for
+#     ad-hoc session secrets and DB pokes)
 
 set -uo pipefail
 
@@ -67,6 +68,16 @@ assert_eq() {
         ng "$label — want \`$want\`, got \`$got\`"
     fi
 }
+
+# --- prerequisites ---------------------------------------------------------
+
+for tool in curl jq python3 openssl sqlite3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf "error: required tool \`%s\` is not installed.\n" "$tool" >&2
+        printf "       Install it (or invoke the corresponding scenarios separately) and retry.\n" >&2
+        exit 1
+    fi
+done
 
 # --- start servers ---------------------------------------------------------
 

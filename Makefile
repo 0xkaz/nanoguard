@@ -193,10 +193,6 @@ clean:
 # on first start using that value. After first run, unset the env
 # var in your shell (the bootstrap path is one-shot).
 run: build ollama-start
-	@command -v openssl >/dev/null 2>&1 || { \
-	    echo "error: openssl not installed; install it or set CONSOLE_SESSION_SECRET / BOOTSTRAP_PASSWORD yourself."; \
-	    exit 1; \
-	}
 	@db_path=$$(awk ' \
 	    /^[[:space:]]*\[budget\][[:space:]]*$$/ { in_budget=1; next } \
 	    /^[[:space:]]*\[[^]]+\][[:space:]]*$$/  { in_budget=0 } \
@@ -213,6 +209,12 @@ run: build ollama-start
 	    [ "$$count" -gt 0 ] 2>/dev/null && users_exist=1; \
 	fi; \
 	if [ -z "$$CONSOLE_SESSION_SECRET" ]; then \
+	    if ! command -v openssl >/dev/null 2>&1; then \
+	        echo "error: CONSOLE_SESSION_SECRET is not set and openssl is not installed."; \
+	        echo "       Either install openssl, set CONSOLE_SESSION_SECRET yourself,"; \
+	        echo "       or set [console].session_secret in nanoguard.toml."; \
+	        exit 1; \
+	    fi; \
 	    export CONSOLE_SESSION_SECRET="$$(openssl rand -hex 32)"; \
 	    echo "→ CONSOLE_SESSION_SECRET not set; generated an ephemeral one for this run."; \
 	fi; \
@@ -223,6 +225,12 @@ run: build ollama-start
 	    echo "  or reset a forgotten password with: make set-admin-password"; \
 	    echo ""; \
 	elif [ -z "$$BOOTSTRAP_PASSWORD" ]; then \
+	    if ! command -v openssl >/dev/null 2>&1; then \
+	        echo "error: BOOTSTRAP_PASSWORD is not set, the user table is empty,"; \
+	        echo "       and openssl is not installed. Either install openssl, or"; \
+	        echo "       set BOOTSTRAP_PASSWORD to your initial admin password and re-run."; \
+	        exit 1; \
+	    fi; \
 	    export BOOTSTRAP_PASSWORD="$$(openssl rand -hex 12)"; \
 	    echo ""; \
 	    echo "  ┌─────────────────────────────────────────────────────────────┐"; \
