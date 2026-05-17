@@ -17,7 +17,9 @@ pub struct AppState {
     /// Policy rule index — used by the audit layer to enrich match records
     /// with rule_id / category / severity. None when no policy bundle.
     pub policy: Option<Arc<crate::policy::PolicyRuleIndex>>,
-    pub backend: backend::Backend,
+    /// Resolved backend pool. Hot path: `pool.route(model)` picks
+    /// the right backend for each request.
+    pub pool: backend::BackendPoolRuntime,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,
     pub audit: Option<Arc<audit::AuditLog>>,
@@ -30,15 +32,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The backend endpoint this `AppState` forwards requests to.
-    ///
-    /// Reads from `self.backend` (preserved across hot reload), NOT
-    /// from `self.config.backend` (which is the freshly-reloaded TOML
-    /// view and may diverge from what the connection pool was built
-    /// against). Anything externally visible — `/v1/models`, logs,
-    /// future health checks — must read this method to stay consistent
-    /// with the writes `forward_chat` actually performs.
+    /// Endpoint of the default backend in the live pool. Kept for
+    /// log lines and the legacy `/v1/models` fallback that does not
+    /// carry a request model. Hot-path callers should route by
+    /// model via `state.pool.route(model)` instead.
     pub fn backend_endpoint(&self) -> &str {
-        self.backend.endpoint()
+        self.pool
+            .get(self.pool.default_backend())
+            .map(|b| b.endpoint())
+            .unwrap_or("")
     }
 }

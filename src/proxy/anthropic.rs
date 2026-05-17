@@ -229,8 +229,27 @@ pub async fn messages(
         }
     }
 
+    // Resolve which backend in the pool this request maps to.
+    // /v1/messages carries `model` at the top level of the request
+    // body (already extracted into `req.model`); routing rules in
+    // [routing] match against that.
+    let backend = match state.pool.route(Some(&req.model)) {
+        Some(b) => b,
+        None => {
+            warn!(
+                "routing: no backend resolved for model `{}` (anthropic)",
+                req.model
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"type":"error","error":{"type":"api_error","message":format!("no backend configured for model `{}`", req.model)}})),
+            )
+                .into_response();
+        }
+    };
+
     // Forward to backend (OpenAI-compatible)
-    let backend_resp = match state.backend.forward_chat(oai_body).await {
+    let backend_resp = match backend.forward_chat(oai_body).await {
         Ok(r) => r,
         Err(e) => {
             warn!("backend error (anthropic): {}", e);

@@ -1198,14 +1198,49 @@ pub async fn api_overview(
         },
     }));
 
-    // Backend digest. Multi-backend routing is still proposed
-    // (docs/design/multi-backend-routing.md), so today this is one
-    // upstream, surfaced for completeness.
-    let backend = json!({
-        "provider": cfg.backend.provider,
-        "endpoint": cfg.backend.endpoint,
-        "model": cfg.backend.model,
+    // Backend digest. Multi-backend routing is shipped: resolve the
+    // pool view (with legacy [backend] → "default" synthesis) and
+    // return one entry per backend label plus the routing table.
+    let (pool_view, _) = cfg.pool().unwrap_or_else(|_| {
+        // Pool resolution failed (e.g. routing rule pointing at an
+        // unknown backend). The proxy is unlikely to be up either,
+        // but rather than 500 the overview endpoint we return an
+        // empty pool so the SPA can still render the rest of the
+        // dashboard. The error will already be in the startup log.
+        (
+            crate::config::BackendPool {
+                backends: std::collections::BTreeMap::new(),
+                rules: Vec::new(),
+                default_backend: String::new(),
+            },
+            Vec::new(),
+        )
     });
+
+    let backends: Vec<serde_json::Value> = pool_view
+        .backends
+        .iter()
+        .map(|(name, b)| {
+            json!({
+                "name": name,
+                "provider": b.provider,
+                "endpoint": b.endpoint,
+                "model": b.model,
+                "is_default": name == &pool_view.default_backend,
+            })
+        })
+        .collect();
+    let routing = json!({
+        "default": pool_view.default_backend,
+        "rules": pool_view.rules.iter().map(|r| json!({
+            "model": r.model,
+            "backend": r.backend,
+        })).collect::<Vec<_>>(),
+    });
+    // Legacy single-backend digest stays under `backend` for SPA
+    // compatibility — it's the first (only, in legacy mode) entry
+    // of `backends`. New SPA code reads `backends` + `routing`.
+    let backend = backends.first().cloned().unwrap_or_else(|| json!({}));
 
     // Count this user's live (non-revoked) tokens so the SPA can
     // say "you have N tokens" inline, without making the operator
@@ -1224,6 +1259,8 @@ pub async fn api_overview(
             "env_marker": env_marker,
         },
         "backend": backend,
+        "backends": backends,
+        "routing": routing,
         "guards": guards,
         "user_token_count": token_count,
         "endpoints": [

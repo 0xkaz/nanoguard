@@ -53,4 +53,84 @@ impl Backend {
 
         Ok(req.send().await?)
     }
+
+    pub fn provider(&self) -> &str {
+        &self.cfg.provider
+    }
+}
+
+/// Runtime view of the resolved backend pool. Holds a `Backend`
+/// (which owns its own `reqwest::Client` connection pool) per
+/// configured label, plus the routing table the proxy consults on
+/// every request to pick which backend a given `model` goes to.
+///
+/// This is the value the proxy hot path actually queries via
+/// `state.pool.route(model)` and `state.pool.get(name)`. The TOML
+/// `Config::pool()` builder constructs the matching `BackendPool`
+/// view that this `BackendPoolRuntime` mirrors.
+#[derive(Clone)]
+pub struct BackendPoolRuntime {
+    pub backends: std::collections::BTreeMap<String, Backend>,
+    pub rules: Vec<crate::config::RoutingRule>,
+    pub default_backend: String,
+}
+
+impl BackendPoolRuntime {
+    /// Build the runtime pool from a `[backends.*]` map + routing
+    /// declaration. Each backend gets its own `Backend` (=> its own
+    /// `reqwest::Client` connection pool).
+    pub fn build(pool: &crate::config::BackendPool) -> Self {
+        let backends = pool
+            .backends
+            .iter()
+            .map(|(name, cfg)| (name.clone(), Backend::new(cfg.clone())))
+            .collect();
+        Self {
+            backends,
+            rules: pool.rules.clone(),
+            default_backend: pool.default_backend.clone(),
+        }
+    }
+
+    /// Resolve a request's model field to a Backend handle. Returns
+    /// `None` only if the routing default points at a name that was
+    /// dropped from `[backends.*]` between parse and resolve — that
+    /// should be impossible because `Config::pool()` validates.
+    pub fn route(&self, model: Option<&str>) -> Option<&Backend> {
+        let name = self.route_name(model)?;
+        self.backends.get(name)
+    }
+
+    /// Resolve a request's model field to a backend label. Same
+    /// rules as `Config::pool().route(...)`; duplicated here so the
+    /// proxy hot path does not have to call back into config.
+    pub fn route_name(&self, model: Option<&str>) -> Option<&str> {
+        let Some(model) = model else {
+            return Some(self.default_backend.as_str());
+        };
+        for r in &self.rules {
+            if rule_matches(&r.model, model) {
+                return Some(r.backend.as_str());
+            }
+        }
+        Some(self.default_backend.as_str())
+    }
+
+    /// Get a backend by label.
+    pub fn get(&self, name: &str) -> Option<&Backend> {
+        self.backends.get(name)
+    }
+
+    /// Default backend label.
+    pub fn default_backend(&self) -> &str {
+        &self.default_backend
+    }
+}
+
+fn rule_matches(pattern: &str, model: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        model.starts_with(prefix)
+    } else {
+        pattern == model
+    }
 }

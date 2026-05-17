@@ -165,8 +165,25 @@ pub async fn chat_completions(
         }
     }
 
+    // Resolve which backend in the pool this request goes to. The
+    // routing table is consulted once per request; on miss we fall
+    // back to the default backend (covered by route()).
+    let backend = match state.pool.route(Some(&model)) {
+        Some(b) => b,
+        None => {
+            warn!("routing: no backend resolved for model `{}`", model);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("no backend configured for model `{model}`"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
     // Forward to backend
-    let backend_resp = match state.backend.forward_chat(body).await {
+    let backend_resp = match backend.forward_chat(body).await {
         Ok(r) => r,
         Err(e) => {
             warn!("backend error: {}", e);
