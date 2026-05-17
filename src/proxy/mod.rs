@@ -585,25 +585,47 @@ pub async fn list_models(State(shared): State<SharedState>) -> Response {
         };
         match result {
             Ok(Ok(resp)) if resp.status().is_success() => {
-                if let Ok(body) = resp.json::<Value>().await {
-                    any_ok = true;
-                    let entries = body
-                        .get("data")
-                        .and_then(|d| d.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    for mut entry in entries {
-                        if let Some(obj) = entry.as_object_mut() {
-                            // Tag with the operator-chosen backend
-                            // label so the caller knows which
-                            // upstream serves which model. This
-                            // overwrites any `owned_by` the
-                            // upstream already set — by design,
-                            // the operator's labels are the
-                            // authority for routing.
-                            obj.insert("owned_by".to_string(), Value::String(label.clone()));
+                // 200 alone is not "healthy" for /v1/models — we
+                // need a valid JSON body containing a `data` array.
+                // Anything else (HTML error page, empty body, body
+                // missing `data`) is recorded as a per-backend
+                // error so `partial_errors` / `all_backends_failed`
+                // tell the truth instead of pretending the
+                // upstream answered.
+                match resp.json::<Value>().await {
+                    Ok(body) => match body.get("data").and_then(|d| d.as_array()) {
+                        Some(entries) => {
+                            any_ok = true;
+                            for mut entry in entries.clone() {
+                                if let Some(obj) = entry.as_object_mut() {
+                                    // Tag with the operator-chosen
+                                    // backend label so the caller
+                                    // knows which upstream serves
+                                    // which model. This overwrites
+                                    // any `owned_by` the upstream
+                                    // already set — by design, the
+                                    // operator's labels are the
+                                    // authority for routing.
+                                    obj.insert(
+                                        "owned_by".to_string(),
+                                        Value::String(label.clone()),
+                                    );
+                                }
+                                merged.push(entry);
+                            }
                         }
-                        merged.push(entry);
+                        None => {
+                            errors.push(json!({
+                                "backend": label,
+                                "error": "200 OK but response body has no `data` array",
+                            }));
+                        }
+                    },
+                    Err(e) => {
+                        errors.push(json!({
+                            "backend": label,
+                            "error": format!("200 OK but JSON parse failed: {e}"),
+                        }));
                     }
                 }
             }
