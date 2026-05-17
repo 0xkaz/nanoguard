@@ -464,7 +464,7 @@ See `docs/design/multi-backend-routing.md` for the full design.
 
 ## Web Configuration UI
 
-A separate binary, `nanoguard-console`, ships an optional operator console and self-service proxy-token UI. It shares `nanoguard.toml` and the budget SQLite database with the proxy but runs in its own process with its own listener. **The proxy itself never exposes a mutation HTTP surface** — see [`docs/design/web-config-ui.md`](docs/design/web-config-ui.md) for the rationale.
+The `nanoguard` binary now spawns the operator console alongside the proxy on startup. `make run` brings up **both** the proxy (`:8080`) and the console (`:8081`) on a single process — operators no longer need a second command. Set `[console].enabled = false` in `nanoguard.toml` for headless deployments. The legacy `nanoguard-console` binary stays as the "console-only" entry point (e.g. an operator workstation pointing at a remote DB); it always runs the console regardless of the flag. **The proxy itself never exposes a mutation HTTP surface** — every write goes through the console listener which has its own port and its own auth — see [`docs/design/web-config-ui.md`](docs/design/web-config-ui.md) for the rationale.
 
 Phase 1 (commit `cdc795c`) shipped read-only browsing of audit log, budget state, and the current config, plus self-service proxy-token issue/revoke for the logged-in user and admin user CRUD (allowed models, budget limit, role, enable/disable). Phase 2 (commit `ef5b188`) added file-based config editing for `nanoguard.toml`, `dicts/*.txt`, and `policies/*.yaml`: every write is validated server-side with the same parsers the proxy runs at reload time, atomically renamed into place, backed up under `.nanoguard-backups/` (per-file retention configurable via `[console] backup_limit`, default 20), audited to `console-audit.jsonl`, and followed by a reload trigger (`SIGHUP` via `[reload] pid_file`, or `RELOAD\n` over `[reload] socket`). OIDC login and per-session CSRF tokens are Phase 4 and remain on the roadmap.
 
@@ -494,7 +494,20 @@ If `listen` is non-loopback, cookies are automatically marked `Secure` — termi
 
 ### 2. Start the console
 
-The fastest path is `make run-console`. It builds, generates a `CONSOLE_SESSION_SECRET` if you don't have one set, generates a `BOOTSTRAP_PASSWORD` and prints it once when the user table is empty (otherwise it tells you to log in with the existing admin), then starts the listener:
+`make run` boots both the proxy and the console on a single `nanoguard` process — the console listener is spawned inline whenever `[console].enabled = true` (the default). For local development:
+
+```bash
+export CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)"
+export BOOTSTRAP_PASSWORD='your-initial-admin-password'
+make run
+# → proxy on :8080, console on :8081, one process serving both
+```
+
+`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. The bootstrap is **one-shot** — the user table is only seeded when it is empty. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell**; on subsequent restarts that env var is ignored.
+
+#### Console-only deployments
+
+For setups where the console runs on a different host than the proxy (operator workstation pointing at a remote DB, for example), use `make run-console` instead. It builds, generates a `CONSOLE_SESSION_SECRET` if you don't have one set, generates a `BOOTSTRAP_PASSWORD` and prints it once when the user table is empty, and starts the listener as a standalone process:
 
 ```bash
 make run-console
@@ -511,7 +524,7 @@ cargo run --bin nanoguard-console
 ./target/release/nanoguard-console
 ```
 
-`BOOTSTRAP_PASSWORD` is read **before** the tokio runtime starts and wrapped in `Zeroizing<String>` so it is overwritten in memory after hashing. The bootstrap is **one-shot** — the user table is only seeded when it is empty. After the first start logs `Bootstrap admin '<name>' provisioned. Clear $BOOTSTRAP_PASSWORD from the environment.`, **unset `BOOTSTRAP_PASSWORD` in your shell**; on subsequent restarts that env var is ignored (the existing admin owns the password).
+The `nanoguard-console` binary always runs the console regardless of `[console].enabled`. Set `[console].enabled = false` in `nanoguard.toml` for headless `nanoguard` deployments where you do not want the console listener at all.
 
 ### 2a. Recovering a forgotten admin password
 

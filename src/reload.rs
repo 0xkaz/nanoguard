@@ -685,6 +685,7 @@ mod tests {
             policies: crate::config::PoliciesConfig::default(),
             auth: crate::config::AuthConfig::default(),
             console: crate::config::ConsoleConfig {
+                enabled: true,
                 listen: crate::config::ConsoleConfig::default_listen(),
                 session_secret: "test-secret-for-unit-tests-only-do-not-use".to_string(),
                 session_ttl_hours: 24,
@@ -760,6 +761,7 @@ mod tests {
             policies: crate::config::PoliciesConfig::default(),
             auth: crate::config::AuthConfig::default(),
             console: crate::config::ConsoleConfig {
+                enabled: true,
                 listen: crate::config::ConsoleConfig::default_listen(),
                 session_secret: "test-secret-for-unit-tests-only-do-not-use".to_string(),
                 session_ttl_hours: 24,

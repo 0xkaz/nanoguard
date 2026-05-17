@@ -8,14 +8,28 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use nanoguard::{
-    admin, audit, backend, budget, build_app_state, config, proxy, reload, RuntimeHandles,
+    admin, audit, backend, budget, build_app_state, config, console, proxy, reload, RuntimeHandles,
     SharedState,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cfg = config::Config::from_env_or_default()?;
+fn main() -> Result<()> {
+    // Pre-runtime: load the config, then run the console's pre-tokio
+    // prep so BOOTSTRAP_PASSWORD never lingers in /proc/<pid>/environ
+    // and CONSOLE_SESSION_SECRET length is validated before we bind.
+    // If the operator turned the console off (`[console].enabled =
+    // false`) the prep is still safe — it only reads env and never
+    // requires a configured bootstrap admin.
+    let mut cfg = config::Config::from_env_or_default()?;
+    let console_bootstrap_password = console::prepare_for_run(&mut cfg)?;
 
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main(cfg, console_bootstrap_password))
+}
+
+async fn async_main(
+    cfg: config::Config,
+    console_bootstrap_password: Option<zeroize::Zeroizing<String>>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("RUST_LOG")
@@ -198,6 +212,32 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Single-process boot: when [console].enabled (default true)
+    // we spawn the Web Configuration UI on the same tokio runtime
+    // so `make run` alone gives an operator both ports. The
+    // `nanoguard-console` binary stays as the "console only"
+    // deployment (operator workstation pointing at a remote DB).
+    //
+    // The console task is fire-and-forget: when the proxy's
+    // graceful shutdown completes, the runtime drops with the
+    // console task still bound — no extra coordination needed for
+    // Ctrl+C / SIGTERM because both surfaces install the same
+    // signal handler via `shutdown_signal()`.
+    if cfg.console.enabled {
+        let console_cfg = cfg.clone();
+        let pw = console_bootstrap_password;
+        tokio::spawn(async move {
+            if let Err(e) = console::run(console_cfg, pw).await {
+                tracing::error!("console listener exited with error: {e:#}");
+            }
+        });
+    } else {
+        tracing::info!("[console].enabled = false; not spawning the console listener");
+        // Drop the password explicitly so its Zeroizing<String>
+        // wipes the buffer now, not at the end of main().
+        drop(console_bootstrap_password);
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)

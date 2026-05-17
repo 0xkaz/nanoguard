@@ -664,6 +664,19 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ConsoleConfig {
+    /// Master switch for the Web Configuration UI. When the main
+    /// `nanoguard` binary boots it now spawns the console listener
+    /// inline, so `make run` alone gives an operator both the proxy
+    /// (:8080) and the console (:8081). Set `enabled = false` in
+    /// production-no-UI deployments where the operator does not want
+    /// the management surface exposed at all.
+    ///
+    /// Defaults to true to match the quickstart story: a first-time
+    /// user runs a single command and expects both ports up. The
+    /// standalone `nanoguard-console` binary is unaffected — it
+    /// always runs the console regardless of this flag.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default = "default_listen")]
     pub listen: String,
     // Optional in TOML: if empty/missing, `console::run` generates an
@@ -709,6 +722,7 @@ impl ConsoleConfig {
 impl Default for ConsoleConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             listen: Self::default_listen(),
             session_secret: String::new(),
             session_ttl_hours: default_session_ttl_hours(),

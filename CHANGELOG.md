@@ -4,6 +4,16 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Changed — `make run` now boots proxy + console in one process
+
+The `nanoguard` binary now spawns the Web Configuration UI listener inline when `[console].enabled = true` (the new default). A first-time operator types `make run` and gets both the proxy on `:8080` and the console on `:8081` from a single command. Set `[console].enabled = false` in `nanoguard.toml` for headless deployments.
+
+The standalone `nanoguard-console` binary stays as the entry point for "console-only" deployments (operator workstation pointing at a shared DB on a remote proxy host). It always runs the console regardless of the flag. Both binaries route through the same `console::prepare_for_run` helper for `CONSOLE_SESSION_SECRET` env override, secret-length validation, and the pre-runtime `BOOTSTRAP_PASSWORD` read — so the two cannot drift apart on security-sensitive behavior.
+
+`src/main.rs` drops `#[tokio::main]` and constructs the runtime by hand so the bootstrap password can be read pre-runtime and wrapped in `Zeroizing<String>` (matching the existing `nanoguard-console` pattern; the plaintext never lingers in `/proc/<pid>/environ`).
+
+e2e scenario 37 covers the new behavior with 7 assertions: proxy + console on the same process, exactly one `nanoguard` PID, in-process spawn log line, `[console].enabled = false` suppression, proxy-only mode still serves `/health`, and the suppression decision lands in the startup log. Existing scenarios 26–36 are configured with `[console].enabled = false` in their proxy TOML so the separate-binary test path (`nanoguard-console`) keeps running unchanged.
+
 ### Added — Multi-backend routing: one proxy, many upstreams
 
 A single proxy can now hold N upstream backends (OpenAI, Anthropic, Ollama, DeepSeek, …) side-by-side and dispatch each request to the right one based on the request body's `model` field. Phase 1 of `docs/design/multi-backend-routing.md` ships in this release; per-client `allowed_models`, audit verdict expansion (`model_denied` / `model_unrouted`), and provider-side failover remain proposed.

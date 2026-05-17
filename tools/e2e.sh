@@ -1095,6 +1095,7 @@ cp "$S26_PROXY_TOML" "$S26_CONSOLE_TOML"
 cat >> "$S26_CONSOLE_TOML" <<EOF
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S26_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1267,6 +1268,7 @@ cp "$S27_PROXY_TOML" "$S27_CONSOLE_TOML"
 cat >> "$S27_CONSOLE_TOML" <<EOF
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S27_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1507,6 +1509,7 @@ hash_only = true
 socket = "$S28_RELOAD_SOCK"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S28_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1636,6 +1639,7 @@ hash_only = true
 socket = "$S28_RELOAD_SOCK"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S28_PORT"
 session_secret = "$(grep '^session_secret' "$S28_TOML" | head -n1 | cut -d= -f2- | tr -d ' "')"
 session_ttl_hours = 1
@@ -1758,6 +1762,7 @@ enabled = false
 db_path = "$S29_DB"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S29_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -1944,6 +1949,7 @@ enabled = false
 db_path = "$S30_DB"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S30_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2088,6 +2094,7 @@ enabled = false
 db_path = "$S31_DB"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S31_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2218,6 +2225,7 @@ db_path = "$S32_DB"
 socket = "$S32_RELOAD_SOCK"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S32_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2349,6 +2357,7 @@ enabled = false
 db_path = "$S33_DB"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S33_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2509,6 +2518,7 @@ enabled = true
 db_path = "$S34_DB"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S34_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2809,6 +2819,7 @@ enabled = false
 db_path = "$S35_DB"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S35_CONSOLE_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -2945,6 +2956,7 @@ db_path = "$S36_DB"
 socket = "$S36_RELOAD_SOCK"
 
 [console]
+enabled = false
 listen = "127.0.0.1:$S36_CONSOLE_PORT"
 session_secret = "$(openssl rand -hex 32)"
 session_ttl_hours = 1
@@ -3121,6 +3133,133 @@ esac
 
 kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+# --- 37. Single-process boot: one `nanoguard` serves proxy + console -----
+# Before this change an operator needed two commands: `make run` and
+# `make run-console`. Now `nanoguard` spawns the console listener
+# inline when `[console].enabled = true` (the default). The
+# `nanoguard-console` binary stays for the rare "console-only"
+# deployment (operator workstation → remote DB).
+info "scenario 37: single-process nanoguard serves both proxy and console"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
+    kill -9 "$pid" 2>/dev/null || true
+done
+sleep 0.5
+
+S37_DIR="$LOGDIR/e2e.s37.workdir"
+rm -rf "$S37_DIR"
+mkdir -p "$S37_DIR"
+
+S37_TOML="$S37_DIR/nanoguard.toml"
+S37_LOG="$LOGDIR/ng.s37.log"
+S37_CONSOLE_PORT=18092
+S37_CONSOLE_URL="http://127.0.0.1:$S37_CONSOLE_PORT"
+
+cat > "$S37_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S37_DIR/nanoguard.db"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S37_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S37_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+EOF
+
+(cd "$S37_DIR" && NANOGUARD_CONFIG="$S37_TOML" "$BIN" > "$S37_LOG" 2>&1) &
+NG_PID=$!
+wait_for_url "37-pre. proxy /health on :$NG_PORT" "$NG_URL/health" 15 || exit 1
+wait_for_url "37-pre. console / on :$S37_CONSOLE_PORT" "$S37_CONSOLE_URL/" 15 || exit 1
+
+# 37a. Proxy listener is up.
+PROXY=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/health")
+assert_eq "37a. single-process /health on :$NG_PORT" "$PROXY" "200"
+
+# 37b. Console listener is up, on the SAME process.
+CONSOLE=$(curl -s -o /dev/null -w "%{http_code}" "$S37_CONSOLE_URL/")
+assert_eq "37b. single-process console / on :$S37_CONSOLE_PORT" "$CONSOLE" "200"
+
+# 37c. Exactly one nanoguard process is running — confirms the
+# console is in-process, not a forked child.
+PROC_COUNT=$(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null \
+    | grep -v nanoguard-console | wc -l | tr -d ' ')
+case "$PROC_COUNT" in
+    1) ok "37c. exactly one nanoguard process serves both ports" ;;
+    *) ng "37c. unexpected nanoguard process count: $PROC_COUNT" ;;
+esac
+
+# 37d. The console listener log line is present in the proxy's own
+# log stream — proves the spawn is in-process.
+if grep -q "nanoguard-console listening on http://127.0.0.1:$S37_CONSOLE_PORT" "$S37_LOG"; then
+    ok "37d. proxy log carries the in-process console listener line"
+else
+    ng "37d. expected console listener log line in $S37_LOG"
+fi
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+# Give the kernel a moment to release the console port. Without
+# this, the next `nanoguard` boot hits EADDRINUSE on $S37_CONSOLE_PORT
+# even though the process has exited — TCP TIME_WAIT lingers briefly.
+sleep 0.5
+for pid in $(pgrep -f "target/release/nanoguard($|-)" 2>/dev/null | grep -v console || true); do
+    kill -9 "$pid" 2>/dev/null || true
+done
+
+# 37e. [console].enabled = false — `nanoguard` alone serves only the
+# proxy. The console port is silent.
+sed -i.bak 's/^enabled = true$/enabled = false/' "$S37_TOML"
+(cd "$S37_DIR" && NANOGUARD_CONFIG="$S37_TOML" "$BIN" > "$S37_LOG" 2>&1) &
+NG_PID=$!
+wait_for_url "37-pre. proxy /health (console off)" "$NG_URL/health" 15 || exit 1
+
+# curl returns 000 when the connection is refused (i.e. nothing
+# listening). 2>/dev/null hides the curl error; `|| echo 000`
+# defends against the non-zero exit code in case `-w` produces
+# empty output on connect failure on the operator's platform.
+CONSOLE_OFF_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 \
+    "$S37_CONSOLE_URL/" 2>/dev/null)
+[ -z "$CONSOLE_OFF_CODE" ] && CONSOLE_OFF_CODE="000"
+case "$CONSOLE_OFF_CODE" in
+    000) ok "37e. [console].enabled = false suppresses the console listener" ;;
+    *)   ng "37e. console answered $CONSOLE_OFF_CODE with enabled = false" ;;
+esac
+
+PROXY_STILL=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/health")
+assert_eq "37f. proxy still serves /health when console is disabled" "$PROXY_STILL" "200"
+
+if grep -q "\[console\].enabled = false; not spawning" "$S37_LOG"; then
+    ok "37g. proxy log records the [console] suppression decision"
+else
+    ng "37g. expected suppression log line in $S37_LOG"
+fi
+
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 
