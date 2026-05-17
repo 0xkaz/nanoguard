@@ -259,7 +259,7 @@ run-console: build
 ADMIN_USER ?= admin
 
 set-admin-password: build
-	./target/release/nanoguard-admin set-password $(ADMIN_USER)
+	./target/release/nanoguard-admin set-password "$(ADMIN_USER)"
 
 # Run with OpenAI backend
 run-openai: build

@@ -1056,8 +1056,9 @@ EOF
 # Console config: same DB (`[budget].db_path` is what `nanoguard-console`
 # reads), bootstrap_admin so the admin user is provisioned, loopback
 # listener so cookies are not marked Secure (we're on plain HTTP).
-# Same [reload].pid_file as the proxy so console revoke fires SIGHUP at
-# the proxy and the verification cache is flushed cross-process.
+# Same [reload].socket as the proxy so a console-side token revoke
+# sends INVALIDATE_TOKENS over that socket and the verification cache
+# is flushed cross-process (see assertions 26e–26f).
 cp "$S26_PROXY_TOML" "$S26_CONSOLE_TOML"
 cat >> "$S26_CONSOLE_TOML" <<EOF
 
@@ -1371,7 +1372,6 @@ VIEWER_MINT=$(curl -s -b "$S27_COOKIES_VIEWER" -c "$S27_COOKIES_VIEWER" \
     -d '{"label":"viewer-self-service"}' \
     "$S27_CONSOLE_URL/api/tokens")
 S27_VIEWER_TOKEN=$(echo "$VIEWER_MINT" | jq -r '.token // empty')
-S27_VIEWER_TOKEN_ID=$(echo "$VIEWER_MINT" | jq -r '.id // empty')
 VIEWER_USE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $S27_VIEWER_TOKEN" \
@@ -1698,6 +1698,178 @@ kill "$CONSOLE_PID" 2>/dev/null || true
 wait "$CONSOLE_PID" 2>/dev/null || true
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
+
+# --- 29. nanoguard-admin CLI end-to-end ------------------------------------
+# The CLI was shipped specifically for the case where a sysadmin cannot
+# go through the web console (forgotten admin password, locked-out user).
+# This scenario verifies the CLI ACTUALLY recovers a login — by running
+# `set-password` against a freshly-bootstrapped DB and then proving the
+# new password authenticates through `nanoguard-console`'s /api/login.
+info "scenario 29: nanoguard-admin CLI recovers a forgotten password"
+
+S29_DIR="$LOGDIR/e2e.s29.workdir"
+rm -rf "$S29_DIR"
+mkdir -p "$S29_DIR"
+
+S29_PORT=18084
+S29_CONSOLE_URL="http://127.0.0.1:$S29_PORT"
+S29_DB="$S29_DIR/nanoguard.db"
+S29_TOML="$S29_DIR/nanoguard.toml"
+S29_CONSOLE_AUDIT="$S29_DIR/console-audit.jsonl"
+S29_CONSOLE_LOG="$LOGDIR/ng.s29.console.log"
+S29_COOKIES="$LOGDIR/e2e.s29.cookies"
+rm -f "$S29_COOKIES"
+
+cat > "$S29_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[backend]
+provider = "ollama"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+model = "test"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[budget]
+enabled = false
+db_path = "$S29_DB"
+
+[console]
+listen = "127.0.0.1:$S29_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S29_CONSOLE_AUDIT"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S29_BOOTSTRAP_PW" }
+EOF
+
+# Bootstrap an admin user we deliberately "forget" the password to.
+S29_FORGOTTEN_PW="s29-forgotten-$(openssl rand -hex 8)"
+(cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
+    S29_BOOTSTRAP_PW="$S29_FORGOTTEN_PW" \
+    "$CONSOLE_BIN" > "$S29_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 0.2
+    curl -sf -o /dev/null "$S29_CONSOLE_URL/" && break
+done
+
+# 29a. The forgotten password works at this point (proves the test
+# baseline is sane before we reset).
+BASELINE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S29_FORGOTTEN_PW\"}" \
+    "$S29_CONSOLE_URL/api/login")
+assert_eq "29a. baseline: original bootstrap password authenticates (200)" "$BASELINE" "200"
+
+# 29b. Stop the console so the admin CLI can take the SQLite write lock
+# without racing the running process. The CLI itself only needs the
+# proxy/console to be down to be safe; it reads the same TOML for the
+# DB path.
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
+
+# 29c. list-users dumps the bootstrap admin we just created.
+LIST_OUT=$(cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" "$ADMIN_BIN" list-users)
+if echo "$LIST_OUT" | grep -qE '^[[:space:]]*1[[:space:]]+admin[[:space:]]+admin'; then
+    ok "29c. nanoguard-admin list-users prints the admin row"
+else
+    ng "29c. list-users output unexpected: $(echo "$LIST_OUT" | head -3)"
+fi
+
+# 29d. set-password via --password-stdin replaces the forgotten password
+# atomically. The plaintext only ever touches the pipe and the binary's
+# Zeroizing<String> buffer.
+S29_NEW_PW="s29-new-$(openssl rand -hex 12)"
+SETPW_OUT=$(printf '%s' "$S29_NEW_PW" | \
+    (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
+        "$ADMIN_BIN" set-password admin --password-stdin))
+case "$SETPW_OUT" in
+    *"password updated for 'admin'"*) ok "29d. set-password --password-stdin reports success" ;;
+    *)                                ng "29d. set-password unexpected output: $SETPW_OUT" ;;
+esac
+
+# 29e. set-password rejects a known-weak password from the common list,
+# so a tired operator cannot accidentally land "password123" as the
+# new admin secret.
+WEAK_OUT=$(printf '%s' "password123456" | \
+    (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
+        "$ADMIN_BIN" set-password admin --password-stdin) 2>&1 || true)
+if echo "$WEAK_OUT" | grep -qF "well-known weak password"; then
+    ok "29e. set-password refuses a known-weak password"
+else
+    ng "29e. weak password was not rejected; output: $WEAK_OUT"
+fi
+
+# 29f. set-password rejects an empty pipe — would otherwise be the
+# silent failure mode if a script pipes from an empty variable.
+EMPTY_OUT=$(printf '' | \
+    (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
+        "$ADMIN_BIN" set-password admin --password-stdin) 2>&1 || true)
+if echo "$EMPTY_OUT" | grep -qF "password is empty"; then
+    ok "29f. set-password refuses an empty password from stdin"
+else
+    ng "29f. empty password was not rejected; output: $EMPTY_OUT"
+fi
+
+# 29g. set-password requires a positional <username>.
+NO_USER_OUT=$( (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
+    "$ADMIN_BIN" set-password) 2>&1 || true)
+if echo "$NO_USER_OUT" | grep -qF "requires a <username>"; then
+    ok "29g. set-password without a username errors out"
+else
+    ng "29g. missing username not flagged; output: $NO_USER_OUT"
+fi
+
+# 29h. set-password refuses to operate on a user that does not exist.
+NO_SUCH_OUT=$(printf '%s' "$S29_NEW_PW" | \
+    (cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
+        "$ADMIN_BIN" set-password no-such-user --password-stdin) 2>&1 || true)
+if echo "$NO_SUCH_OUT" | grep -qF "no user named 'no-such-user'"; then
+    ok "29h. set-password errors on an unknown username"
+else
+    ng "29h. unknown-user error not surfaced; output: $NO_SUCH_OUT"
+fi
+
+# 29i. Bring the console back up (same config; the BOOTSTRAP_PASSWORD
+# env var is intentionally NOT set this time — the bootstrap path is
+# one-shot and should be a no-op now that the users table has a row).
+(cd "$S29_DIR" && NANOGUARD_CONFIG="$S29_TOML" \
+    "$CONSOLE_BIN" > "$S29_CONSOLE_LOG" 2>&1) &
+CONSOLE_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 0.2
+    curl -sf -o /dev/null "$S29_CONSOLE_URL/" && break
+done
+
+# 29j. The OLD password is now rejected — the CLI write actually
+# replaced the hash, not appended to a list.
+OLD_PW_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S29_FORGOTTEN_PW\"}" \
+    "$S29_CONSOLE_URL/api/login")
+assert_eq "29j. the old (forgotten) password no longer logs in (401)" "$OLD_PW_CODE" "401"
+
+# 29k. The NEW password from the CLI authenticates the admin. This is
+# the whole point of the CLI: an operator who lost the password can
+# get back in.
+NEW_PW_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$S29_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S29_NEW_PW\"}" \
+    "$S29_CONSOLE_URL/api/login")
+assert_eq "29k. the new password set via CLI authenticates (200)" "$NEW_PW_CODE" "200"
+
+kill "$CONSOLE_PID" 2>/dev/null || true
+wait "$CONSOLE_PID" 2>/dev/null || true
 
 # --- summary ---------------------------------------------------------------
 

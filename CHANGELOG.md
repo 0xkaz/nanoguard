@@ -4,12 +4,18 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
-### Added — Console e2e: auth, permission boundary, file edit round-trip
+### Changed — `nanoguard-admin` tty prompt is now in-process
+
+`nanoguard-admin set-password` no longer forks `test -t 0` and `stty -echo` to manage the controlling terminal. It now uses `std::io::IsTerminal` for the TTY check and `libc::tcgetattr` / `tcsetattr` (via the `libc` crate already used by the reload trigger) to mask `ECHO` off and restore on drop. CLAUDE.md absolute rule #2 — "single binary, no runtime dependencies beyond the binary itself" — applies as much to operator tools as to the proxy, so the shell-out was a quiet violation. No new crate dependency.
+
+### Added — Console e2e: auth, permission boundary, file edit round-trip + admin CLI
 
 `tools/e2e.sh` grows two scenarios that fence the Web Console operationally:
 
 - **Scenario 27 (auth + permission boundary)** — wrong-password is 401 and does not echo the submitted secret; mutating endpoints with no `X-CSRF-Token` or a wrong one are 403; an admin can create a non-admin user; the non-admin can sign in and self-service-mint a proxy token; the non-admin cannot create users (403); admin force-revoke flushes the proxy verification cache so the previously-minted token immediately 401s; logout invalidates the session row, not just the cookie.
 - **Scenario 28 (file edit round-trip)** — the Phase 2 file-edit machinery now has end-to-end coverage. The console writes a new `inline_block` keyword to `nanoguard.toml` through `POST /api/edit`, the edit handler fires a socket-based reload trigger, and the proxy starts blocking the new keyword without a restart. Invalid TOML is rejected by both `/api/validate` (returns `valid:false` in the body) and `/api/edit` (HTTP 400 before the atomic rename) — the pre-rename validator is what keeps a fat-fingered edit from bricking the proxy. The edit produces a backup file under `.nanoguard-backups/` (visible via `GET /api/backups`), the pre-existing keyword still blocks after the edit (no truncation regression), and `console-audit.jsonl` records the edit action.
+
+- **Scenario 29 (nanoguard-admin CLI)** — the recovery binary itself was unverified until now. The new scenario bootstraps an admin, "forgets" the password, runs `set-password admin --password-stdin` against the offline DB, brings the console back up, and confirms the old password 401s while the new password 200s. Also fences the rejection paths: weak passwords (`is_common_password`), empty stdin, missing username, unknown user — each error message is asserted verbatim so a future refactor cannot silently turn a hard fail into a no-op.
 
 While here, `api_force_revoke_user_tokens` (XKA-61) gains the same `trigger_invalidate_tokens` call the per-token revoke uses — without it, a mass-revoke would have left up to 60s of cached "verified" results on the proxy, which is exactly the scenario where that latency is a security bug.
 

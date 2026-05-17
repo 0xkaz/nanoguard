@@ -10,7 +10,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use nanoguard::console::{auth, db};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use zeroize::Zeroizing;
 
 fn main() -> Result<()> {
@@ -191,10 +191,10 @@ fn read_password_from_stdin() -> Result<Zeroizing<String>> {
 }
 
 /// Prompt for a password on the controlling tty with echo turned off.
-/// Falls back to a plain readline if stdin is not a tty (CI, pipes).
+/// Errors out if stdin is not a tty so the caller has to pick an
+/// explicit pipe-friendly mode (`--password-stdin` or `--password`).
 fn prompt_password_tty(username: &str) -> Result<Zeroizing<String>> {
-    let is_tty = is_stdin_tty();
-    if !is_tty {
+    if !io::stdin().is_terminal() {
         return Err(anyhow!(
             "stdin is not a TTY; pass --password-stdin or --password instead"
         ));
@@ -203,9 +203,12 @@ fn prompt_password_tty(username: &str) -> Result<Zeroizing<String>> {
     print!("New password for '{}': ", username);
     io::stdout().flush().ok();
 
-    // Toggle echo off via stty. Doing it via `stty` keeps libc out of the
-    // dependency graph; this binary is a console-side admin tool and only
-    // runs on the operator's box, so the extra fork is acceptable.
+    // RAII: take a snapshot of termios, mask ECHO off, restore on drop.
+    // Stays in-process — no fork/exec of `stty`. CLAUDE.md absolute rule
+    // #2 ("single binary, no runtime dependencies beyond the binary
+    // itself") would otherwise be at risk; `libc` is already vendored
+    // for `libc::kill` in the console reload trigger, so this adds no
+    // new dependency.
     let _echo_off = EchoGuard::off()?;
 
     let mut line = String::new();
@@ -224,37 +227,46 @@ fn prompt_password_tty(username: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(line))
 }
 
-fn is_stdin_tty() -> bool {
-    // The `isatty(0)` syscall is the canonical answer, but doing it without
-    // libc means shelling out — `test -t 0` returns 0 on a tty. Cheap enough.
-    std::process::Command::new("test")
-        .args(["-t", "0"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// RAII guard that masks `ECHO` off on stdin's termios and restores the
+/// previous setting on drop. Operates on `STDIN_FILENO` directly via
+/// `tcgetattr`/`tcsetattr`. Caller is expected to have already verified
+/// stdin is a tty.
+struct EchoGuard {
+    saved: libc::termios,
 }
-
-/// RAII guard that disables terminal echo for stdin and restores it on drop.
-struct EchoGuard;
 
 impl EchoGuard {
     fn off() -> Result<Self> {
-        let status = std::process::Command::new("stty")
-            .arg("-echo")
-            .status()
-            .context("running `stty -echo`")?;
-        if !status.success() {
-            return Err(anyhow!("`stty -echo` exited with status {}", status));
+        // SAFETY: zero-initialized `termios` is a valid input for
+        // `tcgetattr`, which fills every field we care about. The call
+        // returns -1 on error, never partial init.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("tcgetattr(stdin)");
         }
-        Ok(EchoGuard)
+        let mut new = saved;
+        new.c_lflag &= !libc::ECHO;
+        // SAFETY: `new` is a fully-initialized termios derived from the
+        // value tcgetattr just produced; modifying c_lflag is the
+        // documented way to mask off echo.
+        let rc = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &new) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("tcsetattr(stdin, ECHO off)");
+        }
+        Ok(EchoGuard { saved })
     }
 }
 
 impl Drop for EchoGuard {
     fn drop(&mut self) {
-        // Best-effort restore. If this fails the user's terminal will be
-        // left without echo until they `stty echo` themselves — not great
-        // but the only honest thing to do without a signal handler.
-        let _ = std::process::Command::new("stty").arg("echo").status();
+        // Best-effort restore. If this somehow fails the user's terminal
+        // will be stuck without echo until they `stty echo` it back —
+        // unfortunate but the only honest thing without a signal handler.
+        // SAFETY: `self.saved` came from a successful `tcgetattr` call,
+        // so it is a valid termios value to write back.
+        unsafe {
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
+        }
     }
 }
