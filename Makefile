@@ -1,4 +1,4 @@
-.PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai run-console set-admin-password ollama-start \
+.PHONY: all build dev test e2e e2e-live check lint fmt clean run run-openai set-admin-password ollama-start \
         docker docker-run release docker-release watch-docker watch watch-test watch-lint \
         bench coverage miri audit geiger semgrep ci push release-patch release-minor release-major \
         release-tag pr pr-web preflight install-trivy trivy trivy-image mirai preflight-mirai
@@ -180,29 +180,21 @@ clean:
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
-# Start Ollama if not running, pull model, then run nanoguard
+# Start Ollama if not running, pull the model, then run nanoguard.
+# Since v0.8.0 the `nanoguard` binary serves BOTH the proxy (:8080)
+# and the Web Configuration UI (:8081) from a single process —
+# `make run` alone is enough; there is no separate `make run-console`.
+# Set `[console].enabled = false` in nanoguard.toml for headless deployments.
+#
+# If $CONSOLE_SESSION_SECRET is unset, generate an ephemeral one for
+# this shell so sessions don't reset on restart unintentionally.
+# If $BOOTSTRAP_PASSWORD is unset and the users table is empty,
+# generate one and print it ONCE — the admin user is bootstrapped
+# on first start using that value. After first run, unset the env
+# var in your shell (the bootstrap path is one-shot).
 run: build ollama-start
-	RUST_LOG=info ./target/release/nanoguard
-
-# Start the Web Configuration UI (`nanoguard-console`, default :8081).
-#
-# If $CONSOLE_SESSION_SECRET is unset, generates one for this shell-session.
-# If $BOOTSTRAP_PASSWORD is unset, generates one and prints it ONCE — the
-# admin user is bootstrapped on first start using that value, then it
-# should be unset. Existing $BOOTSTRAP_PASSWORD / $CONSOLE_SESSION_SECRET
-# in the environment are passed through unchanged.
-#
-# Default admin username is `admin` (see [console.auth.local] in
-# nanoguard.toml). Run this in a separate terminal from `make run` — the
-# proxy (:8080) and the console (:8081) are independent processes.
-run-console: build
 	@command -v openssl >/dev/null 2>&1 || { \
-	    echo "error: openssl not installed."; \
-	    echo "       \`make run-console\` uses \`openssl rand\` to generate"; \
-	    echo "       CONSOLE_SESSION_SECRET and BOOTSTRAP_PASSWORD when they"; \
-	    echo "       aren't already set in the environment."; \
-	    echo "       Install openssl, or set both env vars yourself and"; \
-	    echo "       run ./target/release/nanoguard-console directly."; \
+	    echo "error: openssl not installed; install it or set CONSOLE_SESSION_SECRET / BOOTSTRAP_PASSWORD yourself."; \
 	    exit 1; \
 	}
 	@db_path=$$(awk ' \
@@ -222,16 +214,13 @@ run-console: build
 	fi; \
 	if [ -z "$$CONSOLE_SESSION_SECRET" ]; then \
 	    export CONSOLE_SESSION_SECRET="$$(openssl rand -hex 32)"; \
-	    echo "→ CONSOLE_SESSION_SECRET not set; generated an ephemeral one for this session."; \
+	    echo "→ CONSOLE_SESSION_SECRET not set; generated an ephemeral one for this run."; \
 	fi; \
 	if [ "$$users_exist" = "1" ]; then \
 	    echo ""; \
 	    echo "→ $$db_path already has users; BOOTSTRAP_PASSWORD is a no-op."; \
 	    echo "  Sign in at http://localhost:8081/ with the existing admin credentials,"; \
-	    echo "  or reset a forgotten password with:"; \
-	    echo "    make set-admin-password           # interactive (no shell-history leak)"; \
-	    echo "    ./target/release/nanoguard-admin --help"; \
-	    echo "  (To wipe the DB and start over: rm $$db_path)"; \
+	    echo "  or reset a forgotten password with: make set-admin-password"; \
 	    echo ""; \
 	elif [ -z "$$BOOTSTRAP_PASSWORD" ]; then \
 	    export BOOTSTRAP_PASSWORD="$$(openssl rand -hex 12)"; \
@@ -246,7 +235,7 @@ run-console: build
 	    echo "  └─────────────────────────────────────────────────────────────┘"; \
 	    echo ""; \
 	fi; \
-	RUST_LOG=info ./target/release/nanoguard-console
+	RUST_LOG=info ./target/release/nanoguard
 
 # Reset an admin / user password in the Console DB without going through the
 # web UI. Useful when the bootstrap password has been forgotten or the

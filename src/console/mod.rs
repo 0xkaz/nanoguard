@@ -31,19 +31,27 @@ pub struct ConsoleState {
     pub audit_log: Option<audit::ConsoleAuditLog>,
 }
 
-/// Pre-runtime setup the both the standalone `nanoguard-console`
+/// Pre-runtime setup that both the standalone `nanoguard-console`
 /// binary and the in-process console-launcher in `nanoguard` need
 /// to perform identically. Reads the bootstrap password and the
 /// `CONSOLE_SESSION_SECRET` env override, validates the session
 /// secret length, and returns the bootstrap password wrapped in
-/// `Zeroizing<String>` so the caller can pass it into [`run`].
+/// `Zeroizing<String>` so the in-memory plaintext is wiped after
+/// hashing. Centralising the env read keeps the two binaries on a
+/// single code path — a fork on security-sensitive setup is
+/// exactly the kind that becomes a regression at the worst time.
 ///
-/// MUST be called BEFORE the tokio runtime starts so the
-/// `BOOTSTRAP_PASSWORD` plaintext never lingers in `/proc/<pid>/environ`
-/// for the rest of the process lifetime. Centralizing the env read
-/// also keeps the two binaries from drifting apart in subtle ways
-/// (one validating, the other not — the kind of fork that becomes
-/// a security regression at the worst possible moment).
+/// Note on `/proc/<pid>/environ`: reading an env var via
+/// `std::env::var()` is read-only and does **not** clear it from
+/// the process environment image. The `Zeroizing<String>` wrap
+/// gives us a deterministic wipe of the in-memory copy; the
+/// `BOOTSTRAP_PASSWORD` slot in `/proc/<pid>/environ` itself
+/// remains visible for the process lifetime unless the caller
+/// also `unset`s the variable in the shell before exec, or we
+/// follow up with `std::env::remove_var` (unsafe under threads).
+/// Treat the env slot as the operator's responsibility: documented
+/// in README's "Recovering a forgotten admin password" section and
+/// in the bootstrap log line that asks them to clear it.
 pub fn prepare_for_run(cfg: &mut Config) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
     // CONSOLE_SESSION_SECRET overrides whatever the TOML carries
     // when it is set and non-empty. 12-factor pattern: secrets via

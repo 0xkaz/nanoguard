@@ -14,8 +14,13 @@ use nanoguard::{
 
 fn main() -> Result<()> {
     // Pre-runtime: load the config, then run the console's pre-tokio
-    // prep so BOOTSTRAP_PASSWORD never lingers in /proc/<pid>/environ
-    // and CONSOLE_SESSION_SECRET length is validated before we bind.
+    // prep so the BOOTSTRAP_PASSWORD plaintext is wrapped in a
+    // Zeroizing<String> (deterministic wipe after hashing) and
+    // CONSOLE_SESSION_SECRET length is validated before we bind. The
+    // env-slot itself stays visible in /proc/<pid>/environ until the
+    // operator `unset`s the variable; the Zeroizing wrap only kills
+    // the in-memory copy. README's bootstrap section asks the
+    // operator to clear it after the first run.
     // If the operator turned the console off (`[console].enabled =
     // false`) the prep is still safe — it only reads env and never
     // requires a configured bootstrap admin.
@@ -224,25 +229,58 @@ async fn async_main(
     // console task still bound — no extra coordination needed for
     // Ctrl+C / SIGTERM because both surfaces install the same
     // signal handler via `shutdown_signal()`.
-    if cfg.console.enabled {
+    let console_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = if cfg.console.enabled {
         let console_cfg = cfg.clone();
         let pw = console_bootstrap_password;
-        tokio::spawn(async move {
-            if let Err(e) = console::run(console_cfg, pw).await {
-                tracing::error!("console listener exited with error: {e:#}");
-            }
-        });
+        Some(tokio::spawn(
+            async move { console::run(console_cfg, pw).await },
+        ))
     } else {
         tracing::info!("[console].enabled = false; not spawning the console listener");
         // Drop the password explicitly so its Zeroizing<String>
         // wipes the buffer now, not at the end of main().
         drop(console_bootstrap_password);
-    }
+        None
+    };
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let proxy_serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+
+    // Race the proxy server against the console task. If the console
+    // exits early — bind error, panic, anything — and the operator
+    // asked for it (`[console].enabled = true`), kill the proxy too:
+    // a partial boot (proxy up, console silently dead) is exactly
+    // the state we want to fail loud on, not silently tolerate.
+    // When console is disabled the JoinHandle is None and we just
+    // await the proxy normally.
+    if let Some(handle) = console_task {
+        tokio::select! {
+            proxy_result = proxy_serve => {
+                proxy_result?;
+            }
+            console_result = handle => {
+                match console_result {
+                    Ok(Ok(())) => {
+                        tracing::warn!(
+                            "console listener exited cleanly while proxy was running; \
+                             treating as fatal because [console].enabled = true"
+                        );
+                        anyhow::bail!("console listener exited unexpectedly");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("console listener failed: {e:#}");
+                        anyhow::bail!("console listener failed: {e:#}");
+                    }
+                    Err(join_err) => {
+                        tracing::error!("console listener task panicked: {join_err}");
+                        anyhow::bail!("console listener task panicked");
+                    }
+                }
+            }
+        }
+    } else {
+        proxy_serve.await?;
+    }
 
     tracing::info!("nanoguard stopped gracefully");
     Ok(())

@@ -4,15 +4,19 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
-### Changed — `make run` now boots proxy + console in one process
+### Changed — single-process boot; `nanoguard-console` binary retired
 
-The `nanoguard` binary now spawns the Web Configuration UI listener inline when `[console].enabled = true` (the new default). A first-time operator types `make run` and gets both the proxy on `:8080` and the console on `:8081` from a single command. Set `[console].enabled = false` in `nanoguard.toml` for headless deployments.
+The `nanoguard` binary now spawns the Web Configuration UI listener inline when `[console].enabled = true` (the new default). A first-time operator types `make run` and gets both the proxy on `:8080` and the console on `:8081` from a single command. Set `[console].enabled = false` in `nanoguard.toml` for headless deployments where the management UI is undesired.
 
-The standalone `nanoguard-console` binary stays as the entry point for "console-only" deployments (operator workstation pointing at a shared DB on a remote proxy host). It always runs the console regardless of the flag. Both binaries route through the same `console::prepare_for_run` helper for `CONSOLE_SESSION_SECRET` env override, secret-length validation, and the pre-runtime `BOOTSTRAP_PASSWORD` read — so the two cannot drift apart on security-sensitive behavior.
+The standalone `nanoguard-console` binary is **retired** — single-process is the only supported boot mode. The `[[bin]] name = "nanoguard-console"` entry, `make run-console` target, and the matching `$CONSOLE_BIN` plumbing in `tools/e2e.sh` are gone. `make run` now folds in the bootstrap-admin-password convenience the retired target used to provide (auto-generate when the users table is empty, print once, recognise an existing admin without overwriting), so operators who used `make run-console` for that UX lose nothing.
 
-`src/main.rs` drops `#[tokio::main]` and constructs the runtime by hand so the bootstrap password can be read pre-runtime and wrapped in `Zeroizing<String>` (matching the existing `nanoguard-console` pattern; the plaintext never lingers in `/proc/<pid>/environ`).
+`make run` accepts `CONSOLE_SESSION_SECRET` and `BOOTSTRAP_PASSWORD` from the shell environment as before; when unset, the target generates ephemeral values and prints the admin password exactly once on first boot. The `BOOTSTRAP_PASSWORD` env-slot remains visible in `/proc/<pid>/environ` until the operator `unset`s it after first run — the in-memory `Zeroizing<String>` wrap kills the heap copy but not the env image. Documented in README's "Recovering a forgotten admin password" section.
 
-e2e scenario 37 covers the new behavior with 7 assertions: proxy + console on the same process, exactly one `nanoguard` PID, in-process spawn log line, `[console].enabled = false` suppression, proxy-only mode still serves `/health`, and the suppression decision lands in the startup log. Existing scenarios 26–36 are configured with `[console].enabled = false` in their proxy TOML so the separate-binary test path (`nanoguard-console`) keeps running unchanged.
+`src/main.rs` drops `#[tokio::main]` and constructs the runtime by hand so the bootstrap password can be read pre-runtime. The new `console::prepare_for_run` helper centralises `CONSOLE_SESSION_SECRET` env override, secret-length validation, and the pre-runtime `BOOTSTRAP_PASSWORD` read — keeping the path in one place after the standalone binary's removal.
+
+**Fail-fast on console bind error.** When `[console].enabled = true` and `console::run` exits early (bind error, panic, anything), `nanoguard` treats that as fatal and shuts the proxy down too. A partial boot — proxy up, console silently dead — was exactly the state we want to fail loud on. `tokio::select!` races the proxy server against the console join handle; whichever exits first decides the process outcome.
+
+**e2e** — scenario 37 covers the new contract with 7 assertions (proxy + console on the same PID, in-process spawn log line, `[console].enabled = false` suppresses the listener cleanly, proxy still serves `/health` in disabled mode). Scenarios 26–36 unified on the single binary: every `[console]` block carries `enabled = true`, the secondary `$CONSOLE_BIN` invocations are gone, the new `kill_leftover_nanoguards` helper sweeps any zombie from a flaky previous tear-down, and scenarios 28 / 36 switch their reload trigger from `[reload].socket` to `[reload].pid_file` because same-runtime socket reads under the new boot model have a race window that SIGHUP does not.
 
 ### Added — Multi-backend routing: one proxy, many upstreams
 
