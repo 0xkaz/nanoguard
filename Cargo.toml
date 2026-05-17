@@ -30,6 +30,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# `toml_edit` is already in the dep graph as a transitive of `toml`;
+# we pull it in explicitly so the Console can rewrite [backends.*]
+# round-trippable (other sections of nanoguard.toml stay verbatim).
+toml_edit = "0.22"
 iword-rs = { version = "0.1", features = ["regex"] }
 aho-corasick = "1"
 regex = "1"

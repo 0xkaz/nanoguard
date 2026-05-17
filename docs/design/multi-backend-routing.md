@@ -1,4 +1,4 @@
-> **Status:** proposed (2026-05-16)
+> **Status:** partial (2026-05-17) — Phase 1 (multi-backend pool, model-name routing, legacy `[backend]` compat, Console Backends tab) shipped. Per-client `allowed_models`, per-route audit verdicts (`model_denied` / `model_unrouted`), and provider-side failover remain proposed.
 
 # Multi-Backend Routing
 

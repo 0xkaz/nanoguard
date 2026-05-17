@@ -49,7 +49,7 @@ async function api(path, opts = {}) {
 // ── Navigation ──────────────────────────────────────────────
 
 const TABS = ['overview', 'tokens', 'budget', 'audit', 'config'];
-const ADMIN_TABS = ['users'];
+const ADMIN_TABS = ['users', 'backends'];
 
 function renderNav() {
   const nav = $('#nav');
@@ -71,6 +71,7 @@ function switchTab(name) {
   if (name === 'audit') loadAudit();
   if (name === 'config') loadConfig();
   if (name === 'users') loadUsers();
+  if (name === 'backends') loadBackends();
 }
 
 // ── Auth ────────────────────────────────────────────────────
@@ -640,6 +641,104 @@ $('#user-submit').addEventListener('click', async (e) => {
     $('#user-error').textContent = err.message;
   }
 });
+
+// ── Backends (admin only) ───────────────────────────────────
+
+async function loadBackends() {
+  const body = $('#backends-body');
+  if (!body) return;
+  try {
+    const res = await api('/api/backends');
+    const def = res.default;
+    const rows = (res.data || []).map(b => `
+      <tr>
+        <td><code>${esc(b.name)}</code>${b.is_default ? ' <span class="hint subtle">(default)</span>' : ''}</td>
+        <td><code>${esc(b.provider)}</code></td>
+        <td><code>${esc(b.endpoint)}</code></td>
+        <td>${esc(b.model || '')}</td>
+        <td>${b.has_api_key ? '✓' : ''}</td>
+        <td>
+          <button class="btn small" data-backend-edit="${esc(b.name)}">Edit</button>
+          <button class="btn small danger" data-backend-delete="${esc(b.name)}">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+    body.innerHTML = `
+      <p class="hint subtle">Add or change backends here. Adding / removing backends is
+      <strong>restart-only</strong> — the proxy keeps using its current pool until you
+      restart it. Routing rules (model → backend) are hot-reloadable and live in
+      <code>[routing]</code>.</p>
+      <p class="hint subtle">Default backend: <code>${esc(def || '—')}</code></p>
+      <table class="table">
+        <thead><tr><th>Name</th><th>Provider</th><th>Endpoint</th><th>Model</th><th>API Key</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="6" class="hint">no backends configured</td></tr>'}</tbody>
+      </table>
+      <button id="backend-add-btn" class="btn primary">Add backend</button>
+    `;
+    $('#backend-add-btn').addEventListener('click', () => openBackendEditor(null));
+    $$('#tab-backends [data-backend-edit]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const name = btn.dataset.backendEdit;
+        const b = (res.data || []).find(x => x.name === name);
+        if (b) openBackendEditor(b);
+      });
+    });
+    $$('#tab-backends [data-backend-delete]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const name = btn.dataset.backendDelete;
+        if (!confirm(`Delete backend ${name}? (proxy must be restarted to drop the pool entry)`)) return;
+        try {
+          await api(`/api/backends/${encodeURIComponent(name)}`, { method: 'DELETE' });
+          loadBackends();
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+    });
+  } catch (err) {
+    body.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+  }
+}
+
+function openBackendEditor(existing) {
+  const name = existing
+    ? prompt('Backend name (cannot be changed):', existing.name)
+    : prompt('Backend name (letters, digits, - and _):');
+  if (!name) return;
+  if (existing && name !== existing.name) {
+    alert('Renaming is not supported — delete and recreate instead.');
+    return;
+  }
+  const provider = prompt('Provider (openai | anthropic | ollama):', existing?.provider || 'openai');
+  if (!provider) return;
+  const endpoint = prompt('Endpoint URL:', existing?.endpoint || 'https://api.openai.com');
+  if (!endpoint) return;
+  const apiKey = prompt('API key (leave blank to keep current or to send nothing):', '');
+  const model = prompt('Default model (optional):', existing?.model || '');
+
+  const body = { provider, endpoint };
+  if (apiKey) body.api_key = apiKey;
+  if (model) body.model = model;
+
+  (async () => {
+    try {
+      if (existing) {
+        await api(`/api/backends/${encodeURIComponent(name)}`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        });
+      } else {
+        await api(`/api/backends?name=${encodeURIComponent(name)}`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+      }
+      loadBackends();
+    } catch (err) {
+      alert(err.message);
+    }
+  })();
+}
 
 // ── Utilities ───────────────────────────────────────────────
 

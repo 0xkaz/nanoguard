@@ -10,6 +10,7 @@ For SSE tests, set `?stream=1` or pass `"stream": true` in the body —
 the backend emits a series of `data: {...}` chunks then `data: [DONE]`.
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -60,7 +61,12 @@ class MockHandler(BaseHTTPRequestHandler):
             except Exception:
                 tool_calls = None
 
-        echo = f"You said: {user_msg}"
+        # `BACKEND_LABEL` lets the e2e script run two mock backends
+        # on different ports and tell them apart in the response. The
+        # default reproduces the historical "You said: ..." shape so
+        # existing scenarios keep matching their assertions verbatim.
+        label = os.environ.get("BACKEND_LABEL", "")
+        echo = f"[{label}] You said: {user_msg}" if label else f"You said: {user_msg}"
 
         if req.get("stream"):
             if tool_calls is not None:

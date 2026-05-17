@@ -419,6 +419,49 @@ See [`docs/operations.md`](docs/operations.md) for systemd integration, log rota
 
 ---
 
+## Multiple backends and routing
+
+A single proxy can expose several upstream LLM backends side-by-side. Configure them under `[backends.NAME]` (operator-chosen label) and add a `[routing]` block to decide which backend handles which `model` name. The legacy single `[backend]` section still works; nanoguard synthesizes a `default` pool entry from it.
+
+```toml
+[backends.openai]
+provider = "openai"
+endpoint = "https://api.openai.com"
+api_key  = "sk-..."
+
+[backends.local]
+provider = "ollama"
+endpoint = "http://localhost:11434"
+
+[backends.anthropic]
+provider = "anthropic"
+endpoint = "https://api.anthropic.com"
+api_key  = "..."
+
+[routing]
+default = "local"     # used when no rule matches
+rules = [
+    { model = "gpt-*",     backend = "openai"    },
+    { model = "claude-*",  backend = "anthropic" },
+    { model = "qwen*",     backend = "local"     },
+    { model = "llama*",    backend = "local"     },
+]
+```
+
+Rules support exact strings and trailing-`*` globs (no other wildcards). They are scanned in the order declared; first match wins. A request whose `model` does not match any rule falls back to `[routing].default`.
+
+The Console **Backends** tab (admin only) shows the current pool, the routing table, and lets you add or remove entries from a UI. The mutation rewrites `nanoguard.toml` on disk via a TOML round-trip (unrelated sections and comments preserved). The proxy's live backend pool is **restart-only** — see `docs/design/multi-backend-routing.md > State management` for the reason — so a freshly-added backend is visible on disk and in the API immediately, but the proxy itself only picks it up on the next process restart. Routing rules and the default selection are hot-reloadable.
+
+What is NOT in this iteration:
+
+- Per-client `allowed_models` (token-scoped permission). The current implementation lets any authenticated caller hit any backend the routing table reaches.
+- Provider-side failover (auto-retry on a different backend when the primary returns 5xx). nanoguard does **not** silently re-route; downed-backend requests fail.
+- Per-backend quota partitioning. Budgets remain global per token.
+
+See `docs/design/multi-backend-routing.md` for the full design.
+
+---
+
 ## Web Configuration UI
 
 A separate binary, `nanoguard-console`, ships an optional operator console and self-service proxy-token UI. It shares `nanoguard.toml` and the budget SQLite database with the proxy but runs in its own process with its own listener. **The proxy itself never exposes a mutation HTTP surface** — see [`docs/design/web-config-ui.md`](docs/design/web-config-ui.md) for the rationale.
@@ -534,11 +577,18 @@ The Overview tab also renders a **Guards Active** panel listing which input/outp
 listen = "0.0.0.0:8080"
 log_level = "info"
 
+# Single-backend deployments use [backend] (legacy schema):
 [backend]
 provider = "ollama"
 endpoint = "http://localhost:11434"
 # api_key = "sk-..."
 # model = "llama3.2"
+
+# Multi-backend deployments use [backends.NAME] instead (one section
+# per upstream) plus a [routing] block. Mixing both is allowed during
+# migration — [backends.*] takes precedence and a startup warning
+# fires. See "Multiple backends" below and
+# `docs/design/multi-backend-routing.md`.
 
 [input]
 enabled = true
