@@ -474,6 +474,18 @@ pub struct ConsoleConfig {
     /// successful write.
     #[serde(default = "default_backup_limit")]
     pub backup_limit: usize,
+    /// Idle timeout in hours. A session is considered expired if it has
+    /// not been touched (via `last_seen_at`) for longer than this.
+    /// Defaults to the same value as `session_ttl_hours`.
+    #[serde(default)]
+    pub session_idle_timeout_hours: Option<i64>,
+    /// Brute-force protection: max failed login attempts before lockout.
+    #[serde(default = "default_max_login_attempts")]
+    pub max_login_attempts: i64,
+    /// Brute-force protection: lockout duration in minutes after max
+    /// failed attempts.
+    #[serde(default = "default_lockout_duration_minutes")]
+    pub lockout_duration_minutes: i64,
     #[serde(default)]
     pub auth: ConsoleAuthConfig,
 }
@@ -496,6 +508,9 @@ impl Default for ConsoleConfig {
             session_ttl_hours: default_session_ttl_hours(),
             audit_path: default_console_audit_path(),
             backup_limit: default_backup_limit(),
+            session_idle_timeout_hours: None,
+            max_login_attempts: default_max_login_attempts(),
+            lockout_duration_minutes: default_lockout_duration_minutes(),
             auth: ConsoleAuthConfig::default(),
         }
     }
@@ -511,6 +526,14 @@ fn default_console_audit_path() -> String {
 
 fn default_backup_limit() -> usize {
     20
+}
+
+fn default_max_login_attempts() -> i64 {
+    10
+}
+
+fn default_lockout_duration_minutes() -> i64 {
+    15
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

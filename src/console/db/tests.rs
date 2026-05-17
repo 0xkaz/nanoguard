@@ -98,3 +98,73 @@ fn bootstrap_only_when_empty() {
     let created2 = maybe_bootstrap_admin(&conn, "admin2", &hash).unwrap();
     assert!(!created2);
 }
+
+#[test]
+fn login_attempt_tracking_and_pruning() {
+    let conn = in_memory();
+    migrate(&conn).unwrap();
+    insert_user(&conn, "eve", None, None, "user", None).unwrap();
+
+    record_login_attempt(&conn, "eve", Some("10.0.0.1")).unwrap();
+    record_login_attempt(&conn, "eve", Some("10.0.0.1")).unwrap();
+
+    let count = count_recent_login_attempts(&conn, "eve", 15).unwrap();
+    assert_eq!(count, 2);
+
+    let ip_count = count_recent_login_attempts_by_ip(&conn, "10.0.0.1", 15).unwrap();
+    assert_eq!(ip_count, 2);
+
+    clear_login_attempts(&conn, "eve").unwrap();
+    let count_after = count_recent_login_attempts(&conn, "eve", 15).unwrap();
+    assert_eq!(count_after, 0);
+
+    // Prune old attempts
+    record_login_attempt(&conn, "eve", Some("10.0.0.1")).unwrap();
+    let pruned = prune_old_login_attempts(&conn, 1).unwrap();
+    assert_eq!(pruned, 0); // too fresh
+    let pruned_old = prune_old_login_attempts(&conn, 0).unwrap();
+    assert_eq!(pruned_old, 1); // older than 0 minutes
+}
+
+#[test]
+fn lockout_roundtrip() {
+    let conn = in_memory();
+    migrate(&conn).unwrap();
+    let id = insert_user(&conn, "frank", None, None, "user", None).unwrap();
+
+    let user = user_by_id(&conn, id).unwrap().unwrap();
+    assert!(user.locked_until.is_none());
+
+    let until = (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
+    set_locked_until(&conn, id, Some(&until)).unwrap();
+
+    let user = user_by_id(&conn, id).unwrap().unwrap();
+    assert_eq!(user.locked_until, Some(until));
+
+    set_locked_until(&conn, id, None).unwrap();
+    let user = user_by_id(&conn, id).unwrap().unwrap();
+    assert!(user.locked_until.is_none());
+}
+
+#[test]
+fn prune_idle_sessions_evicts_stale() {
+    let conn = in_memory();
+    migrate(&conn).unwrap();
+    insert_user(&conn, "grace", None, None, "user", None).unwrap();
+
+    let sid = vec![1u8; 32];
+    let csrf = vec![2u8; 32];
+    let expires = "2099-12-31T23:59:59Z";
+    let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    create_session(&conn, &sid, 1, expires, None, None, &csrf).unwrap();
+    // Manually backdate last_seen_at
+    conn.execute(
+        "UPDATE user_sessions SET last_seen_at = ? WHERE id = ?",
+        params![old, &sid],
+    )
+    .unwrap();
+
+    let pruned = prune_idle_sessions(&conn, 1).unwrap();
+    assert_eq!(pruned, 1);
+    assert!(session_by_id(&conn, &sid).unwrap().is_none());
+}

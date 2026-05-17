@@ -15,6 +15,19 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use cookie::{Cookie, Key, SameSite};
+
+/// Small hardcoded set of common passwords that must be rejected even if
+/// they meet the length requirement. This is a lightweight defense; larger
+/// deployments should use a full dictionary (e.g. HIBP) via external check.
+const COMMON_PASSWORDS: &[&str] = &[
+    "password123456",
+    "123456789012",
+    "qwertyuiop[]",
+    "letmein1234567",
+    "welcome1234567",
+    "adminadminadmin",
+    "nanoguard12345",
+];
 use rand::rngs::OsRng;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -108,7 +121,7 @@ pub fn build_session_cookie(session_id: &[u8], secret: &str, secure: bool) -> Co
     let value = hex::encode(session_id);
     let mut cookie = Cookie::new("ng_session", value.clone());
     cookie.set_http_only(true);
-    cookie.set_same_site(SameSite::Lax);
+    cookie.set_same_site(SameSite::Strict);
     cookie.set_path("/");
     cookie.set_secure(secure);
 
@@ -125,7 +138,7 @@ pub fn build_logout_cookie(secret: &str, secure: bool) -> Cookie<'static> {
     let key = Key::derive_from(secret.as_bytes());
     let mut cookie = Cookie::new("ng_session", "");
     cookie.set_http_only(true);
-    cookie.set_same_site(SameSite::Lax);
+    cookie.set_same_site(SameSite::Strict);
     cookie.set_path("/");
     cookie.set_secure(secure);
     cookie.set_max_age(cookie::time::Duration::seconds(0));
@@ -156,6 +169,13 @@ pub fn extract_session_id(headers: &HeaderMap, secret: &str) -> Option<Vec<u8>> 
     hex::decode(session_cookie.value()).ok()
 }
 
+/// Check whether a password appears in the small built-in common-password
+/// list. Case-insensitive comparison.
+pub fn is_common_password(password: &str) -> bool {
+    let lower = password.to_lowercase();
+    COMMON_PASSWORDS.iter().any(|&p| p.to_lowercase() == lower)
+}
+
 /// Current user extractor for axum handlers.
 #[derive(Clone, Debug)]
 pub struct CurrentUser(pub User);
@@ -171,6 +191,12 @@ impl FromRequestParts<Arc<super::ConsoleState>> for CurrentUser {
         let session_id = extract_session_id(&parts.headers, &state.config.console.session_secret)
             .ok_or_else(|| AuthError(StatusCode::UNAUTHORIZED, "no session".into()))?;
 
+        let idle_timeout_hours = state
+            .config
+            .console
+            .session_idle_timeout_hours
+            .unwrap_or(state.config.console.session_ttl_hours);
+
         let (user, expired) = state
             .db
             .with_conn(|conn| {
@@ -182,6 +208,14 @@ impl FromRequestParts<Arc<super::ConsoleState>> for CurrentUser {
                 let expires = chrono::DateTime::parse_from_rfc3339(&session.expires_at)
                     .unwrap_or_else(|_| chrono::DateTime::UNIX_EPOCH.into());
                 if now > expires {
+                    let _ = super::db::delete_session(conn, &session_id);
+                    return Ok((None, true));
+                }
+                // Idle-timeout check
+                let last_seen = chrono::DateTime::parse_from_rfc3339(&session.last_seen_at)
+                    .unwrap_or_else(|_| chrono::DateTime::UNIX_EPOCH.into());
+                let idle_cutoff = now - chrono::Duration::hours(idle_timeout_hours);
+                if last_seen < idle_cutoff {
                     let _ = super::db::delete_session(conn, &session_id);
                     return Ok((None, true));
                 }
@@ -250,6 +284,12 @@ impl FromRequestParts<Arc<super::ConsoleState>> for MutatingUser {
             .and_then(|v| v.to_str().ok())
             .and_then(decode_csrf_token);
 
+        let idle_timeout_hours = state
+            .config
+            .console
+            .session_idle_timeout_hours
+            .unwrap_or(state.config.console.session_ttl_hours);
+
         let (user, session_csrf, expired) = state
             .db
             .with_conn(|conn| {
@@ -261,6 +301,14 @@ impl FromRequestParts<Arc<super::ConsoleState>> for MutatingUser {
                 let expires = chrono::DateTime::parse_from_rfc3339(&session.expires_at)
                     .unwrap_or_else(|_| chrono::DateTime::UNIX_EPOCH.into());
                 if now > expires {
+                    let _ = super::db::delete_session(conn, &session_id);
+                    return Ok((None, None, true));
+                }
+                // Idle-timeout check
+                let last_seen = chrono::DateTime::parse_from_rfc3339(&session.last_seen_at)
+                    .unwrap_or_else(|_| chrono::DateTime::UNIX_EPOCH.into());
+                let idle_cutoff = now - chrono::Duration::hours(idle_timeout_hours);
+                if last_seen < idle_cutoff {
                     let _ = super::db::delete_session(conn, &session_id);
                     return Ok((None, None, true));
                 }
@@ -350,6 +398,28 @@ mod tests {
         assert!(decode_csrf_token("").is_some()); // empty hex decodes to empty
     }
 
+    #[test]
+    fn session_cookie_uses_samesite_strict() {
+        let sid = generate_session_id();
+        let cookie = build_session_cookie(&sid, "test-secret-at-least-32-bytes-long!!!", false);
+        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
+        assert_eq!(cookie.http_only(), Some(true));
+    }
+
+    #[test]
+    fn logout_cookie_uses_samesite_strict() {
+        let cookie = build_logout_cookie("test-secret-at-least-32-bytes-long!!!", false);
+        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
+        assert_eq!(cookie.http_only(), Some(true));
+    }
+
+    #[test]
+    fn common_password_rejects_known_weak_passwords() {
+        assert!(is_common_password("password123456"));
+        assert!(is_common_password("PASSWORD123456"));
+        assert!(!is_common_password("uncommon-horse-battery-99"));
+    }
+
     // ── MutatingUser extractor integration tests ─────────────────────────
     //
     // The extractor combines session lookup with CSRF verification. The
@@ -360,6 +430,7 @@ mod tests {
     use crate::console::db::ConsoleDb;
     use crate::console::ConsoleState;
     use axum::http::Request;
+    use rusqlite::params;
     use std::sync::{Arc, Mutex};
 
     fn test_state() -> (Arc<ConsoleState>, i64, Vec<u8>, Vec<u8>) {
@@ -513,5 +584,67 @@ session_secret = "test-secret-for-csrf-tests-zzzzz"
         MutatingUser::from_request_parts(&mut parts, &state)
             .await
             .expect("new csrf must pass after rotation");
+    }
+
+    #[tokio::test]
+    async fn current_user_rejects_idle_session() {
+        let mut config = crate::config::Config::from_file_content(
+            r#"
+[backend]
+provider = "ollama"
+endpoint = "http://localhost:11434"
+
+[console]
+session_secret = "test-secret-for-idle-tests-zzzzz"
+session_idle_timeout_hours = 1
+"#,
+        )
+        .expect("parse test config");
+        config.budget.db_path = ":memory:".to_string();
+
+        let db = crate::console::db::ConsoleDb {
+            conn: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        };
+        db.with_conn(crate::console::db::__test_migrate).unwrap();
+
+        let user_id = db
+            .with_conn(|c| {
+                crate::console::db::insert_user(c, "idle_alice", None, None, "user", None)
+            })
+            .unwrap();
+
+        let sid = generate_session_id();
+        let csrf = generate_csrf_token();
+        // Session last_seen 2 hours ago → idle
+        let old_last_seen =
+            (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO user_sessions (id, user_id, created_at, expires_at, last_seen_at, user_agent, ip, csrf_token)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![&sid, user_id, old_last_seen.clone(), expires, old_last_seen, None::<&str>, None::<&str>, &csrf],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let state = std::sync::Arc::new(crate::console::ConsoleState {
+            config,
+            db,
+            secure_cookie: false,
+            audit_log: None,
+        });
+
+        let req = Request::builder()
+            .uri("/api/me")
+            .header(axum::http::header::COOKIE, cookie_header(&state, &sid))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = CurrentUser::from_request_parts(&mut parts, &state)
+            .await
+            .expect_err("idle session must reject");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 }

@@ -54,6 +54,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
             budget_limit    INTEGER,
             oidc_sub        TEXT UNIQUE,
             password_hash   BLOB,
+            locked_until    TEXT,
             created_at      TEXT NOT NULL,
             last_login_at   TEXT
         );
@@ -89,6 +90,38 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if !has_csrf {
         conn.execute_batch("ALTER TABLE user_sessions ADD COLUMN csrf_token BLOB")?;
     }
+    // Phase 5: per-user lockout for brute-force protection.
+    let has_locked: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(users)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "locked_until" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_locked {
+        conn.execute_batch("ALTER TABLE users ADD COLUMN locked_until TEXT")?;
+    }
+    // Login attempts table for brute-force tracking.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id           INTEGER PRIMARY KEY,
+            username     TEXT NOT NULL,
+            ip           TEXT,
+            attempted_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_user_time
+            ON login_attempts(username, attempted_at);
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time
+            ON login_attempts(ip, attempted_at);
+        "#,
+    )?;
     Ok(())
 }
 
@@ -107,6 +140,7 @@ pub struct User {
     pub budget_limit: Option<i64>,
     pub oidc_sub: Option<String>,
     pub password_hash: Option<Vec<u8>>,
+    pub locked_until: Option<String>,
     pub created_at: String,
     pub last_login_at: Option<String>,
 }
@@ -115,7 +149,7 @@ pub fn user_by_id(conn: &Connection, id: i64) -> anyhow::Result<Option<User>> {
     let mut stmt = conn.prepare(
         "SELECT id, username, display_name, email, role, service_account,
                 disabled, allowed_models, budget_limit, oidc_sub, password_hash,
-                created_at, last_login_at
+                locked_until, created_at, last_login_at
          FROM users WHERE id = ?",
     )?;
     row_to_user(stmt.query_row(params![id], map_user).optional()?)
@@ -125,7 +159,7 @@ pub fn user_by_username(conn: &Connection, username: &str) -> anyhow::Result<Opt
     let mut stmt = conn.prepare(
         "SELECT id, username, display_name, email, role, service_account,
                 disabled, allowed_models, budget_limit, oidc_sub, password_hash,
-                created_at, last_login_at
+                locked_until, created_at, last_login_at
          FROM users WHERE username = ?",
     )?;
     row_to_user(stmt.query_row(params![username], map_user).optional()?)
@@ -144,8 +178,9 @@ fn map_user(row: &rusqlite::Row) -> rusqlite::Result<User> {
         budget_limit: row.get(8)?,
         oidc_sub: row.get(9)?,
         password_hash: row.get(10)?,
-        created_at: row.get(11)?,
-        last_login_at: row.get(12)?,
+        locked_until: row.get(11)?,
+        created_at: row.get(12)?,
+        last_login_at: row.get(13)?,
     })
 }
 
@@ -183,7 +218,7 @@ pub fn list_users(conn: &Connection) -> anyhow::Result<Vec<User>> {
     let mut stmt = conn.prepare(
         "SELECT id, username, display_name, email, role, service_account,
                 disabled, allowed_models, budget_limit, oidc_sub, password_hash,
-                created_at, last_login_at
+                locked_until, created_at, last_login_at
          FROM users ORDER BY created_at DESC",
     )?;
     let rows = stmt.query_map([], map_user)?;
@@ -237,6 +272,84 @@ pub fn update_user(conn: &Connection, id: i64, patch: UserUpdate<'_>) -> anyhow:
         )?;
     }
     Ok(total)
+}
+
+// ── Brute-force protection ─────────────────────────────────────────────────
+
+/// Record a failed login attempt.
+pub fn record_login_attempt(
+    conn: &Connection,
+    username: &str,
+    ip: Option<&str>,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO login_attempts (username, ip, attempted_at) VALUES (?, ?, ?)",
+        params![username, ip, now],
+    )?;
+    Ok(())
+}
+
+/// Count failed login attempts for a username within the last N minutes.
+pub fn count_recent_login_attempts(
+    conn: &Connection,
+    username: &str,
+    window_minutes: i64,
+) -> anyhow::Result<i64> {
+    let since = chrono::Utc::now() - chrono::Duration::minutes(window_minutes);
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM login_attempts WHERE username = ? AND attempted_at > ?",
+        params![username, since.to_rfc3339()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Count failed login attempts from an IP within the last N minutes.
+pub fn count_recent_login_attempts_by_ip(
+    conn: &Connection,
+    ip: &str,
+    window_minutes: i64,
+) -> anyhow::Result<i64> {
+    let since = chrono::Utc::now() - chrono::Duration::minutes(window_minutes);
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM login_attempts WHERE ip = ? AND attempted_at > ?",
+        params![ip, since.to_rfc3339()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Clear old login attempts for a username (e.g. after successful login).
+pub fn clear_login_attempts(conn: &Connection, username: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM login_attempts WHERE username = ?",
+        params![username],
+    )?;
+    Ok(())
+}
+
+/// Prune login-attempt rows older than the given window.
+pub fn prune_old_login_attempts(conn: &Connection, window_minutes: i64) -> anyhow::Result<usize> {
+    let since = chrono::Utc::now() - chrono::Duration::minutes(window_minutes);
+    let n = conn.execute(
+        "DELETE FROM login_attempts WHERE attempted_at < ?",
+        params![since.to_rfc3339()],
+    )?;
+    Ok(n)
+}
+
+/// Set the lockout expiry for a user.
+pub fn set_locked_until(
+    conn: &Connection,
+    user_id: i64,
+    until: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE users SET locked_until = ? WHERE id = ?",
+        params![until, user_id],
+    )?;
+    Ok(())
 }
 
 pub fn set_password_hash(conn: &Connection, id: i64, hash: &[u8]) -> anyhow::Result<()> {
@@ -338,6 +451,19 @@ pub fn prune_expired_sessions(conn: &Connection) -> anyhow::Result<usize> {
     let n = conn.execute(
         "DELETE FROM user_sessions WHERE expires_at < ?",
         params![now],
+    )?;
+    Ok(n)
+}
+
+/// Prune sessions whose last_seen_at is older than the idle threshold.
+pub fn prune_idle_sessions(
+    conn: &Connection,
+    idle_timeout_hours: i64,
+) -> anyhow::Result<usize> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(idle_timeout_hours);
+    let n = conn.execute(
+        "DELETE FROM user_sessions WHERE last_seen_at < ?",
+        params![cutoff.to_rfc3339()],
     )?;
     Ok(n)
 }

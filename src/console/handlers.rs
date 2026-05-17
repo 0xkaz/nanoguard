@@ -138,6 +138,7 @@ pub struct UserResponse {
     pub disabled: bool,
     pub allowed_models: String,
     pub budget_limit: Option<i64>,
+    pub locked_until: Option<String>,
     pub created_at: String,
     pub last_login_at: Option<String>,
 }
@@ -154,6 +155,7 @@ impl From<User> for UserResponse {
             disabled: u.disabled,
             allowed_models: u.allowed_models,
             budget_limit: u.budget_limit,
+            locked_until: u.locked_until,
             created_at: u.created_at,
             last_login_at: u.last_login_at,
         }
@@ -228,6 +230,11 @@ pub async fn api_login(
             .into_response();
     }
 
+    let ip = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok());
+
     let user = match state
         .db
         .with_conn(|conn| db::user_by_username(conn, &body.username))
@@ -244,12 +251,31 @@ pub async fn api_login(
     };
 
     let Some(user) = user else {
+        // Record failed attempt even when user does not exist (username enumeration
+        // defense: always return the same error and timing).
+        let _ = state.db.with_conn(|conn| {
+            db::record_login_attempt(conn, &body.username, ip)
+        });
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
         )
             .into_response();
     };
+
+    // Check lockout
+    if let Some(ref locked_until) = user.locked_until {
+        let locked = chrono::DateTime::parse_from_rfc3339(locked_until)
+            .map(|dt| chrono::Utc::now() < dt)
+            .unwrap_or(false);
+        if locked {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "account locked"})),
+            )
+                .into_response();
+        }
+    }
 
     if user.disabled {
         return (
@@ -260,6 +286,7 @@ pub async fn api_login(
     }
 
     let Some(ref hash) = user.password_hash else {
+        let _ = state.db.with_conn(|conn| db::record_login_attempt(conn, &user.username, ip));
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
@@ -268,12 +295,69 @@ pub async fn api_login(
     };
 
     if !verify_password(&body.password, hash) {
+        let _ = state.db.with_conn(|conn| {
+            db::record_login_attempt(conn, &user.username, ip)
+        });
+        // Check if we should lock the account
+        let max_attempts = state.config.console.max_login_attempts;
+        let lockout_minutes = state.config.console.lockout_duration_minutes;
+        let should_lock = state
+            .db
+            .with_conn(|conn| {
+                let count = db::count_recent_login_attempts(conn, &user.username, lockout_minutes)?;
+                Ok(count >= max_attempts)
+            })
+            .unwrap_or(false);
+        if should_lock {
+            let until = (chrono::Utc::now() + chrono::Duration::minutes(lockout_minutes))
+                .to_rfc3339();
+            let _ = state
+                .db
+                .with_conn(|conn| db::set_locked_until(conn, user.id, Some(&until)));
+            tracing::warn!(
+                "login: account {} locked until {} after {} failed attempts",
+                user.username,
+                until,
+                max_attempts
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "account locked"})),
+            )
+                .into_response();
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
         )
             .into_response();
     }
+
+    // Rate-limit per IP
+    let max_attempts = state.config.console.max_login_attempts;
+    let lockout_minutes = state.config.console.lockout_duration_minutes;
+    if let Some(ip_str) = ip {
+        let ip_count = state
+            .db
+            .with_conn(|conn| db::count_recent_login_attempts_by_ip(conn, ip_str, lockout_minutes))
+            .unwrap_or(0);
+        if ip_count >= max_attempts {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "too many requests from this IP"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Clear failed login attempts on success.
+    let _ = state
+        .db
+        .with_conn(|conn| db::clear_login_attempts(conn, &user.username));
+    // Also clear any stale lockout.
+    let _ = state
+        .db
+        .with_conn(|conn| db::set_locked_until(conn, user.id, None));
 
     if let Err(e) = state
         .db
@@ -287,10 +371,6 @@ pub async fn api_login(
     let ttl_hours = state.config.console.session_ttl_hours;
     let expires = chrono::Utc::now() + chrono::Duration::hours(ttl_hours);
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok());
 
     if let Err(e) = state.db.with_conn(|conn| {
         db::create_session(
@@ -865,6 +945,13 @@ pub async fn api_create_user(
         )
             .into_response();
     }
+    if super::auth::is_common_password(&body.password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "password is too common"})),
+        )
+            .into_response();
+    }
 
     let hash = match super::auth::hash_password(&body.password) {
         Ok(h) => h,
@@ -970,6 +1057,20 @@ pub async fn api_update_user(
         )
     }) {
         Ok(n) => {
+            // If role changed, invalidate the target user's sessions (session
+            // rotation on privilege escalation).
+            let role_changed = match (&body.role, &before_user) {
+                (Some(new), Some(b)) => new != &b.role,
+                _ => false,
+            };
+            if role_changed {
+                if let Some(ref target) = before_user {
+                    let _ = state
+                        .db
+                        .with_conn(|conn| db::delete_user_sessions(conn, target.id));
+                }
+            }
+
             if let Some(ref log) = state.audit_log {
                 let target_name = before_user
                     .as_ref()
@@ -980,10 +1081,6 @@ pub async fn api_update_user(
                 // operator filtering by `action=user_role_change` can find
                 // every privilege escalation/de-escalation without scanning
                 // every user_update.
-                let role_changed = match (&body.role, &before_user) {
-                    (Some(new), Some(b)) => new != &b.role,
-                    _ => false,
-                };
                 if role_changed {
                     log.record_mutation(
                         &MutationRecord::new(
