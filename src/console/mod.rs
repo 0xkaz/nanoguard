@@ -244,6 +244,14 @@ pub async fn run(
         .route("/api/budget/limit", post(handlers::api_set_budget_limit))
         .route("/api/budget/reset", post(handlers::api_reset_budget_usage))
         .route(
+            "/api/playground/proxy",
+            post(handlers::api_playground_proxy),
+        )
+        .route(
+            "/api/playground/backend",
+            post(handlers::api_playground_backend),
+        )
+        .route(
             "/api/backends",
             get(handlers::api_list_backends).post(handlers::api_create_backend),
         )

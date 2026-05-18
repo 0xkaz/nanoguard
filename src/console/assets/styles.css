@@ -219,3 +219,27 @@ li.guard.on .dot  { background: #4ade80; }
 li.guard.off .dot { background: #475569; }
 li.guard .name { color: #e2e8f0; }
 li.guard .summary { color: #94a3b8; font-size: .85rem; }
+
+/* Playground: enforce a side-by-side comparison no matter how
+   narrow the viewport gets, so the operator can read both panes
+   without scrolling. Below 720px we let the existing auto-fill
+   take over. */
+.grid.playground-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (max-width: 720px) {
+  .grid.playground-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.grid.playground-grid pre {
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  font-size: .8rem;
+  background: #0f172a;
+  padding: .6rem;
+  border-radius: 4px;
+}
