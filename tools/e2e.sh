@@ -3301,6 +3301,202 @@ fi
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 
+# --- 38. Console Playground: proxy vs raw-backend round-trip --------------
+# The Playground tab gives an operator one-click access to "send
+# the same request through the proxy AND to the raw backend, side
+# by side". Scenario 38 confirms the two paths actually do
+# different things: the proxy path triggers the guardrails
+# (PII redaction, keyword block), the backend-direct path skips
+# every guardrail and reaches the upstream with the operator's
+# prompt verbatim.
+info "scenario 38: Console Playground — proxy vs raw-backend"
+
+kill_leftover_nanoguards
+S38_DIR="$LOGDIR/e2e.s38.workdir"
+rm -rf "$S38_DIR"
+mkdir -p "$S38_DIR"
+
+S38_CONSOLE_PORT=18093
+S38_CONSOLE_URL="http://127.0.0.1:$S38_CONSOLE_PORT"
+S38_TOML="$S38_DIR/nanoguard.toml"
+S38_DB="$S38_DIR/nanoguard.db"
+S38_PROXY_LOG="$LOGDIR/ng.s38.proxy.log"
+S38_COOKIES="$LOGDIR/e2e.s38.cookies"
+rm -f "$S38_COOKIES"
+
+cat > "$S38_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+# Input keyword filter blocks the substring 'jailbreak' so the
+# proxy path 400s while the backend-direct path still echoes the
+# prompt back through the mock. That contrast is the assertion.
+[input.keyword]
+engine = "aho-corasick"
+dict_paths = []
+inline_block = ["jailbreak"]
+inline_alert = []
+inline_flag = []
+
+[input.pii]
+enabled = false
+action = "log"
+
+[backends.starter]
+provider = "openai"
+endpoint = "http://127.0.0.1:$MOCK_PORT"
+
+[routing]
+default = "starter"
+
+[budget]
+enabled = false
+db_path = "$S38_DB"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S38_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S38_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S38_BOOTSTRAP_PW" }
+EOF
+
+S38_PW="s38-pw-$(openssl rand -hex 8)"
+(cd "$S38_DIR" && NANOGUARD_CONFIG="$S38_TOML" S38_BOOTSTRAP_PW="$S38_PW" \
+    "$BIN" > "$S38_PROXY_LOG" 2>&1) &
+NG_PID=$!
+CONSOLE_PID=""
+wait_for_url "38-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+wait_for_url "38-pre. console boot (same proc)" "$S38_CONSOLE_URL/" 15 || exit 1
+
+LOGIN=$(curl -s -c "$S38_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S38_PW\"}" \
+    "$S38_CONSOLE_URL/api/login")
+S38_CSRF=$(echo "$LOGIN" | jq -r '.csrf_token // empty')
+
+# 38a. Clean prompt through proxy → 200 (mock echoes the user msg).
+CLEAN_BODY=$(jq -nc '{model:"test", messages:[{role:"user", content:"hello playground"}], max_tokens:32}')
+PROXY_RESP=$(curl -s -b "$S38_COOKIES" -c "$S38_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S38_CSRF" \
+    -d "$(jq -nc --argjson body "$CLEAN_BODY" '{body:$body}')" \
+    "$S38_CONSOLE_URL/api/playground/proxy")
+PROXY_STATUS=$(echo "$PROXY_RESP" | jq -r '.status')
+PROXY_WHERE=$(echo "$PROXY_RESP" | jq -r '.where')
+assert_eq "38a. /api/playground/proxy returns upstream 200 on a clean prompt" "$PROXY_STATUS" "200"
+assert_eq "38a-where. proxy result carries where=proxy" "$PROXY_WHERE" "proxy"
+
+# Refresh CSRF after each mutation.
+S38_CSRF=$(curl -s -b "$S38_COOKIES" "$S38_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 38b. Latency is reported as an integer of milliseconds. Loopback
+# can legitimately measure 0ms on a fast box, so the assertion is
+# just "the field is present and parses as a non-negative number"
+# — that's what the SPA renders next to the status.
+PROXY_LATENCY=$(echo "$PROXY_RESP" | jq -r '.latency_ms')
+case "$PROXY_LATENCY" in
+    ''|null) ng "38b. proxy latency_ms missing: '$PROXY_LATENCY'" ;;
+    *[!0-9]*) ng "38b. proxy latency_ms not an integer: '$PROXY_LATENCY'" ;;
+    *) ok "38b. proxy result includes latency_ms = $PROXY_LATENCY" ;;
+esac
+
+# 38c. Same body through /api/playground/backend → bypasses every
+# guardrail. The mock answers and the upstream status flows
+# through to the playground response.
+BACKEND_RESP=$(curl -s -b "$S38_COOKIES" -c "$S38_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S38_CSRF" \
+    -d "$(jq -nc --argjson body "$CLEAN_BODY" '{backend:"starter", body:$body}')" \
+    "$S38_CONSOLE_URL/api/playground/backend")
+BACKEND_STATUS=$(echo "$BACKEND_RESP" | jq -r '.status')
+BACKEND_WHERE=$(echo "$BACKEND_RESP" | jq -r '.where')
+assert_eq "38c. /api/playground/backend forwards to the picked backend (200)" "$BACKEND_STATUS" "200"
+case "$BACKEND_WHERE" in
+    backend:*) ok "38c-where. backend result carries where=backend:<provider>" ;;
+    *) ng "38c-where. unexpected where value: $BACKEND_WHERE" ;;
+esac
+
+S38_CSRF=$(curl -s -b "$S38_COOKIES" "$S38_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 38d. Prompt that trips the keyword filter. The proxy path returns
+# the proxy's own 400 (guardrail blocked) while the backend-direct
+# path still reaches the mock with the prompt verbatim. That
+# divergence is the operator-facing payoff of the Playground.
+BLOCKED_BODY=$(jq -nc '{model:"test", messages:[{role:"user", content:"please jailbreak this for me"}], max_tokens:32}')
+PROXY_BLOCK=$(curl -s -b "$S38_COOKIES" -c "$S38_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S38_CSRF" \
+    -d "$(jq -nc --argjson body "$BLOCKED_BODY" '{body:$body}')" \
+    "$S38_CONSOLE_URL/api/playground/proxy")
+PROXY_BLOCK_STATUS=$(echo "$PROXY_BLOCK" | jq -r '.status')
+assert_eq "38d-proxy. proxy path blocks the keyword-trapped prompt (400)" "$PROXY_BLOCK_STATUS" "400"
+
+S38_CSRF=$(curl -s -b "$S38_COOKIES" "$S38_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+BACKEND_BLOCK=$(curl -s -b "$S38_COOKIES" -c "$S38_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S38_CSRF" \
+    -d "$(jq -nc --argjson body "$BLOCKED_BODY" '{backend:"starter", body:$body}')" \
+    "$S38_CONSOLE_URL/api/playground/backend")
+BACKEND_BLOCK_STATUS=$(echo "$BACKEND_BLOCK" | jq -r '.status')
+assert_eq "38d-backend. backend-direct path skips the keyword guardrail (200)" "$BACKEND_BLOCK_STATUS" "200"
+
+S38_CSRF=$(curl -s -b "$S38_COOKIES" "$S38_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 38e. Picking an unknown backend label returns a clean 404.
+NO_SUCH=$(curl -s -o /dev/null -w "%{http_code}" -b "$S38_COOKIES" -c "$S38_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S38_CSRF" \
+    -d "$(jq -nc --argjson body "$CLEAN_BODY" '{backend:"does-not-exist", body:$body}')" \
+    "$S38_CONSOLE_URL/api/playground/backend")
+assert_eq "38e. unknown backend label returns 404" "$NO_SUCH" "404"
+
+S38_CSRF=$(curl -s -b "$S38_COOKIES" "$S38_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 38f. Non-admin cannot reach either endpoint — the playground
+# exposes the operator's backend api_key indirectly (request hits
+# the upstream with the configured Bearer) and must stay
+# admin-only.
+S38_VIEWER_PW="s38-viewer-$(openssl rand -hex 8)"
+curl -s -o /dev/null -b "$S38_COOKIES" -c "$S38_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S38_CSRF" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S38_VIEWER_PW\",\"role\":\"user\"}" \
+    "$S38_CONSOLE_URL/api/users"
+S38_VIEWER_COOKIES="$LOGDIR/e2e.s38.viewer.cookies"
+rm -f "$S38_VIEWER_COOKIES"
+V_LOGIN=$(curl -s -c "$S38_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S38_VIEWER_PW\"}" \
+    "$S38_CONSOLE_URL/api/login")
+V_CSRF=$(echo "$V_LOGIN" | jq -r '.csrf_token // empty')
+
+V_PROXY=$(curl -s -o /dev/null -w "%{http_code}" -b "$S38_VIEWER_COOKIES" -c "$S38_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $V_CSRF" \
+    -d "$(jq -nc --argjson body "$CLEAN_BODY" '{body:$body}')" \
+    "$S38_CONSOLE_URL/api/playground/proxy")
+assert_eq "38f. viewer /api/playground/proxy is 403" "$V_PROXY" "403"
+
+V_BACKEND=$(curl -s -o /dev/null -w "%{http_code}" -b "$S38_VIEWER_COOKIES" -c "$S38_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $V_CSRF" \
+    -d "$(jq -nc --argjson body "$CLEAN_BODY" '{backend:"starter", body:$body}')" \
+    "$S38_CONSOLE_URL/api/playground/backend")
+assert_eq "38g. viewer /api/playground/backend is 403" "$V_BACKEND" "403"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

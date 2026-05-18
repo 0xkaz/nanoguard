@@ -49,7 +49,7 @@ async function api(path, opts = {}) {
 // ── Navigation ──────────────────────────────────────────────
 
 const TABS = ['overview', 'tokens', 'budget', 'audit', 'config'];
-const ADMIN_TABS = ['users', 'backends'];
+const ADMIN_TABS = ['users', 'backends', 'playground'];
 
 function renderNav() {
   const nav = $('#nav');
@@ -72,6 +72,7 @@ function switchTab(name) {
   if (name === 'config') loadConfig();
   if (name === 'users') loadUsers();
   if (name === 'backends') loadBackends();
+  if (name === 'playground') loadPlayground();
 }
 
 // ── Auth ────────────────────────────────────────────────────
@@ -756,6 +757,167 @@ function openBackendEditor(existing) {
       alert(err.message);
     }
   })();
+}
+
+// ── Playground (admin only) ─────────────────────────────────
+//
+// Two-pane debugger: same chat-completions request goes (left)
+// through the proxy with the full guardrail pipeline and (right)
+// directly to a picked backend. Lets the operator answer
+// "is nanoguard blocking this, or is the backend returning
+// garbage?" in two clicks instead of two terminals.
+
+const PLAYGROUND_DEFAULT_BODY = JSON.stringify(
+  {
+    model: '',
+    messages: [{ role: 'user', content: 'Say hello.' }],
+    max_tokens: 64,
+  },
+  null,
+  2,
+);
+
+async function loadPlayground() {
+  const root = $('#playground-body');
+  if (!root) return;
+
+  let backendOptions = '';
+  let defaultModel = '';
+  try {
+    const ov = await api('/api/overview');
+    const list = (ov.backends || [])
+      .map(b => `<option value="${esc(b.name)}">${esc(b.name)} — ${esc(b.provider)}</option>`)
+      .join('');
+    backendOptions = list || '<option value="">(no backends configured)</option>';
+    defaultModel = ov.backend?.model || '';
+  } catch (err) {
+    root.innerHTML = `<p class="error">Could not load /api/overview: ${esc(err.message)}</p>`;
+    return;
+  }
+
+  const initialBody = defaultModel
+    ? PLAYGROUND_DEFAULT_BODY.replace('"model": ""', `"model": "${defaultModel}"`)
+    : PLAYGROUND_DEFAULT_BODY;
+
+  root.innerHTML = `
+    <p class="hint subtle">Send the same chat-completions request through the proxy
+    (guardrails on) and directly to a backend (guardrails off) so you can tell which
+    side a behaviour is coming from. The request body is sent verbatim; pick a backend
+    only for the "direct" call. The body of each call is audit-logged but its
+    contents are not stored, so prompts you paste here stay on the wire.</p>
+    <div class="field">
+      <label for="playground-body-input">Request body (OpenAI chat-completions JSON)</label>
+      <textarea id="playground-body-input" rows="10">${esc(initialBody)}</textarea>
+    </div>
+    <div class="field">
+      <label for="playground-bearer">Bearer token (proxy direction only, when <code>[auth].enabled</code>)</label>
+      <input type="text" id="playground-bearer" placeholder="ng_t_..." />
+    </div>
+    <div class="field">
+      <label for="playground-backend-select">Backend (direct direction)</label>
+      <select id="playground-backend-select">${backendOptions}</select>
+    </div>
+    <div class="actions">
+      <button id="playground-send-proxy" class="btn primary">Send through proxy</button>
+      <button id="playground-send-backend" class="btn">Send direct to backend</button>
+    </div>
+    <div class="grid playground-grid">
+      <div class="card">
+        <h3>Through proxy <span id="playground-proxy-status" class="hint subtle"></span></h3>
+        <pre id="playground-proxy-output"><code class="hint subtle">No call yet.</code></pre>
+      </div>
+      <div class="card">
+        <h3>Direct to backend <span id="playground-backend-status" class="hint subtle"></span></h3>
+        <pre id="playground-backend-output"><code class="hint subtle">No call yet.</code></pre>
+      </div>
+    </div>
+  `;
+
+  $('#playground-send-proxy').addEventListener('click', () =>
+    sendPlayground('proxy'),
+  );
+  $('#playground-send-backend').addEventListener('click', () =>
+    sendPlayground('backend'),
+  );
+}
+
+async function sendPlayground(direction) {
+  const raw = $('#playground-body-input').value;
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch (err) {
+    alert(`Request body is not valid JSON: ${err.message}`);
+    return;
+  }
+
+  const statusEl =
+    direction === 'proxy'
+      ? $('#playground-proxy-status')
+      : $('#playground-backend-status');
+  const outEl =
+    direction === 'proxy'
+      ? $('#playground-proxy-output')
+      : $('#playground-backend-output');
+
+  statusEl.textContent = 'sending…';
+  outEl.innerHTML = '<code class="hint subtle">…</code>';
+
+  try {
+    let payload;
+    if (direction === 'proxy') {
+      const bearer = $('#playground-bearer').value.trim();
+      const req = bearer ? { body, bearer } : { body };
+      payload = await api('/api/playground/proxy', {
+        method: 'POST',
+        body: JSON.stringify(req),
+      });
+    } else {
+      const backendName = $('#playground-backend-select').value;
+      if (!backendName) {
+        alert('No backend selected. Configure one under the Backends tab first.');
+        statusEl.textContent = '';
+        return;
+      }
+      payload = await api('/api/playground/backend', {
+        method: 'POST',
+        body: JSON.stringify({ backend: backendName, body }),
+      });
+    }
+    renderPlaygroundResult(direction, payload);
+  } catch (err) {
+    statusEl.textContent = 'failed';
+    outEl.innerHTML = `<code class="error">${esc(err.message)}</code>`;
+  }
+}
+
+function renderPlaygroundResult(direction, payload) {
+  const statusEl =
+    direction === 'proxy'
+      ? $('#playground-proxy-status')
+      : $('#playground-backend-status');
+  const outEl =
+    direction === 'proxy'
+      ? $('#playground-proxy-output')
+      : $('#playground-backend-output');
+
+  const statusClass =
+    payload.status >= 200 && payload.status < 300
+      ? 'ok'
+      : payload.status === 0
+        ? 'warn'
+        : 'warn';
+  const statusText =
+    payload.status === 0
+      ? `transport error (${payload.latency_ms} ms)`
+      : `${payload.status} · ${payload.latency_ms} ms`;
+  statusEl.className = `hint ${statusClass}`;
+  statusEl.textContent = statusText;
+
+  const pretty = payload.error
+    ? payload.error
+    : JSON.stringify(payload.body, null, 2);
+  outEl.innerHTML = `<code>${esc(pretty)}</code>`;
 }
 
 // ── Utilities ───────────────────────────────────────────────

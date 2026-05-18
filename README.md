@@ -532,6 +532,10 @@ Browse to `http://127.0.0.1:8081/` and log in as the bootstrap admin.
 
 The proxy and the console are independent processes; you can run the console without the proxy and vice versa. They share `[budget].db_path` (default `nanoguard.db`), so run both from the same working directory.
 
+### 3a. Playground tab (admin only)
+
+The **Playground** tab is a two-pane debugging surface that answers the recurring question "is nanoguard blocking this, or is my backend returning garbage?" — paste an OpenAI chat-completions request body, pick a backend from the dropdown, then click either "Send through proxy" (full guardrail pipeline) or "Send direct to backend" (raw upstream, no guardrails) and read both responses side by side. Status and round-trip latency render next to the response body so you can see whether the call actually round-tripped. The proxy-direction call optionally takes a Bearer token field for testing `[auth].enabled = true` setups; the backend-direction call pulls `api_key` from the live `[backends.*]` config — admins cannot exfiltrate keys through this endpoint. Every Playground call is audited under `playground_proxy` / `playground_backend` in `console-audit.jsonl`, but the **request body is deliberately not logged** because operators routinely paste secrets while testing redaction.
+
 ### 4. Point your app at the proxy
 
 The Overview tab in the Console renders a **Getting Started** panel with the live proxy URL, a working curl example, and the OpenAI SDK env-var form. The same information assembled by hand:

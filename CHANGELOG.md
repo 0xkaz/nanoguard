@@ -4,6 +4,14 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — Console Playground tab: query proxy and raw backend side by side
+
+New admin-only **Playground** tab in the Web Configuration UI: paste an OpenAI chat-completions request body, pick a backend from the dropdown, and click either "Send through proxy" (= full guardrail pipeline via `http://<listen>/v1/chat/completions`) or "Send direct to backend" (= `<backend.endpoint>/v1/chat/completions` with no guardrails). Both responses render side by side with their upstream HTTP status and round-trip latency, so an operator can compare "what guardrails did" against "what the backend would have answered". Two new endpoints back the tab: `POST /api/playground/proxy` and `POST /api/playground/backend`. Both are admin-only, both rotate CSRF on every call, and the backend-direction call reads `api_key` from the live `[backends.*]` config rather than trusting the caller — admins cannot exfiltrate keys or aim the call at an arbitrary URL through the playground.
+
+Playground calls are audited under `playground_proxy` / `playground_backend` / `playground_error` in `console-audit.jsonl` with `target = proxy | backend:<provider>`. The **request body is intentionally not logged** because operators routinely paste secrets while testing redaction; the audit trail captures who ran the call, not the prompt.
+
+**e2e** — scenario 38 covers the new endpoints with 10 assertions: clean prompt forwards 200 through proxy and through the backend-direct call, the response carries a `where` discriminator (`proxy` / `backend:<provider>`) and a `latency_ms` integer, a keyword-trapped prompt is 400 on the proxy path but still 200 on the backend-direct path (the divergence is the whole point of the tab), an unknown backend label returns 404, and a non-admin viewer is 403 on both endpoints. Total `tools/e2e.sh` assertions: 186 (was 169 after PR #43).
+
 ### Changed — single-process boot; `nanoguard-console` binary retired
 
 The `nanoguard` binary now spawns the Web Configuration UI listener inline when `[console].enabled = true` (the new default). A first-time operator types `make run` and gets both the proxy on `:8080` and the console on `:8081` from a single command. Set `[console].enabled = false` in `nanoguard.toml` for headless deployments where the management UI is undesired.

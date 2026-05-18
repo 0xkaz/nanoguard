@@ -1585,6 +1585,325 @@ fn reload_outcome_json(reload: &super::reload::ReloadOutcome) -> serde_json::Val
     })
 }
 
+// ── API: Playground (admin only) — query proxy vs raw backend ─────────────
+//
+// Two-pane debugging surface: an operator pastes a chat-completions
+// request, picks "through proxy" or "direct to backend", and gets
+// the upstream response back in JSON so they can answer the
+// recurring question "is this nanoguard blocking the request, or is
+// the backend returning garbage?" The two endpoints share a
+// `PlaygroundResponse` shape (status / latency / body / where), so
+// the SPA can render the result of either call into the same panel.
+//
+// Why this lives in the console, not in the proxy itself:
+//   - The proxy never exposes a mutation HTTP surface; the
+//     playground reads operator config (api_key for the chosen
+//     backend) and is admin-authenticated.
+//   - The proxy-direction call goes back through nanoguard's own
+//     /v1/chat/completions, which means the full guardrail
+//     pipeline runs. That is the whole point — we want to see
+//     what the guardrails do.
+//   - The backend-direction call bypasses the proxy by design,
+//     using the backend's `endpoint` + `api_key` from `[backends.*]`
+//     verbatim. No guardrails, raw upstream behavior.
+
+#[derive(Deserialize)]
+pub struct PlaygroundProxyRequest {
+    /// The full OpenAI-shape chat-completions body. We forward it
+    /// verbatim; the operator owns its content (model, messages,
+    /// max_tokens, etc).
+    pub body: JsonValue,
+    /// Optional Bearer token to attach when [auth].enabled. When
+    /// omitted, no Authorization header goes on the wire — useful
+    /// for the operator to test "what happens without a token".
+    #[serde(default)]
+    pub bearer: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PlaygroundBackendRequest {
+    /// Backend label from [backends.*]. The handler reads the
+    /// `endpoint` + `api_key` from the live config (NOT from the
+    /// caller) so an admin cannot exfiltrate a backend's api_key
+    /// or aim the proxy at an arbitrary URL through this endpoint.
+    pub backend: String,
+    /// Full chat-completions body, forwarded as-is to
+    /// `<endpoint>/v1/chat/completions`.
+    pub body: JsonValue,
+}
+
+#[derive(Serialize)]
+struct PlaygroundResponse {
+    /// "proxy" | "backend:<label>" — surfaces in the SPA so the
+    /// caller knows which pane to render the result into. Renamed
+    /// from the reserved `where` so the field stays idiomatic JSON.
+    #[serde(rename = "where")]
+    where_: String,
+    /// HTTP status code from the upstream call. 0 when the request
+    /// never completed (connect error, timeout); see `error`.
+    status: u16,
+    latency_ms: u128,
+    /// Parsed JSON when the upstream returned a JSON body, raw
+    /// string otherwise. Most LLM backends respond JSON; non-JSON
+    /// almost always means "auth required" / HTML error page.
+    body: JsonValue,
+    /// `Some(_)` when the call itself failed (DNS, connect, timeout).
+    /// Status 0 always pairs with `Some(_)`. Status >= 100 always
+    /// pairs with `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// `POST /api/playground/proxy` — send a chat-completions request
+/// through the local proxy (= full guardrail pipeline). Admin-only.
+pub async fn api_playground_proxy(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Json(req): Json<PlaygroundProxyRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+    let listen = &state.config.nanoguard.listen;
+    let host_port = normalize_listen(listen);
+    let url = format!("http://{host_port}/v1/chat/completions");
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return playground_error_response(&state, &admin, "proxy", &session_id, e.to_string());
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    let mut builder = client.post(&url).json(&req.body);
+    if let Some(ref token) = req.bearer {
+        builder = builder.bearer_auth(token);
+    }
+    let result = builder.send().await;
+    let elapsed = t0.elapsed().as_millis();
+
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return playground_error_response_with_latency(
+                &state,
+                &admin,
+                "proxy",
+                &session_id,
+                elapsed,
+                e.to_string(),
+            );
+        }
+    };
+    let status = resp.status().as_u16();
+    let body = read_body_as_json(resp).await;
+
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    record_playground_mutation(&state, &admin, "playground_proxy", "proxy");
+    let payload = PlaygroundResponse {
+        where_: "proxy".to_string(),
+        status,
+        latency_ms: elapsed,
+        body,
+        error: None,
+    };
+    (StatusCode::OK, headers, Json(payload)).into_response()
+}
+
+/// `POST /api/playground/backend` — send the same request directly
+/// to a specific backend, bypassing the proxy and all guardrails.
+/// The operator picks the backend label; api_key is pulled from
+/// the live config (not the caller).
+pub async fn api_playground_backend(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Json(req): Json<PlaygroundBackendRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let cfg = match fresh_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("re-parse failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let backend = match cfg.backends.get(&req.backend) {
+        Some(b) => b,
+        None => {
+            // Maybe the operator is on the legacy single-`[backend]`
+            // schema; surface that as "default" so it appears in
+            // the dropdown like everything else.
+            if req.backend == "default" {
+                if let Some(b) = cfg.backend.as_ref() {
+                    return playground_send_backend(&state, &admin, &session_id, b, &req.body)
+                        .await;
+                }
+            }
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("backend `{}` not configured", req.backend)})),
+            )
+                .into_response();
+        }
+    };
+    playground_send_backend(&state, &admin, &session_id, backend, &req.body).await
+}
+
+async fn playground_send_backend(
+    state: &Arc<ConsoleState>,
+    admin: &crate::console::db::User,
+    session_id: &[u8],
+    backend: &crate::config::BackendConfig,
+    body: &JsonValue,
+) -> Response {
+    let url = format!(
+        "{}/v1/chat/completions",
+        backend.endpoint.trim_end_matches('/')
+    );
+    let label = format!("backend:{}", backend.provider);
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return playground_error_response(state, admin, &label, session_id, e.to_string());
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    let mut builder = client.post(&url).json(body);
+    if let Some(ref k) = backend.api_key {
+        builder = builder.bearer_auth(k);
+    }
+    let result = builder.send().await;
+    let elapsed = t0.elapsed().as_millis();
+
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return playground_error_response_with_latency(
+                state,
+                admin,
+                &label,
+                session_id,
+                elapsed,
+                e.to_string(),
+            );
+        }
+    };
+    let status = resp.status().as_u16();
+    let body_json = read_body_as_json(resp).await;
+
+    let next_csrf = rotate_csrf(state, session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    record_playground_mutation(state, admin, "playground_backend", &label);
+    let payload = PlaygroundResponse {
+        where_: label,
+        status,
+        latency_ms: elapsed,
+        body: body_json,
+        error: None,
+    };
+    (StatusCode::OK, headers, Json(payload)).into_response()
+}
+
+fn playground_error_response(
+    state: &Arc<ConsoleState>,
+    admin: &crate::console::db::User,
+    where_: &str,
+    session_id: &[u8],
+    err: String,
+) -> Response {
+    playground_error_response_with_latency(state, admin, where_, session_id, 0, err)
+}
+
+fn playground_error_response_with_latency(
+    state: &Arc<ConsoleState>,
+    admin: &crate::console::db::User,
+    where_: &str,
+    session_id: &[u8],
+    latency_ms: u128,
+    err: String,
+) -> Response {
+    let next_csrf = rotate_csrf(state, session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    record_playground_mutation(state, admin, "playground_error", where_);
+    let payload = PlaygroundResponse {
+        where_: where_.to_string(),
+        status: 0,
+        latency_ms,
+        body: JsonValue::Null,
+        error: Some(err),
+    };
+    (StatusCode::OK, headers, Json(payload)).into_response()
+}
+
+async fn read_body_as_json(resp: reqwest::Response) -> JsonValue {
+    // Try JSON first (most successful LLM responses), fall back to
+    // a string so HTML/text errors aren't lost. Either way, the SPA
+    // gets a single typed slot to render.
+    let text = resp.text().await.unwrap_or_default();
+    serde_json::from_str(&text).unwrap_or(JsonValue::String(text))
+}
+
+fn record_playground_mutation(
+    state: &Arc<ConsoleState>,
+    admin: &crate::console::db::User,
+    action: &str,
+    where_: &str,
+) {
+    // Playground requests are HTTP mutations from the operator and
+    // can carry sensitive content; audit them so an organisation
+    // can see who used this surface. We log the action + the
+    // target (proxy / backend:<provider>) but never the body — the
+    // body is the operator's prompt and could include secrets they
+    // pasted in to test redaction.
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &admin.username,
+                admin.id,
+                action,
+                format!("{} ran playground request via {}", admin.username, where_),
+            )
+            .with_target(where_.to_string()),
+        );
+    }
+}
+
+/// Normalize a listen address (e.g. "0.0.0.0:8080") to something a
+/// loopback HTTP client can dial ("localhost:8080"). Same logic as
+/// `api_overview`'s `proxy_url` resolution; duplicating it here so
+/// playground stays self-contained.
+fn normalize_listen(listen: &str) -> String {
+    if let Some(port) = listen.strip_prefix("0.0.0.0:") {
+        format!("localhost:{port}")
+    } else if let Some(port) = listen.strip_prefix("[::]:") {
+        format!("localhost:{port}")
+    } else {
+        listen.to_string()
+    }
+}
+
 // ── API: Overview / getting-started summary ────────────────────────────────
 
 /// `GET /api/overview` — a single read-only snapshot the SPA needs to
