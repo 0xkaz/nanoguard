@@ -191,8 +191,8 @@ callers get 401.
 
 ### ClientView
 
-The in-memory shape attached to each request as it stands in
-Stage 1:
+The in-memory shape attached to each request as of 2026-05-18
+(Stage 2 slice 1 shipped):
 
 ```rust
 struct ClientView {
@@ -200,17 +200,15 @@ struct ClientView {
     token_prefix:    String,         // "ng_p_a3k7"
     user_id:         i64,
     label:           Option<String>,
+    budget_key:      String,         // "token:<token_id>" — see Budget integration
 }
 ```
 
-The fields below are part of the longer-term design but are **not
-present today**. They are listed here for context, not as a current
-contract:
+The fields below remain part of the longer-term design but are **not
+present today**:
 
 - `allowed_models: AllowedModels` — Stage 2, lands with
   `multi-backend-routing.md`.
-- `budget_key: String` — Stage 2, lands with the Budget integration
-  rewrite below.
 - `pii_overrides: Option<Arc<PiiOverrides>>` — future, see Open
   questions.
 
