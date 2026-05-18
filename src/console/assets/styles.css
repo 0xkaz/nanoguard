@@ -236,7 +236,8 @@ li.guard .summary { color: #94a3b8; font-size: .85rem; }
   max-height: 360px;
   overflow: auto;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
+  word-break: normal;
   font-size: .8rem;
   background: #0f172a;
   padding: .6rem;

@@ -795,9 +795,13 @@ async function loadPlayground() {
     return;
   }
 
-  const initialBody = defaultModel
-    ? PLAYGROUND_DEFAULT_BODY.replace('"model": ""', `"model": "${defaultModel}"`)
-    : PLAYGROUND_DEFAULT_BODY;
+  // Build the initial body via JSON round-trip — a model name like
+  // `foo"bar` from operator config would corrupt a string replace.
+  const initialBody = JSON.stringify(
+    { ...JSON.parse(PLAYGROUND_DEFAULT_BODY), model: defaultModel },
+    null,
+    2,
+  );
 
   root.innerHTML = `
     <p class="hint subtle">Send the same chat-completions request through the proxy
@@ -914,9 +918,13 @@ function renderPlaygroundResult(direction, payload) {
   statusEl.className = `hint ${statusClass}`;
   statusEl.textContent = statusText;
 
+  // Plain-text upstream bodies (HTML error pages, auth-required
+  // text, etc.) should render verbatim, not as a JSON-escaped string.
   const pretty = payload.error
     ? payload.error
-    : JSON.stringify(payload.body, null, 2);
+    : typeof payload.body === 'string'
+      ? payload.body
+      : JSON.stringify(payload.body, null, 2);
   outEl.innerHTML = `<code>${esc(pretty)}</code>`;
 }
 

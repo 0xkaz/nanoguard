@@ -1737,11 +1737,18 @@ pub async fn api_playground_backend(
     let cfg = match fresh_config() {
         Ok(c) => c,
         Err(e) => {
-            return (
+            // Surfacing the config-reparse failure still has to rotate
+            // CSRF and audit — otherwise the operator's next mutation
+            // gets a stale-token 403 and we'd have no record of the
+            // failed playground call.
+            return playground_error_typed(
+                &state,
+                &admin,
+                &session_id,
+                "backend",
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("re-parse failed: {e}")})),
-            )
-                .into_response();
+                format!("re-parse failed: {e}"),
+            );
         }
     };
     let backend = match cfg.backends.get(&req.backend) {
@@ -1756,14 +1763,37 @@ pub async fn api_playground_backend(
                         .await;
                 }
             }
-            return (
+            return playground_error_typed(
+                &state,
+                &admin,
+                &session_id,
+                &format!("backend:{}", req.backend),
                 StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("backend `{}` not configured", req.backend)})),
-            )
-                .into_response();
+                format!("backend `{}` not configured", req.backend),
+            );
         }
     };
     playground_send_backend(&state, &admin, &session_id, backend, &req.body).await
+}
+
+/// Like `playground_error_response_with_latency`, but for cases where
+/// the playground call never reaches the upstream (config parse, no
+/// such backend). Still rotates CSRF, still writes a `playground_error`
+/// audit row, but returns a real HTTP 4xx/5xx envelope instead of the
+/// 200-with-`status: 0` "transport error" shape we use for connect
+/// failures.
+fn playground_error_typed(
+    state: &Arc<ConsoleState>,
+    admin: &crate::console::db::User,
+    session_id: &[u8],
+    where_: &str,
+    code: StatusCode,
+    err: String,
+) -> Response {
+    let next_csrf = rotate_csrf(state, session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    record_playground_mutation(state, admin, "playground_error", where_);
+    (code, headers, Json(json!({"error": err}))).into_response()
 }
 
 async fn playground_send_backend(
