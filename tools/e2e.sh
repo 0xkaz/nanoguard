@@ -3497,6 +3497,156 @@ assert_eq "38g. viewer /api/playground/backend is 403" "$V_BACKEND" "403"
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 
+# --- 39. Client-auth Stage 2: budget bucket is per-token ------------------
+# Stage 1 keyed the budget by the request body's OpenAI `user` field
+# (or "default" when absent). That was a self-asserted identifier:
+# the caller picked their own bucket, and a malicious caller could
+# squat on a victim's bucket to deplete it.
+#
+# Stage 2 (this slice) switches the budget bucket to a verified
+# `token:<id>` derived from the ClientView the verifier middleware
+# attaches. Scenario 39 confirms:
+#   - With [auth].enabled = true, spend lands under `token:<id>`, NOT
+#     under the body's `user` field.
+#   - The body's `user` field is still forwarded to the backend (it
+#     is a backend-side tag, not a nanoguard policy decision), but
+#     no `api_key_usage` row appears with that value.
+#   - With [auth].enabled = false, the legacy body-`user` behavior
+#     is preserved so existing deployments are not silently broken.
+info "scenario 39: client-auth Stage 2 — budget bucket is per-token"
+
+kill_leftover_nanoguards
+S39_DB="$LOGDIR/e2e.s39.db"
+S39_TOML="$LOGDIR/e2e.s39.toml"
+S39_LOG="$LOGDIR/ng.s39.log"
+rm -f "$S39_DB"
+
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S39_TOML"
+cat >> "$S39_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S39_DB"
+admin_api_key = "s39-admin"
+
+[auth]
+enabled = true
+env_marker = "t"
+EOF
+
+NANOGUARD_CONFIG="$S39_TOML" "$BIN" > "$S39_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "39-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+
+# Mint a token for user_id=42 so we can also confirm the budget key
+# discriminates on token id (not on user id, see design doc rationale).
+MINT39=$(curl -s "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s39-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"s39-token","user_id":42}')
+T39_WIRE=$(echo "$MINT39" | jq -r '.token // empty')
+T39_ID=$(echo "$MINT39" | jq -r '.id // empty')
+if [ -z "$T39_WIRE" ] || [ "$T39_WIRE" = "null" ]; then
+    ng "39-pre. token mint failed: $MINT39"
+    exit 1
+fi
+
+# Fire a request with a deliberately-different body `user` field so we
+# can tell which one nanoguard accounts against. If Stage 2 wiring is
+# right, the spend lands under `token:<id>`, not under `victim-bucket`.
+RESP39=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Authorization: Bearer $T39_WIRE" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","user":"victim-bucket","messages":[{"role":"user","content":"hello"}]}')
+RESP39_CODE=$(echo "$RESP39" | jq -r 'if .error then "err" else "ok" end')
+assert_eq "39a. authed request succeeds" "$RESP39_CODE" "ok"
+
+# Give the proxy a moment to flush the budget row (the BudgetStore
+# write happens after the upstream returns, before the response is
+# sent — but on a fast loopback the read here can still race).
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    USAGE_NOW=$(curl -s -H "Authorization: Bearer s39-admin" \
+        "$NG_URL/v1/admin/budget/token:$T39_ID" | jq -r '.usage // 0')
+    [ "$USAGE_NOW" -gt 0 ] && break
+    sleep 0.1
+done
+
+# 39b. Spend lands under token:<id>.
+USAGE_T=$(curl -s -H "Authorization: Bearer s39-admin" \
+    "$NG_URL/v1/admin/budget/token:$T39_ID" | jq -r '.usage // 0')
+case "$USAGE_T" in
+    ''|0) ng "39b. token:$T39_ID has zero usage after a successful request" ;;
+    *)    ok "39b. budget usage tracked under token:$T39_ID ($USAGE_T tokens)" ;;
+esac
+
+# 39c. The body's `user` field did NOT create its own bucket.
+USAGE_VICTIM=$(curl -s -H "Authorization: Bearer s39-admin" \
+    "$NG_URL/v1/admin/budget/victim-bucket" | jq -r '.usage // 0')
+assert_eq "39c. body's \`user\` field does not create a separate budget row" "$USAGE_VICTIM" "0"
+
+# 39d. The legacy "default" bucket also stays at zero — the verifier
+# attached a ClientView, so the body fallback never runs.
+USAGE_DEFAULT=$(curl -s -H "Authorization: Bearer s39-admin" \
+    "$NG_URL/v1/admin/budget/default" | jq -r '.usage // 0')
+assert_eq "39d. legacy \`default\` bucket is untouched when [auth].enabled" "$USAGE_DEFAULT" "0"
+
+# 39e. Limit applied to the new key form is enforced.
+curl -s -X PUT -H "Authorization: Bearer s39-admin" \
+    -H "Content-Type: application/json" \
+    "$NG_URL/v1/admin/budget/token:$T39_ID" \
+    -d '{"limit":1}' > /dev/null
+LIMITED_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
+    -H "Authorization: Bearer $T39_WIRE" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","messages":[{"role":"user","content":"over the limit"}]}')
+assert_eq "39e. per-token limit on \`token:$T39_ID\` is enforced (429)" "$LIMITED_CODE" "429"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+# 39f. Re-boot with [auth].enabled = false — the legacy contract must
+# still hold so existing deployments are not silently broken.
+S39B_TOML="$LOGDIR/e2e.s39b.toml"
+S39B_DB="$LOGDIR/e2e.s39b.db"
+S39B_LOG="$LOGDIR/ng.s39b.log"
+rm -f "$S39B_DB"
+
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S39B_TOML"
+cat >> "$S39B_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S39B_DB"
+admin_api_key = "s39b-admin"
+
+[auth]
+enabled = false
+EOF
+
+NANOGUARD_CONFIG="$S39B_TOML" "$BIN" > "$S39B_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "39f-pre. legacy proxy boot" "$NG_URL/health" 15 || exit 1
+
+curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","user":"legacy-bucket","messages":[{"role":"user","content":"hi"}]}' \
+    > /dev/null
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    USAGE_LEGACY=$(curl -s -H "Authorization: Bearer s39b-admin" \
+        "$NG_URL/v1/admin/budget/legacy-bucket" | jq -r '.usage // 0')
+    [ "$USAGE_LEGACY" -gt 0 ] && break
+    sleep 0.1
+done
+
+case "$USAGE_LEGACY" in
+    ''|0) ng "39f. legacy body-\`user\` bucket has zero usage with [auth].enabled = false" ;;
+    *)    ok "39f. legacy body-\`user\` budgeting preserved when [auth].enabled = false" ;;
+esac
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"
