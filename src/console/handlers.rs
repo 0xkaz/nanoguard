@@ -1436,10 +1436,21 @@ pub async fn api_update_routing(
         user: admin,
         session_id,
     }: MutatingUser,
-    Json(body): Json<RoutingUpdateRequest>,
+    Json(mut body): Json<RoutingUpdateRequest>,
 ) -> Response {
     if let Err(e) = require_admin(&admin) {
         return *e;
+    }
+
+    // Normalize whitespace once at the boundary so validation, write,
+    // audit, and the response echo all observe the same string. Leaving
+    // whitespace in for the writer would let a payload like `" alpha "`
+    // pass validation (which trims) but persist verbatim, which then
+    // fails to match any backend key on the next reload.
+    body.default = body.default.trim().to_string();
+    for r in body.rules.iter_mut() {
+        r.model = r.model.trim().to_string();
+        r.backend = r.backend.trim().to_string();
     }
 
     let cfg = match fresh_config() {

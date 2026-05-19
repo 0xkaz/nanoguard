@@ -734,9 +734,11 @@ async function loadRouting(backendList) {
 function renderRouting() {
   const root = $('#routing-body');
   if (!root || !routingDraft) return;
-  const backendOptions = routingBackendNames
-    .map(n => `<option value="${esc(n)}">${esc(n)}</option>`)
-    .join('');
+  // Routing is meaningless without any backend to point at. Disable
+  // the form and surface a clear "add a backend first" hint rather
+  // than letting the operator submit a guaranteed-400 payload.
+  const hasBackends = routingBackendNames.length > 0;
+  const disabledAttr = hasBackends ? '' : 'disabled';
   const ruleRows = routingDraft.rules
     .map((r, i) => {
       const sel = routingBackendNames
@@ -747,9 +749,9 @@ function renderRouting() {
           <td><input type="text" data-rule-model="${i}" value="${esc(r.model)}" placeholder="gpt-4o-* or claude-3-opus" /></td>
           <td><select data-rule-backend="${i}">${sel}</select></td>
           <td>
-            <button class="btn small" data-rule-up="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
-            <button class="btn small" data-rule-down="${i}" ${i === routingDraft.rules.length - 1 ? 'disabled' : ''}>↓</button>
-            <button class="btn small danger" data-rule-del="${i}">×</button>
+            <button class="btn small" data-rule-up="${i}" aria-label="Move rule up" title="Move rule up" ${i === 0 ? 'disabled' : ''}>↑</button>
+            <button class="btn small" data-rule-down="${i}" aria-label="Move rule down" title="Move rule down" ${i === routingDraft.rules.length - 1 ? 'disabled' : ''}>↓</button>
+            <button class="btn small danger" data-rule-del="${i}" aria-label="Delete rule" title="Delete rule">×</button>
           </td>
         </tr>
       `;
@@ -760,12 +762,13 @@ function renderRouting() {
     are exact strings or end with <code>*</code> for a prefix glob (e.g.
     <code>gpt-4o-*</code>). A request whose model matches no rule uses the default
     backend below.</p>
+    ${hasBackends ? '' : '<p class="hint warn">No backends configured yet — add a backend above before editing routing.</p>'}
     <div class="field">
       <label for="routing-default-select">Default backend</label>
-      <select id="routing-default-select">
+      <select id="routing-default-select" ${disabledAttr}>
         ${routingBackendNames
           .map(n => `<option value="${esc(n)}"${n === routingDraft.default ? ' selected' : ''}>${esc(n)}</option>`)
-          .join('')}
+          .join('') || '<option value="">(none)</option>'}
       </select>
     </div>
     <table class="table">
@@ -773,14 +776,13 @@ function renderRouting() {
       <tbody>${ruleRows || `<tr><td colspan="3" class="hint">No rules — every request uses the default backend.</td></tr>`}</tbody>
     </table>
     <div class="actions">
-      <button id="routing-add-rule" class="btn">Add rule</button>
-      <button id="routing-save" class="btn primary">Save routing</button>
+      <button id="routing-add-rule" class="btn" ${disabledAttr}>Add rule</button>
+      <button id="routing-save" class="btn primary" ${disabledAttr}>Save routing</button>
     </div>
     <p id="routing-status" class="status"></p>
   `;
-  // Suppress 'unused' warning on backendOptions in linters — the
-  // value is intentionally available for future "Add rule" prefill.
-  void backendOptions;
+
+  if (!hasBackends) return;
 
   $('#routing-default-select').addEventListener('change', e => {
     routingDraft.default = e.target.value;
@@ -830,6 +832,11 @@ function renderRouting() {
 async function saveRouting() {
   const statusEl = $('#routing-status');
   if (!routingDraft) return;
+  if (routingBackendNames.length === 0 || !routingDraft.default) {
+    statusEl.className = 'status error';
+    statusEl.textContent = 'Add a backend before saving routing.';
+    return;
+  }
   // Strip empty-model rows the operator may have added and forgotten;
   // the server would 400 on them anyway and the message is friendlier
   // if we just drop them.
