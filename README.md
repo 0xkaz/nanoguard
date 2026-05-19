@@ -450,7 +450,7 @@ rules = [
 
 Rules support exact strings and trailing-`*` globs (no other wildcards). They are scanned in the order declared; first match wins. A request whose `model` does not match any rule falls back to `[routing].default`.
 
-The Console **Backends** tab (admin only) shows the current pool, the routing table, and lets you add or remove entries from a UI. The mutation rewrites `nanoguard.toml` on disk via a TOML round-trip (unrelated sections and comments preserved). The proxy's live backend pool is **restart-only** — see `docs/design/multi-backend-routing.md > State management` for the reason — so a freshly-added backend is visible on disk and in the API immediately, but the proxy itself only picks it up on the next process restart. Routing rules and the default selection are hot-reloadable.
+The Console **Backends** tab (admin only) shows the current pool, the routing table, and lets you add or remove entries from a UI. The same tab carries a **Routing** section that edits `[routing]` (default backend + first-match-wins rules) with ↑ / ↓ buttons to reorder rules — order is significant. The mutation rewrites `nanoguard.toml` on disk via a TOML round-trip (unrelated sections and comments preserved). The proxy's live backend pool is **restart-only** — see `docs/design/multi-backend-routing.md > State management` for the reason — so a freshly-added backend is visible on disk and in the API immediately, but the proxy itself only picks it up on the next process restart. Routing rules and the default selection are hot-reloadable (saving the Routing section fires a reload immediately).
 
 What is NOT in this iteration:
 

@@ -1400,6 +1400,208 @@ pub struct BackendNameQuery {
     pub name: String,
 }
 
+// ── API: Routing (admin only) ─────────────────────────────────────────────
+//
+// `[routing]` is the hot-reloadable companion to the restart-only
+// `[backends.*]` map: the operator chooses which configured backend
+// serves a given request, by model pattern (`first-match-wins`) with
+// a default fallback. The Backends tab already covers the pool side;
+// this block adds a `PUT /api/routing` write surface so the routing
+// table can be edited from the UI without raw TOML editing.
+
+#[derive(Deserialize)]
+pub struct RoutingUpdateRequest {
+    /// Required: the backend label to use when no rule matches.
+    pub default: String,
+    /// Rules scanned in declared order, first match wins. Empty list
+    /// is fine — the proxy just uses `default` for every request.
+    #[serde(default)]
+    pub rules: Vec<RoutingRuleSpec>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct RoutingRuleSpec {
+    pub model: String,
+    pub backend: String,
+}
+
+/// `PUT /api/routing` — replace the entire `[routing]` section. We
+/// take the whole table rather than diff-y endpoints because the
+/// order of `rules` is semantically meaningful (first-match-wins),
+/// and small operations like "swap rule 2 and 3" are clearer as
+/// "send me the new full list" than as a JSON Patch.
+pub async fn api_update_routing(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Json(body): Json<RoutingUpdateRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    let cfg = match fresh_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e:#}")})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(msg) = validate_routing_body(&body, &cfg) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+    }
+
+    let prev_default = cfg.routing.default.clone();
+    let prev_rule_count = cfg.routing.rules.len();
+
+    if let Err(e) = write_routing_to_toml(&body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e:#}")})),
+        )
+            .into_response();
+    }
+
+    record_routing_mutation(
+        &state,
+        &admin,
+        &body,
+        prev_default.as_deref(),
+        prev_rule_count,
+    );
+    let reload = super::reload::trigger_reload(&state.config.reload);
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({
+            "default": body.default,
+            "rules": body.rules.iter().map(|r| json!({"model": r.model, "backend": r.backend})).collect::<Vec<_>>(),
+            // `[routing]` is hot-reloadable (see CLAUDE.md and
+            // docs/design/multi-backend-routing.md), so the change
+            // takes effect on the next reload, not on process
+            // restart. Flag it for the SPA so the operator sees the
+            // right toast.
+            "restart_required": false,
+            "reload": reload_outcome_json(&reload),
+        })),
+    )
+        .into_response()
+}
+
+fn validate_routing_body(
+    body: &RoutingUpdateRequest,
+    cfg: &crate::config::Config,
+) -> std::result::Result<(), String> {
+    let default = body.default.trim();
+    if default.is_empty() {
+        return Err("routing.default cannot be empty".into());
+    }
+    if !cfg.backends.contains_key(default) {
+        return Err(format!(
+            "routing.default = `{default}` is not a configured backend"
+        ));
+    }
+    let mut seen_models = std::collections::HashSet::new();
+    for (i, rule) in body.rules.iter().enumerate() {
+        let model = rule.model.trim();
+        let backend = rule.backend.trim();
+        if model.is_empty() {
+            return Err(format!("rule[{i}].model cannot be empty"));
+        }
+        if backend.is_empty() {
+            return Err(format!("rule[{i}].backend cannot be empty"));
+        }
+        if !cfg.backends.contains_key(backend) {
+            return Err(format!(
+                "rule[{i}].backend = `{backend}` is not a configured backend"
+            ));
+        }
+        if !seen_models.insert(model.to_string()) {
+            // Duplicate model patterns are almost certainly a typo —
+            // first-match-wins means the later entry can never fire.
+            // Fail loud so the operator can fix the source pattern.
+            return Err(format!(
+                "rule[{i}].model = `{model}` is duplicated; later occurrence would never fire"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Round-trip `nanoguard.toml`: replace the `[routing]` section's
+/// `default` and `rules` while leaving every other section, comment,
+/// and key ordering verbatim. Atomic-write + backup like every other
+/// console edit.
+fn write_routing_to_toml(body: &RoutingUpdateRequest) -> anyhow::Result<()> {
+    use std::fs;
+    use toml_edit::{value, Array, InlineTable, Item, Table};
+    let path_owned =
+        std::env::var("NANOGUARD_CONFIG").unwrap_or_else(|_| "nanoguard.toml".to_string());
+    let path = path_owned.as_str();
+    let original = fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+    let mut doc = original
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+
+    let routing_section = doc
+        .entry("routing")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let routing_tbl = routing_section
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[routing] in {path} is not a table"))?;
+
+    routing_tbl.insert("default", value(body.default.clone()));
+
+    let mut rules = Array::new();
+    for r in &body.rules {
+        let mut t = InlineTable::new();
+        t.insert("model", r.model.clone().into());
+        t.insert("backend", r.backend.clone().into());
+        rules.push(t);
+    }
+    routing_tbl.insert("rules", Item::Value(rules.into()));
+
+    let serialized = doc.to_string();
+    super::edit::atomic_write(path, &serialized, |_| super::edit::ValidationResult {
+        valid: true,
+        error: None,
+    })?;
+    Ok(())
+}
+
+fn record_routing_mutation(
+    state: &Arc<ConsoleState>,
+    admin: &crate::console::db::User,
+    body: &RoutingUpdateRequest,
+    prev_default: Option<&str>,
+    prev_rule_count: usize,
+) {
+    if let Some(ref log) = state.audit_log {
+        let summary = format!(
+            "{} updated [routing]: default `{}` → `{}`, rules {} → {}",
+            admin.username,
+            prev_default.unwrap_or("(unset)"),
+            body.default,
+            prev_rule_count,
+            body.rules.len(),
+        );
+        let rec = MutationRecord::new(&admin.username, admin.id, "routing_update", summary)
+            .with_target("routing".to_string())
+            .with_after(json!({
+                "default": body.default,
+                "rules": body.rules.iter().map(|r| json!({"model": r.model, "backend": r.backend})).collect::<Vec<_>>(),
+            }));
+        log.record_mutation(&rec);
+    }
+}
+
 fn validate_backend_name(name: &str) -> std::result::Result<(), String> {
     if name.is_empty() {
         return Err("backend name cannot be empty".into());

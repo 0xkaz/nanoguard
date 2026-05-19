@@ -259,6 +259,7 @@ pub async fn run(
             "/api/backends/:name",
             put(handlers::api_update_backend).delete(handlers::api_delete_backend),
         )
+        .route("/api/routing", put(handlers::api_update_routing))
         .route(
             "/api/users",
             get(handlers::api_list_users).post(handlers::api_create_user),
