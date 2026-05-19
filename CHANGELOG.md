@@ -4,6 +4,18 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Changed — Client-auth Stage 2 (slice 2): Anthropic `/v1/messages` budget wiring
+
+`/v1/messages` joins `/v1/chat/completions` on the `ClientView.budget_key` contract. With `[auth].enabled = true`, Anthropic requests are accounted against `token:<id>` derived from the verifier middleware — the same bucket the OpenAI path uses, so a single token's quota covers both endpoints. A Claude SDK caller with a leaked token can no longer rack up unaccounted Anthropic spend, which was the asymmetry slice 1 left open.
+
+Budget check runs after spotlighting and before backend resolution; an over-quota call returns `429` with an Anthropic-shaped envelope (`{ type: "error", error: { type: "rate_limit_error", message } }`) so Claude SDKs read it the same way they read an upstream Anthropic 429. Successful calls record spend against the OpenAI-shape `prompt_tokens` / `completion_tokens` returned by the backend (backends always speak OpenAI on the wire; Anthropic mode is a shape adapter, not a parallel transport).
+
+When `[auth].enabled = false`, Anthropic budget falls back to the literal `default` bucket. Anthropic's request body has no OpenAI-style `user` field to fall back to, so the fallback is constant rather than self-asserted — symmetric with the chat-completions fallback when `user` is absent from the body.
+
+Out of scope for this slice (still tracked in [`docs/design/client-auth.md`](docs/design/client-auth.md)): `stream=true` on `/v1/messages` (still refused with 400), audit `user_id` / `token_id` columns, `last_used_at` flush, and shadow mode.
+
+**e2e** — scenario 41 covers the new contract with 7 assertions: authed `/v1/messages` returns Anthropic-shape, spend lands under `token:<id>`, legacy `default` bucket stays untouched when authed, per-token limit on `/v1/messages` returns `429` with `type=error` + `error.type=rate_limit_error`, and with `[auth].enabled = false` the constant `default` bucket records spend. Total `tools/e2e.sh` assertions: 209 (was 202 after PR #46).
+
 ### Added — Console Backends tab: edit `[routing]` from the UI
 
 The Backends tab gains a Routing section that edits `[routing]` without dropping into the Config tab's raw TOML editor. Operators can change the default backend, add / delete rules, and reorder them with ↑ / ↓ buttons (the order is semantically meaningful — `[routing].rules` is first-match-wins). Save goes through a single `PUT /api/routing` round-trip that validates, atomically rewrites the `[routing]` section via `toml_edit` (every other section, comment, and key ordering preserved verbatim), and fires a reload — `[routing]` is hot-reloadable, so the change takes effect on the next request without a restart.

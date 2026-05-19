@@ -3,7 +3,7 @@
 /// Converts Anthropic request format to OpenAI format, proxies through guardrails,
 /// then converts the response back to Anthropic format.
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::{
+    budget::store::{BudgetCheck, SpendRecord},
+    client_auth::ClientView,
     guard::{
         deanonymize,
         vault::{LocalVault, PlaceholderTemplate, Vault},
@@ -67,9 +69,22 @@ impl AnthropicContent {
 
 pub async fn messages(
     State(shared): State<SharedState>,
+    client: Option<Extension<ClientView>>,
     Json(mut req): Json<AnthropicRequest>,
 ) -> Response {
     let state = shared.load_full();
+    // Budget bucket + audit `api_key` column. Mirrors the
+    // `/v1/chat/completions` contract: when [auth].enabled = true,
+    // the verifier middleware has attached a ClientView and we use
+    // its `token:<id>` budget_key. When [auth] is off there's no
+    // token; Anthropic's request body has no OpenAI-style `user`
+    // field to fall back to, so the legacy bucket is the literal
+    // string "default" — matching what /v1/chat/completions does
+    // when the body's `user` field is absent.
+    let api_key = match client.as_ref() {
+        Some(Extension(view)) => view.budget_key.clone(),
+        None => "default".to_string(),
+    };
     // Streaming is not yet supported on /v1/messages. Refuse early with a
     // 400 rather than half-handling the SSE response from the backend
     // (which would surface as an opaque 502 to the caller).
@@ -226,6 +241,30 @@ pub async fn messages(
     if let Some(sl) = state.spotlight.as_ref() {
         if crate::guard::spotlight::apply(&mut oai_body, sl) {
             info!("SPOTLIGHT applied (anthropic) to untrusted-role messages");
+        }
+    }
+
+    // Budget check (before forwarding to LLM). Same shape as
+    // /v1/chat/completions, but the 429 envelope is Anthropic-shaped
+    // so SDK error handlers can read the `type` discriminator.
+    if let Some(budget) = &state.budget {
+        match budget.check(&api_key).await {
+            Ok(BudgetCheck::Exceeded { usage, limit }) => {
+                warn!("budget exceeded (anthropic) for key={api_key}: {usage}/{limit} tokens");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": format!("nanoguard: token budget exceeded ({usage}/{limit})"),
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => warn!("budget check error (anthropic): {}", e),
         }
     }
 
@@ -409,6 +448,37 @@ pub async fn messages(
             "output_tokens": oai_resp.get("usage").and_then(|u| u.get("completion_tokens")).cloned().unwrap_or(json!(0)),
         }
     });
+
+    // Record spend after the upstream returned a successful response.
+    // We use the OpenAI-shaped `prompt_tokens` / `completion_tokens`
+    // values here (not the Anthropic-shaped envelope below) because
+    // the backend pool always speaks OpenAI on the wire — Anthropic
+    // mode is a shape adapter, not a parallel transport. Same
+    // LiteLLM "count on response" pattern as /v1/chat/completions.
+    if status.is_success() {
+        if let Some(budget) = &state.budget {
+            let prompt = oai_resp
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let completion = oai_resp
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let record = SpendRecord {
+                api_key: api_key.clone(),
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                model: req.model.clone(),
+                created_at: chrono::Utc::now(),
+            };
+            if let Err(e) = budget.record_spend(&record).await {
+                warn!("budget record_spend (anthropic) error: {}", e);
+            }
+        }
+    }
 
     (
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),

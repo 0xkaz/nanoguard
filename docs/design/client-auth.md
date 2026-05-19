@@ -14,12 +14,14 @@ Sections below tagged *Stage 2* describe a target state that is
 **not wired** today; the verification middleware exists but does
 not yet feed budget, audit, or PII off it:
 
-- ~~Budget integration is not wired.~~ **Shipped** (2026-05-18,
-  scenario 39). `ClientView` carries a `budget_key` slot set to
-  `token:<id>`; `/v1/chat/completions` uses it when the verifier has
-  attached a view. The legacy body-`user` bucket is preserved when
-  `[auth].enabled = false`. The `user:<id>` aggregate admin form
-  remains a follow-up (depends on the `users`-table slice).
+- ~~Budget integration is not wired.~~ **Shipped** in two slices:
+  `/v1/chat/completions` on 2026-05-18 (scenario 39), `/v1/messages`
+  on 2026-05-20 (scenario 41). `ClientView` carries a `budget_key`
+  slot set to `token:<id>`; both proxy endpoints use it when the
+  verifier has attached a view. The legacy body-`user` bucket
+  (chat-completions) or constant `default` (messages) is preserved
+  when `[auth].enabled = false`. The `user:<id>` aggregate admin
+  form remains a follow-up (depends on the `users`-table slice).
 - **Audit `user_id` / `token_id` not added.** `AuditEntry` has no
   `user_id` or `token_id` field; the `api_key` column is still
   populated from the request body, not from `ClientView`.
@@ -258,8 +260,11 @@ behavior — there is no persistent cache state to lose.
 > attached a view. The legacy body-`user` bucket is preserved on
 > deployments with `[auth].enabled = false`. The `user:<id>`
 > aggregate admin form is **not yet implemented** and depends on
-> the `users`-table slice. `/v1/messages` (Anthropic) also still
-> bypasses budget accounting entirely — that is the next slice.
+> the `users`-table slice. `/v1/messages` (Anthropic) was wired
+> in slice 2 (2026-05-20, scenario 41): same `token:<id>` bucket,
+> Anthropic-shaped `429` envelope on budget-exceeded, fallback to
+> the literal `default` bucket when `[auth].enabled = false` (no
+> body-side `user` field on Anthropic to fall back to).
 
 The existing `[budget]` machinery uses the OpenAI `user` field
 from the request body as the budget key, falling back to
