@@ -675,6 +675,8 @@ async function loadBackends() {
         <tbody>${rows || '<tr><td colspan="6" class="hint">no backends configured</td></tr>'}</tbody>
       </table>
       <button id="backend-add-btn" class="btn primary">Add backend</button>
+      <h3 style="margin-top:1.5rem;">Routing</h3>
+      <div id="routing-body"><p class="hint">Loading…</p></div>
     `;
     $('#backend-add-btn').addEventListener('click', () => openBackendEditor(null));
     $$('#tab-backends [data-backend-edit]').forEach(btn => {
@@ -696,8 +698,169 @@ async function loadBackends() {
         }
       });
     });
+    loadRouting(res.data || []);
   } catch (err) {
     body.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+  }
+}
+
+// ── Routing (admin only, part of the Backends tab) ──────────
+//
+// Routing rules are first-match-wins, so order matters. The editor
+// keeps an in-memory `routingDraft` and only POSTs to /api/routing
+// when the operator clicks Save — that way the row-rearrange
+// buttons (↑ ↓) don't each fire a network round-trip.
+
+let routingDraft = null;
+let routingBackendNames = [];
+
+async function loadRouting(backendList) {
+  const root = $('#routing-body');
+  if (!root) return;
+  try {
+    const ov = await api('/api/overview');
+    routingBackendNames = backendList.map(b => b.name);
+    const r = ov.routing || { default: '', rules: [] };
+    routingDraft = {
+      default: r.default || (routingBackendNames[0] || ''),
+      rules: (r.rules || []).map(x => ({ model: x.model, backend: x.backend })),
+    };
+    renderRouting();
+  } catch (err) {
+    root.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+  }
+}
+
+function renderRouting() {
+  const root = $('#routing-body');
+  if (!root || !routingDraft) return;
+  // Routing is meaningless without any backend to point at. Disable
+  // the form and surface a clear "add a backend first" hint rather
+  // than letting the operator submit a guaranteed-400 payload.
+  const hasBackends = routingBackendNames.length > 0;
+  const disabledAttr = hasBackends ? '' : 'disabled';
+  const ruleRows = routingDraft.rules
+    .map((r, i) => {
+      const sel = routingBackendNames
+        .map(n => `<option value="${esc(n)}"${n === r.backend ? ' selected' : ''}>${esc(n)}</option>`)
+        .join('');
+      return `
+        <tr>
+          <td><input type="text" data-rule-model="${i}" value="${esc(r.model)}" placeholder="gpt-4o-* or claude-3-opus" /></td>
+          <td><select data-rule-backend="${i}">${sel}</select></td>
+          <td>
+            <button class="btn small" data-rule-up="${i}" aria-label="Move rule up" title="Move rule up" ${i === 0 ? 'disabled' : ''}>↑</button>
+            <button class="btn small" data-rule-down="${i}" aria-label="Move rule down" title="Move rule down" ${i === routingDraft.rules.length - 1 ? 'disabled' : ''}>↓</button>
+            <button class="btn small danger" data-rule-del="${i}" aria-label="Delete rule" title="Delete rule">×</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+  root.innerHTML = `
+    <p class="hint subtle">Rules are scanned in order; the first match wins. Patterns
+    are exact strings or end with <code>*</code> for a prefix glob (e.g.
+    <code>gpt-4o-*</code>). A request whose model matches no rule uses the default
+    backend below.</p>
+    ${hasBackends ? '' : '<p class="hint warn">No backends configured yet — add a backend above before editing routing.</p>'}
+    <div class="field">
+      <label for="routing-default-select">Default backend</label>
+      <select id="routing-default-select" ${disabledAttr}>
+        ${routingBackendNames
+          .map(n => `<option value="${esc(n)}"${n === routingDraft.default ? ' selected' : ''}>${esc(n)}</option>`)
+          .join('') || '<option value="">(none)</option>'}
+      </select>
+    </div>
+    <table class="table">
+      <thead><tr><th>Model pattern</th><th>Backend</th><th>Order</th></tr></thead>
+      <tbody>${ruleRows || `<tr><td colspan="3" class="hint">No rules — every request uses the default backend.</td></tr>`}</tbody>
+    </table>
+    <div class="actions">
+      <button id="routing-add-rule" class="btn" ${disabledAttr}>Add rule</button>
+      <button id="routing-save" class="btn primary" ${disabledAttr}>Save routing</button>
+    </div>
+    <p id="routing-status" class="status"></p>
+  `;
+
+  if (!hasBackends) return;
+
+  $('#routing-default-select').addEventListener('change', e => {
+    routingDraft.default = e.target.value;
+  });
+  $$('[data-rule-model]').forEach(input => {
+    input.addEventListener('input', e => {
+      routingDraft.rules[Number(e.target.dataset.ruleModel)].model = e.target.value;
+    });
+  });
+  $$('[data-rule-backend]').forEach(sel => {
+    sel.addEventListener('change', e => {
+      routingDraft.rules[Number(e.target.dataset.ruleBackend)].backend = e.target.value;
+    });
+  });
+  $$('[data-rule-up]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const i = Number(e.target.dataset.ruleUp);
+      if (i <= 0) return;
+      const r = routingDraft.rules;
+      [r[i - 1], r[i]] = [r[i], r[i - 1]];
+      renderRouting();
+    });
+  });
+  $$('[data-rule-down]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const i = Number(e.target.dataset.ruleDown);
+      const r = routingDraft.rules;
+      if (i >= r.length - 1) return;
+      [r[i], r[i + 1]] = [r[i + 1], r[i]];
+      renderRouting();
+    });
+  });
+  $$('[data-rule-del]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const i = Number(e.target.dataset.ruleDel);
+      routingDraft.rules.splice(i, 1);
+      renderRouting();
+    });
+  });
+  $('#routing-add-rule').addEventListener('click', () => {
+    routingDraft.rules.push({ model: '', backend: routingBackendNames[0] || '' });
+    renderRouting();
+  });
+  $('#routing-save').addEventListener('click', saveRouting);
+}
+
+async function saveRouting() {
+  const statusEl = $('#routing-status');
+  if (!routingDraft) return;
+  if (routingBackendNames.length === 0 || !routingDraft.default) {
+    statusEl.className = 'status error';
+    statusEl.textContent = 'Add a backend before saving routing.';
+    return;
+  }
+  // Strip empty-model rows the operator may have added and forgotten;
+  // the server would 400 on them anyway and the message is friendlier
+  // if we just drop them.
+  const cleaned = {
+    default: routingDraft.default,
+    rules: routingDraft.rules
+      .filter(r => r.model.trim() !== '' && r.backend !== '')
+      .map(r => ({ model: r.model.trim(), backend: r.backend })),
+  };
+  statusEl.className = 'status';
+  statusEl.textContent = 'Saving…';
+  try {
+    const res = await api('/api/routing', {
+      method: 'PUT',
+      body: JSON.stringify(cleaned),
+    });
+    statusEl.className = 'status success';
+    statusEl.textContent = `Saved — default = ${res.default}, ${res.rules.length} rule(s). Hot reloaded.`;
+    // Re-fetch so the on-screen draft matches what the proxy actually
+    // parsed (server-side trimming, key ordering, etc).
+    loadBackends();
+  } catch (err) {
+    statusEl.className = 'status error';
+    statusEl.textContent = err.message;
   }
 }
 

@@ -3647,6 +3647,201 @@ esac
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 
+# --- 40. Console Routing tab: PUT /api/routing round-trip ----------------
+# Routing rules are hot-reloadable but until now the only way to
+# add/reorder one was to edit nanoguard.toml directly through the
+# Config tab. Scenario 40 drives the new admin-only endpoint that
+# replaces [routing] atomically: validates default-must-exist,
+# duplicate-model rejection, the proxy actually picks up the new
+# rule on hot reload, and viewer is 403.
+info "scenario 40: Console Routing — PUT /api/routing"
+
+kill_leftover_nanoguards
+S40_DIR="$LOGDIR/e2e.s40.workdir"
+rm -rf "$S40_DIR"
+mkdir -p "$S40_DIR"
+
+S40_CONSOLE_PORT=18094
+S40_CONSOLE_URL="http://127.0.0.1:$S40_CONSOLE_PORT"
+S40_TOML="$S40_DIR/nanoguard.toml"
+S40_DB="$S40_DIR/nanoguard.db"
+S40_LOG="$LOGDIR/ng.s40.log"
+S40_COOKIES="$LOGDIR/e2e.s40.cookies"
+rm -f "$S40_COOKIES"
+
+# Two labelled mock backends — alpha is the default, beta sits idle
+# until routing claims it. The mock script accepts a `?label=` arg
+# so each backend can prefix its echo so we can tell them apart.
+S40_MOCK_A_PORT=11540
+S40_MOCK_B_PORT=11541
+BACKEND_LABEL=ALPHA python3 "$MOCK" "$S40_MOCK_A_PORT" > "$LOGDIR/s40.mock_a.log" 2>&1 &
+S40_MOCK_A=$!
+BACKEND_LABEL=BETA  python3 "$MOCK" "$S40_MOCK_B_PORT" > "$LOGDIR/s40.mock_b.log" 2>&1 &
+S40_MOCK_B=$!
+sleep 0.3
+
+cat > "$S40_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[reload]
+pid_file = "$S40_DIR/nanoguard.pid"
+
+[backends.alpha]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S40_MOCK_A_PORT"
+
+[backends.beta]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S40_MOCK_B_PORT"
+
+[routing]
+default = "alpha"
+rules = []
+
+[budget]
+enabled = false
+db_path = "$S40_DB"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S40_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S40_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S40_BOOTSTRAP_PW" }
+EOF
+
+S40_PW="s40-pw-$(openssl rand -hex 8)"
+(cd "$S40_DIR" && NANOGUARD_CONFIG="$S40_TOML" S40_BOOTSTRAP_PW="$S40_PW" "$BIN" > "$S40_LOG" 2>&1) &
+NG_PID=$!
+wait_for_url "40-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+wait_for_url "40-pre. console boot" "$S40_CONSOLE_URL/" 15 || exit 1
+
+LOGIN=$(curl -s -c "$S40_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S40_PW\"}" \
+    "$S40_CONSOLE_URL/api/login")
+S40_CSRF=$(echo "$LOGIN" | jq -r '.csrf_token // empty')
+
+# 40a. Baseline: a request with model=premium hits alpha (the default).
+PREMIUM_BEFORE=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"premium","messages":[{"role":"user","content":"who serves me"}]}' \
+    | jq -r '.choices[0].message.content // empty')
+case "$PREMIUM_BEFORE" in
+    *ALPHA*) ok "40a. pre-routing-change: model=premium → alpha (default)" ;;
+    *)       ng "40a. expected ALPHA echo, got: $PREMIUM_BEFORE" ;;
+esac
+
+# 40b. PUT a routing rule that sends `premium` to beta. The endpoint
+# returns the new state, restart_required must be false, and the
+# reload trigger should succeed.
+PUT_RESP=$(curl -s -b "$S40_COOKIES" -c "$S40_COOKIES" -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S40_CSRF" \
+    -d '{"default":"alpha","rules":[{"model":"premium","backend":"beta"}]}' \
+    "$S40_CONSOLE_URL/api/routing")
+PUT_DEFAULT=$(echo "$PUT_RESP" | jq -r '.default // empty')
+PUT_RULES=$(echo "$PUT_RESP" | jq -r '.rules | length')
+PUT_RESTART=$(echo "$PUT_RESP" | jq -r '.restart_required')
+assert_eq "40b-default. PUT /api/routing echoes the new default" "$PUT_DEFAULT" "alpha"
+assert_eq "40b-rules. PUT /api/routing echoes the new rule count" "$PUT_RULES" "1"
+assert_eq "40b-restart. routing change is hot-reloadable (restart_required=false)" "$PUT_RESTART" "false"
+
+# 40c. nanoguard.toml on disk now contains the new rule.
+if grep -q 'model = "premium"' "$S40_TOML"; then
+    ok "40c. nanoguard.toml carries the new rule on disk"
+else
+    ng "40c. rule not found in $S40_TOML after PUT"
+    cat "$S40_TOML"
+fi
+
+# Refresh CSRF.
+S40_CSRF=$(curl -s -b "$S40_COOKIES" "$S40_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 40d. Hot reload picked up the rule: model=premium now hits beta.
+# `trigger_reload` already fired inside the handler; give the live
+# state a beat to swap.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    PREMIUM_AFTER=$(curl -s "$NG_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d '{"model":"premium","messages":[{"role":"user","content":"who serves me now"}]}' \
+        | jq -r '.choices[0].message.content // empty')
+    case "$PREMIUM_AFTER" in
+        *BETA*) break ;;
+    esac
+    sleep 0.2
+done
+case "$PREMIUM_AFTER" in
+    *BETA*) ok "40d. post-routing-change: model=premium now → beta via hot reload" ;;
+    *)      ng "40d. expected BETA echo, got: $PREMIUM_AFTER" ;;
+esac
+
+# 40e. Reject: default points at a non-existent backend.
+BAD_DEFAULT=$(curl -s -o /dev/null -w "%{http_code}" -b "$S40_COOKIES" -c "$S40_COOKIES" -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S40_CSRF" \
+    -d '{"default":"does-not-exist","rules":[]}' \
+    "$S40_CONSOLE_URL/api/routing")
+assert_eq "40e. unknown default backend is rejected (400)" "$BAD_DEFAULT" "400"
+
+S40_CSRF=$(curl -s -b "$S40_COOKIES" "$S40_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 40f. Reject: rule.backend not in [backends.*].
+BAD_RULE_BACKEND=$(curl -s -o /dev/null -w "%{http_code}" -b "$S40_COOKIES" -c "$S40_COOKIES" -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S40_CSRF" \
+    -d '{"default":"alpha","rules":[{"model":"x","backend":"ghost"}]}' \
+    "$S40_CONSOLE_URL/api/routing")
+assert_eq "40f. unknown rule.backend is rejected (400)" "$BAD_RULE_BACKEND" "400"
+
+S40_CSRF=$(curl -s -b "$S40_COOKIES" "$S40_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 40g. Reject: duplicate model patterns (the later one could never
+# fire because of first-match-wins; almost certainly a typo).
+DUP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S40_COOKIES" -c "$S40_COOKIES" -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S40_CSRF" \
+    -d '{"default":"alpha","rules":[{"model":"dup","backend":"alpha"},{"model":"dup","backend":"beta"}]}' \
+    "$S40_CONSOLE_URL/api/routing")
+assert_eq "40g. duplicate model pattern is rejected (400)" "$DUP_CODE" "400"
+
+S40_CSRF=$(curl -s -b "$S40_COOKIES" "$S40_CONSOLE_URL/api/me" | jq -r '.csrf_token // empty')
+
+# 40h. Viewer is 403 on the routing endpoint.
+S40_VIEWER_PW="s40-viewer-$(openssl rand -hex 8)"
+curl -s -o /dev/null -b "$S40_COOKIES" -c "$S40_COOKIES" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S40_CSRF" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S40_VIEWER_PW\",\"role\":\"user\"}" \
+    "$S40_CONSOLE_URL/api/users"
+S40_VIEWER_COOKIES="$LOGDIR/e2e.s40.viewer.cookies"
+rm -f "$S40_VIEWER_COOKIES"
+V_LOGIN=$(curl -s -c "$S40_VIEWER_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"viewer\",\"password\":\"$S40_VIEWER_PW\"}" \
+    "$S40_CONSOLE_URL/api/login")
+V_CSRF=$(echo "$V_LOGIN" | jq -r '.csrf_token // empty')
+V_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S40_VIEWER_COOKIES" -c "$S40_VIEWER_COOKIES" -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $V_CSRF" \
+    -d '{"default":"alpha","rules":[]}' \
+    "$S40_CONSOLE_URL/api/routing")
+assert_eq "40h. viewer PUT /api/routing is 403" "$V_CODE" "403"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+kill "$S40_MOCK_A" "$S40_MOCK_B" 2>/dev/null || true
+wait "$S40_MOCK_A" "$S40_MOCK_B" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

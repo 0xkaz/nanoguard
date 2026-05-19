@@ -4,6 +4,16 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — Console Backends tab: edit `[routing]` from the UI
+
+The Backends tab gains a Routing section that edits `[routing]` without dropping into the Config tab's raw TOML editor. Operators can change the default backend, add / delete rules, and reorder them with ↑ / ↓ buttons (the order is semantically meaningful — `[routing].rules` is first-match-wins). Save goes through a single `PUT /api/routing` round-trip that validates, atomically rewrites the `[routing]` section via `toml_edit` (every other section, comment, and key ordering preserved verbatim), and fires a reload — `[routing]` is hot-reloadable, so the change takes effect on the next request without a restart.
+
+Validation rejects: empty `default`, `default` not in `[backends.*]`, any rule whose `backend` is not in `[backends.*]`, empty `model`, and duplicate `model` patterns (the later occurrence could never fire under first-match-wins; almost always a typo).
+
+Mutations are admin-only, CSRF-rotated, and audited as `routing_update` with target `routing` and an `after` payload carrying the new default + rules. `restart_required: false` rides on the success response so the SPA can show the right toast.
+
+**e2e** — scenario 40 covers the new endpoint with 10 assertions: pre-change baseline (premium → default backend), `PUT /api/routing` echoes default + rule count + `restart_required: false`, the new rule lands in `nanoguard.toml` on disk, hot reload picks it up (premium now hits the other backend), unknown `default` rejected (400), unknown `rule.backend` rejected (400), duplicate `model` rejected (400), viewer 403. Total `tools/e2e.sh` assertions: 202 (was 192 after PR #45).
+
 ### Changed — Client-auth Stage 2 (slice 1): per-token budget buckets
 
 When `[auth].enabled = true`, the budget bucket for `/v1/chat/completions` switches from the request body's self-asserted OpenAI `user` field to a verified `token:<id>` derived from the `ClientView` the verifier middleware attaches. A runaway script under one token no longer depletes a sibling token belonging to the same user, and a malicious caller can no longer squat on a victim's bucket by setting `"user": "victim"` in the request body. The body's `user` field is still forwarded to the upstream backend unchanged — it remains a backend-side usage tag, not a nanoguard policy decision.
