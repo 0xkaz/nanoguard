@@ -317,6 +317,41 @@ pub async fn messages(
                 .into_response(),
         };
 
+    // Record spend as soon as we've parsed a successful upstream
+    // response — BEFORE the tool gate / schema validation early
+    // returns. Tokens are consumed upstream the moment the call
+    // completes; if we waited and a schema violation rejected the
+    // response, the caller would burn quota without it being
+    // recorded. Same LiteLLM "count on response" pattern as
+    // /v1/chat/completions, using the OpenAI-shape `prompt_tokens` /
+    // `completion_tokens` from the backend (the pool always speaks
+    // OpenAI; Anthropic mode is a shape adapter, not a parallel
+    // transport).
+    if status.is_success() {
+        if let Some(budget) = &state.budget {
+            let prompt = oai_resp
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let completion = oai_resp
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let record = SpendRecord {
+                api_key: api_key.clone(),
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                model: req.model.clone(),
+                created_at: chrono::Utc::now(),
+            };
+            if let Err(e) = budget.record_spend(&record).await {
+                warn!("budget record_spend (anthropic) error: {}", e);
+            }
+        }
+    }
+
     // Tool gate runs against the OpenAI-shaped response. Denied tool calls
     // are removed from `tool_calls` before we re-shape into Anthropic format.
     if let Some(gate) = state.tool_gate.as_ref() {
@@ -448,37 +483,6 @@ pub async fn messages(
             "output_tokens": oai_resp.get("usage").and_then(|u| u.get("completion_tokens")).cloned().unwrap_or(json!(0)),
         }
     });
-
-    // Record spend after the upstream returned a successful response.
-    // We use the OpenAI-shaped `prompt_tokens` / `completion_tokens`
-    // values here (not the Anthropic-shaped envelope below) because
-    // the backend pool always speaks OpenAI on the wire — Anthropic
-    // mode is a shape adapter, not a parallel transport. Same
-    // LiteLLM "count on response" pattern as /v1/chat/completions.
-    if status.is_success() {
-        if let Some(budget) = &state.budget {
-            let prompt = oai_resp
-                .get("usage")
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let completion = oai_resp
-                .get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let record = SpendRecord {
-                api_key: api_key.clone(),
-                prompt_tokens: prompt,
-                completion_tokens: completion,
-                model: req.model.clone(),
-                created_at: chrono::Utc::now(),
-            };
-            if let Err(e) = budget.record_spend(&record).await {
-                warn!("budget record_spend (anthropic) error: {}", e);
-            }
-        }
-    }
 
     (
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
