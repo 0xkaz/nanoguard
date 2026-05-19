@@ -14,11 +14,12 @@ Sections below tagged *Stage 2* describe a target state that is
 **not wired** today; the verification middleware exists but does
 not yet feed budget, audit, or PII off it:
 
-- **Budget integration is not wired.** `extract_api_key` in
-  `src/proxy/mod.rs` still uses the request body's OpenAI `user`
-  field as the budget key. `ClientView` does not carry a
-  `budget_key` slot, and no `token:<id>` / `user:<id>` admin form
-  exists.
+- ~~Budget integration is not wired.~~ **Shipped** (2026-05-18,
+  scenario 39). `ClientView` carries a `budget_key` slot set to
+  `token:<id>`; `/v1/chat/completions` uses it when the verifier has
+  attached a view. The legacy body-`user` bucket is preserved when
+  `[auth].enabled = false`. The `user:<id>` aggregate admin form
+  remains a follow-up (depends on the `users`-table slice).
 - **Audit `user_id` / `token_id` not added.** `AuditEntry` has no
   `user_id` or `token_id` field; the `api_key` column is still
   populated from the request body, not from `ClientView`.
@@ -190,8 +191,8 @@ callers get 401.
 
 ### ClientView
 
-The in-memory shape attached to each request as it stands in
-Stage 1:
+The in-memory shape attached to each request as of 2026-05-18
+(Stage 2 slice 1 shipped):
 
 ```rust
 struct ClientView {
@@ -199,17 +200,15 @@ struct ClientView {
     token_prefix:    String,         // "ng_p_a3k7"
     user_id:         i64,
     label:           Option<String>,
+    budget_key:      String,         // "token:<token_id>" — see Budget integration
 }
 ```
 
-The fields below are part of the longer-term design but are **not
-present today**. They are listed here for context, not as a current
-contract:
+The fields below remain part of the longer-term design but are **not
+present today**:
 
 - `allowed_models: AllowedModels` — Stage 2, lands with
   `multi-backend-routing.md`.
-- `budget_key: String` — Stage 2, lands with the Budget integration
-  rewrite below.
 - `pii_overrides: Option<Arc<PiiOverrides>>` — future, see Open
   questions.
 
@@ -253,13 +252,14 @@ behavior — there is no persistent cache state to lose.
 
 ## Budget integration
 
-> **Stage 2 — not yet wired.** `src/proxy/mod.rs` still calls
-> `extract_api_key(&body)` and reads the request body's OpenAI
-> `user` field as the budget key; `ClientView` is not consulted
-> for budget accounting and carries no `budget_key` slot. The
-> `token:<id>` / `user:<id>` admin forms are not implemented.
-> The rest of this section describes the target contract, not
-> current behavior.
+> **Status: partial.** As of 2026-05-18 the `token:<id>` budget
+> bucket is shipped: `ClientView` carries `budget_key`, and
+> `/v1/chat/completions` consults it whenever the verifier has
+> attached a view. The legacy body-`user` bucket is preserved on
+> deployments with `[auth].enabled = false`. The `user:<id>`
+> aggregate admin form is **not yet implemented** and depends on
+> the `users`-table slice. `/v1/messages` (Anthropic) also still
+> bypasses budget accounting entirely — that is the next slice.
 
 The existing `[budget]` machinery uses the OpenAI `user` field
 from the request body as the budget key, falling back to

@@ -3,7 +3,7 @@ pub mod redact;
 mod sse;
 
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::{
     audit::{AuditEntry, Verdict},
     budget::store::{BudgetCheck, SpendRecord},
+    client_auth::ClientView,
     guard::{
         deanonymize,
         vault::{LocalVault, Vault},
@@ -26,6 +27,7 @@ use crate::{
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(shared): State<SharedState>,
+    client: Option<Extension<ClientView>>,
     Json(mut body): Json<Value>,
 ) -> Response {
     // Snapshot the live config-derived state for the lifetime of this
@@ -36,7 +38,16 @@ pub async fn chat_completions(
 
     // Extract all message content for scanning
     let user_text = extract_messages_text(&body);
-    let api_key = extract_api_key(&body);
+    // Budget bucket + audit `api_key` column. When [auth].enabled = true,
+    // the verifier middleware has attached a ClientView; we use its
+    // budget_key (`token:<id>`) so accounting is per-verified-token. When
+    // [auth] is off there's no token, so we fall back to the legacy
+    // contract: read the OpenAI `user` body field, default to `"default"`.
+    // The OpenAI `user` field is still forwarded upstream in either case.
+    let api_key = match client.as_ref() {
+        Some(Extension(view)) => view.budget_key.clone(),
+        None => extract_api_key(&body),
+    };
     let model = body
         .get("model")
         .and_then(|v| v.as_str())

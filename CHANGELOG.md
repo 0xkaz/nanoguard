@@ -4,6 +4,18 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Changed — Client-auth Stage 2 (slice 1): per-token budget buckets
+
+When `[auth].enabled = true`, the budget bucket for `/v1/chat/completions` switches from the request body's self-asserted OpenAI `user` field to a verified `token:<id>` derived from the `ClientView` the verifier middleware attaches. A runaway script under one token no longer depletes a sibling token belonging to the same user, and a malicious caller can no longer squat on a victim's bucket by setting `"user": "victim"` in the request body. The body's `user` field is still forwarded to the upstream backend unchanged — it remains a backend-side usage tag, not a nanoguard policy decision.
+
+When `[auth].enabled = false`, the legacy body-`user`/`default` bucket is preserved verbatim so existing single-tenant deployments continue to work without config changes.
+
+`ClientView` gains a `budget_key: String` slot set during verification. `/v1/chat/completions` reads it via `Option<Extension<ClientView>>` and falls back to the legacy `extract_api_key(&body)` path only when no view is attached. Admin endpoints (`GET|PUT|DELETE /v1/admin/budget/:api_key`) accept the new `token:<id>` form because the path extractor is a free string — no schema migration is needed.
+
+Out of scope for this slice (tracked in [`docs/design/client-auth.md`](docs/design/client-auth.md)): Anthropic's `/v1/messages` still bypasses budget accounting entirely, the `user:<id>` aggregate admin form, audit `user_id` / `token_id` columns, `last_used_at` flush, and shadow mode. Each of those is its own Stage 2 slice.
+
+**e2e** — scenario 39 covers the new contract with 6 assertions: authed request succeeds, spend lands under `token:<id>`, the body's `user` field does **not** create a separate bucket (the squat scenario), the legacy `default` bucket stays untouched when `[auth].enabled = true`, the per-token limit applied to `token:<id>` is enforced (429), and with `[auth].enabled = false` the legacy body-`user` budgeting is preserved. Total `tools/e2e.sh` assertions: 192 (was 186 after PR #44).
+
 ### Added — Console Playground tab: query proxy and raw backend side by side
 
 New admin-only **Playground** tab in the Web Configuration UI: paste an OpenAI chat-completions request body, pick a backend from the dropdown, and click either "Send through proxy" (= full guardrail pipeline via `http://<listen>/v1/chat/completions`) or "Send direct to backend" (= `<backend.endpoint>/v1/chat/completions` with no guardrails). Both responses render side by side with their upstream HTTP status and round-trip latency, so an operator can compare "what guardrails did" against "what the backend would have answered". Two new endpoints back the tab: `POST /api/playground/proxy` and `POST /api/playground/backend`. Both are admin-only, both rotate CSRF on every call, and the backend-direction call reads `api_key` from the live `[backends.*]` config rather than trusting the caller — admins cannot exfiltrate keys or aim the call at an arbitrary URL through the playground.

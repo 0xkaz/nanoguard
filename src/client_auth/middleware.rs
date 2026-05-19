@@ -36,6 +36,13 @@ pub struct ClientView {
     pub token_prefix: String,
     pub user_id: i64,
     pub label: Option<String>,
+    /// Budget bucket for this request. Per-token (`token:<id>`) so a
+    /// runaway script under one token does not deplete another token
+    /// belonging to the same user. The OpenAI `user` field in the
+    /// request body is preserved and forwarded upstream, but is no
+    /// longer consulted for budget accounting once a token has been
+    /// verified.
+    pub budget_key: String,
 }
 
 /// Axum middleware fn.
@@ -140,6 +147,7 @@ pub async fn verify_request(
 
     let view = ClientView {
         token_id: row.id,
+        budget_key: format!("token:{}", row.id),
         token_prefix: row.prefix,
         user_id: row.user_id,
         label: row.label,
