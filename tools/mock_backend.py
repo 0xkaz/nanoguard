@@ -60,6 +60,24 @@ class MockHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        # Forced 5xx mode for the fallback e2e: a mock launched with
+        # `FAIL_STATUS=503` returns the configured status with a tiny
+        # JSON body on every POST. The proxy must walk the routing
+        # rule's `fallback` chain past this mock and surface the next
+        # backend's response.
+        fail = os.environ.get("FAIL_STATUS")
+        if fail:
+            try:
+                code = int(fail)
+            except ValueError:
+                code = 503
+            payload = json.dumps({"error": f"mock forced {code}"}).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         try:
             req = json.loads(body)
         except Exception:

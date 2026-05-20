@@ -22,6 +22,7 @@
 - reversible redaction is opt-in and deployment-specific
 - policy bundles and industry packs are still evolving
 - tool-gate and schema coverage still need broader edge-case testing
+- per-routing-rule 5xx fallback (try-once on primary failure; no health-check / circuit-breaker — those stay LiteLLM territory)
 
 ## Proposed
 

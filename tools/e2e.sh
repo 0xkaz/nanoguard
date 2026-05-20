@@ -788,44 +788,25 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 if grep -q "reload_ok" "$S22_AUDIT" 2>/dev/null; then
-    ok "22a. reload still records reload_ok when only restart-only keys changed"
+    ok "22a. reload still records reload_ok when a [backend] endpoint changes"
 else
     ng "22a. expected reload_ok in audit, got: $(tail -3 "$S22_AUDIT" 2>/dev/null || echo none)"
 fi
 
-if grep -q "restart-only key" "$S22_LOG" 2>/dev/null; then
-    ok "22b. proxy log warns about ignored restart-only key changes"
-else
-    ng "22b. expected restart-only-key warn in log; tail: $(tail -5 "$S22_LOG")"
-fi
-
-if grep -q "\[backend\].endpoint" "$S22_LOG" 2>/dev/null; then
-    ok "22c. warn names the changed key ([backend].endpoint)"
-else
-    ng "22c. expected [backend].endpoint in the warn; tail: $(tail -5 "$S22_LOG")"
-fi
-
-# Behavior contract for Greptile finding #1 (split routing fix):
-# Before the fix, AppState::backend_endpoint() read state.config.backend.endpoint
-# (= the reloaded "http://unreachable.example:9999") while Backend::forward_chat
-# kept reading from the preserved RuntimeHandles.backend.cfg. Both paths must
-# now agree.
-#
-# /v1/models can't tell them apart — the mock only handles POST, so a GET
-# returns 502 either way (mock returns 405 → nanoguard fails to parse JSON →
-# 502). Use POST /v1/chat/completions instead: the mock handles it and
-# returns 200 iff the request reached the original mock endpoint. If
-# forward_chat had silently switched to unreachable.example:9999, the call
-# would timeout / connection-refused and surface as 502.
+# 22b/22c were legacy assertions tied to the old "restart-only" warn
+# for `[backend].endpoint` changes. With `[backends.*]` now
+# hot-reloadable and `cfg.pool()` synthesizing `[backends.default]`
+# from any legacy `[backend]`, no warn fires and the change takes
+# effect immediately. The endpoint-edit-takes-effect contract is
+# now asserted in 22d below.
 CHAT_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$NG_URL/v1/chat/completions" \
     -H "Content-Type: application/json" \
     --max-time 5 \
     -d '{"model":"test","messages":[{"role":"user","content":"post-reload check"}]}')
-if [ "$CHAT_CODE" = "200" ]; then
-    ok "22d. /v1/chat/completions still reaches preserved Backend after SIGHUP (200)"
-else
-    ng "22d. /v1/chat/completions returned $CHAT_CODE — Backend may have switched to the edited endpoint"
-fi
+case "$CHAT_CODE" in
+    502|504|000) ok "22d. legacy [backend].endpoint edit takes effect on SIGHUP (request fails $CHAT_CODE)" ;;
+    *)           ng "22d. legacy [backend].endpoint edit was not applied; got $CHAT_CODE" ;;
+esac
 
 # Inverse smoke check: confirm the audit log doesn't accidentally contain
 # the original endpoint string. The error-sanitizer fix in commit c73ca3c
@@ -3035,9 +3016,10 @@ assert_eq "36a-default. default backend is `starter`" "$DEF" "starter"
 
 # 36b. POST /api/backends creates a new entry. The mutation lands in
 # nanoguard.toml on disk (toml_edit round-trip preserves other
-# sections); the proxy's live pool is restart-only, so /api/backends
-# from the *console* sees it via re-parsing the updated TOML on the
-# next request.
+# sections) AND fires a reload — `[backends.*]` is hot-reloadable, so
+# the new backend takes effect on the next request without a process
+# restart. The response carries restart_required = false to confirm
+# that contract to the SPA, which renders a "live now" toast.
 ADD_HDR="$LOGDIR/e2e.s36.add.hdr"
 ADD=$(curl -s -b "$S36_COOKIES" -c "$S36_COOKIES" \
     -D "$ADD_HDR" \
@@ -3045,8 +3027,8 @@ ADD=$(curl -s -b "$S36_COOKIES" -c "$S36_COOKIES" \
     -H "X-CSRF-Token: $S36_CSRF" \
     -d '{"provider":"openai","endpoint":"http://127.0.0.1:11700"}' \
     "$S36_CONSOLE_URL/api/backends?name=secondary")
-RESTART=$(echo "$ADD" | jq -r '.restart_required // empty')
-assert_eq "36b. POST /api/backends reports restart_required = true" "$RESTART" "true"
+RESTART=$(echo "$ADD" | jq -r '.restart_required')
+assert_eq "36b. POST /api/backends reports restart_required = false (hot-reload)" "$RESTART" "false"
 
 # Refresh CSRF for subsequent mutations.
 S36_CSRF=$(grep -i '^x-csrf-token-next:' "$ADD_HDR" 2>/dev/null \
@@ -4167,6 +4149,456 @@ assert_eq "42i. non-admin POST /api/users/:id/reset-password is rejected (403)" 
 
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
+
+# ============================================================================
+info "scenario 43: [backends.*] hot-reload — add/edit/delete without restart"
+# ============================================================================
+#
+# Before this PR, adding or removing a backend through the Console UI
+# only landed in nanoguard.toml on disk; the live pool was preserved
+# across reloads (see the old comment in src/reload.rs about
+# "restart-only to avoid orphaning per-backend reqwest pools"). That
+# was overly conservative — in-flight requests hold an `Arc<AppState>`
+# snapshot via `shared.load_full()`, so the old pool stays alive until
+# the last request drops its Arc. Dropping the old `BackendPoolRuntime`
+# only releases its reqwest connection pools *after* in-flight
+# requests finish. Scenario 43 locks in the new contract: a backend
+# added via POST /api/backends is reachable on the very next
+# /v1/chat/completions call without a restart.
+
+kill_leftover_nanoguards
+sleep 0.3
+
+S43_DIR="$LOGDIR/e2e.s43.workdir"
+rm -rf "$S43_DIR"
+mkdir -p "$S43_DIR"
+
+S43_TOML="$S43_DIR/nanoguard.toml"
+S43_PROXY_LOG="$LOGDIR/ng.s43.proxy.log"
+S43_MOCK_A_PORT=11701
+S43_MOCK_B_PORT=11702
+S43_MOCK_A_LOG="$LOGDIR/mock.s43.a.log"
+S43_MOCK_B_LOG="$LOGDIR/mock.s43.b.log"
+S43_CONSOLE_PORT=18103
+S43_CONSOLE_URL="http://127.0.0.1:$S43_CONSOLE_PORT"
+S43_COOKIES="$LOGDIR/e2e.s43.cookies"
+S43_DB="$S43_DIR/nanoguard.db"
+S43_RELOAD_SOCK="$S43_DIR/reload.sock"
+rm -f "$S43_COOKIES" "$S43_RELOAD_SOCK"
+
+BACKEND_LABEL="A" python3 "$MOCK" "$S43_MOCK_A_PORT" > "$S43_MOCK_A_LOG" 2>&1 &
+S43_MOCK_A_PID=$!
+BACKEND_LABEL="B" python3 "$MOCK" "$S43_MOCK_B_PORT" > "$S43_MOCK_B_LOG" 2>&1 &
+S43_MOCK_B_PID=$!
+sleep 0.4
+
+cat > "$S43_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[backends.alpha]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S43_MOCK_A_PORT"
+
+[routing]
+default = "alpha"
+
+[budget]
+enabled = false
+db_path = "$S43_DB"
+
+[reload]
+socket = "$S43_RELOAD_SOCK"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S43_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+audit_path = "$S43_DIR/console-audit.jsonl"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S43_BOOTSTRAP_PW" }
+EOF
+
+S43_PW="s43-pw-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S43_TOML" S43_BOOTSTRAP_PW="$S43_PW" \
+    "$BIN" > "$S43_PROXY_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "43-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+wait_for_url "43-pre. console boot" "$S43_CONSOLE_URL/" 15 || exit 1
+
+# 43a. Baseline: only `alpha` is in the pool; a request for the unknown
+# `beta-model` falls through to the routing default = alpha (mock A).
+RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"beta-model","messages":[{"role":"user","content":"hello-43a"}]}')
+ECHO_A=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+case "$ECHO_A" in
+    "[A] You said: hello-43a") ok "43a. baseline: unmatched model goes to default backend (alpha)" ;;
+    *) ng "43a. expected mock A's echo before backend add; got: $ECHO_A" ;;
+esac
+
+# Login as admin and pick up the initial CSRF token.
+S43_LOGIN=$(curl -s -c "$S43_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S43_PW\"}" \
+    "$S43_CONSOLE_URL/api/login")
+S43_CSRF=$(echo "$S43_LOGIN" | jq -r '.csrf_token // empty')
+if [ -z "$S43_CSRF" ] || [ "$S43_CSRF" = "null" ]; then
+    ng "43-pre. admin login did not return a csrf token: $S43_LOGIN"
+    kill "$NG_PID" 2>/dev/null || true
+    exit 1
+fi
+
+# 43b. POST /api/backends?name=beta — add a second backend. The
+# response must report restart_required = false because [backends.*]
+# is now hot-reloadable.
+S43_ADD_HDR="$LOGDIR/e2e.s43.add.hdr"
+S43_ADD=$(curl -s -b "$S43_COOKIES" -c "$S43_COOKIES" \
+    -D "$S43_ADD_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S43_CSRF" \
+    -d "{\"provider\":\"openai\",\"endpoint\":\"http://127.0.0.1:$S43_MOCK_B_PORT\"}" \
+    "$S43_CONSOLE_URL/api/backends?name=beta")
+S43_RESTART=$(echo "$S43_ADD" | jq -r '.restart_required')
+assert_eq "43b. POST /api/backends reports restart_required=false" "$S43_RESTART" "false"
+S43_CSRF=$(grep -i '^x-csrf-token-next:' "$S43_ADD_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S43_CSRF" ] && S43_CSRF=$(echo "$S43_LOGIN" | jq -r '.csrf_token // empty')
+
+# 43c. Add a routing rule pointing the bare model name `beta-model`
+# at the new backend. With hot reload off, the rule would land but
+# the new pool wouldn't be reachable; with it on, the very next
+# request hits mock B.
+S43_RT_HDR="$LOGDIR/e2e.s43.routing.hdr"
+curl -s -o /dev/null -b "$S43_COOKIES" -c "$S43_COOKIES" \
+    -D "$S43_RT_HDR" \
+    -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S43_CSRF" \
+    -d '{"default":"alpha","rules":[{"model":"beta-model","backend":"beta"}]}' \
+    "$S43_CONSOLE_URL/api/routing"
+S43_CSRF=$(grep -i '^x-csrf-token-next:' "$S43_RT_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S43_CSRF" ] && S43_CSRF=$(echo "$S43_LOGIN" | jq -r '.csrf_token // empty')
+
+# Give the SIGHUP-driven reload a moment to land. A 2s ceiling is
+# enough — reload_once() is synchronous after spawn_blocking and
+# typically completes in <50ms.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d '{"model":"beta-model","messages":[{"role":"user","content":"hello-43c"}]}')
+    ECHO_C=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+    [ "$ECHO_C" = "[B] You said: hello-43c" ] && break
+    sleep 0.2
+done
+case "$ECHO_C" in
+    "[B] You said: hello-43c") ok "43c. new backend 'beta' is reachable post-reload (mock B answered without restart)" ;;
+    *) ng "43c. expected mock B after hot-reload; got: $ECHO_C" ;;
+esac
+
+# 43d. PUT /api/backends/:name to change `beta`'s endpoint. Swap the
+# endpoint to a port nothing listens on; the next /v1/chat/completions
+# routed to `beta` must fail with 502 (connection refused), proving
+# the live pool picked up the edit. If the live pool were still on
+# the old endpoint, we'd get a 200 from mock B.
+S43_EDIT_HDR="$LOGDIR/e2e.s43.edit.hdr"
+curl -s -o /dev/null -b "$S43_COOKIES" -c "$S43_COOKIES" \
+    -D "$S43_EDIT_HDR" \
+    -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S43_CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:1"}' \
+    "$S43_CONSOLE_URL/api/backends/beta"
+S43_CSRF=$(grep -i '^x-csrf-token-next:' "$S43_EDIT_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S43_CSRF" ] && S43_CSRF=$(echo "$S43_LOGIN" | jq -r '.csrf_token // empty')
+
+# Poll until the edit takes effect or we give up.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    EDIT_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 3 \
+        "$NG_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d '{"model":"beta-model","messages":[{"role":"user","content":"hello-43d"}]}')
+    [ "$EDIT_CODE" = "502" ] && break
+    sleep 0.2
+done
+assert_eq "43d. PUT /api/backends/:name endpoint takes effect on next request (502 from dead port)" "$EDIT_CODE" "502"
+
+# Restore the endpoint so subsequent steps see mock B again.
+curl -s -o /dev/null -b "$S43_COOKIES" -c "$S43_COOKIES" \
+    -D "$S43_EDIT_HDR" \
+    -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S43_CSRF" \
+    -d "{\"provider\":\"openai\",\"endpoint\":\"http://127.0.0.1:$S43_MOCK_B_PORT\"}" \
+    "$S43_CONSOLE_URL/api/backends/beta"
+S43_CSRF=$(grep -i '^x-csrf-token-next:' "$S43_EDIT_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S43_CSRF" ] && S43_CSRF=$(echo "$S43_LOGIN" | jq -r '.csrf_token // empty')
+
+# 43e. DELETE /api/backends/:name removes the backend from the live
+# pool. Drop the routing rule first so the delete is not rejected
+# with "rule still references it" (handler-side guard). Once the
+# backend is gone, a request to `beta-model` should fall back to
+# the routing default (alpha → mock A).
+S43_DROP_RULE_HDR="$LOGDIR/e2e.s43.drop_rule.hdr"
+curl -s -o /dev/null -b "$S43_COOKIES" -c "$S43_COOKIES" \
+    -D "$S43_DROP_RULE_HDR" \
+    -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S43_CSRF" \
+    -d '{"default":"alpha","rules":[]}' \
+    "$S43_CONSOLE_URL/api/routing"
+S43_CSRF=$(grep -i '^x-csrf-token-next:' "$S43_DROP_RULE_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S43_CSRF" ] && S43_CSRF=$(echo "$S43_LOGIN" | jq -r '.csrf_token // empty')
+
+S43_DEL_HDR="$LOGDIR/e2e.s43.del.hdr"
+S43_DEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S43_COOKIES" -c "$S43_COOKIES" \
+    -D "$S43_DEL_HDR" \
+    -X DELETE \
+    -H "X-CSRF-Token: $S43_CSRF" \
+    "$S43_CONSOLE_URL/api/backends/beta")
+assert_eq "43e. DELETE /api/backends/beta succeeds (200)" "$S43_DEL_CODE" "200"
+
+# Poll until the routing falls back to default. The `beta-model`
+# request now has no rule and no `beta` backend, so it falls
+# through to the default (alpha).
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d '{"model":"beta-model","messages":[{"role":"user","content":"hello-43e"}]}')
+    ECHO_E=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+    [ "$ECHO_E" = "[A] You said: hello-43e" ] && break
+    sleep 0.2
+done
+case "$ECHO_E" in
+    "[A] You said: hello-43e") ok "43e. deleted backend is removed from live pool (request falls back to default)" ;;
+    *) ng "43e. expected fallthrough to alpha after delete; got: $ECHO_E" ;;
+esac
+
+# 43f. The audit log records `backend_create` / `backend_update` /
+# `backend_delete` mutations. The reload hook in handlers.rs fires on
+# every one; we verify by greping the console audit file for the three
+# action kinds.
+S43_AUDIT="$S43_DIR/console-audit.jsonl"
+for action in backend_create backend_update backend_delete; do
+    if grep -q "\"action\":\"$action\"" "$S43_AUDIT" 2>/dev/null; then
+        ok "43f. console audit records $action"
+    else
+        ng "43f. expected $action in console audit; tail: $(tail -5 "$S43_AUDIT" 2>/dev/null)"
+    fi
+done
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+kill "$S43_MOCK_A_PID" "$S43_MOCK_B_PID" 2>/dev/null || true
+wait "$S43_MOCK_A_PID" "$S43_MOCK_B_PID" 2>/dev/null || true
+
+# ============================================================================
+info "scenario 44: per-rule fallback chain on upstream 5xx"
+# ============================================================================
+#
+# A routing rule can carry a `fallback = ["backend2", ...]` list. The
+# proxy tries the primary first; on network error or status >= 500,
+# walks the fallback list in order. Once a backend returns a non-5xx
+# status (or the chain is exhausted), the proxy commits. Fallbacks
+# never fire mid-stream — once the upstream has returned bytes we
+# are committed to that backend.
+
+kill_leftover_nanoguards
+sleep 0.3
+
+S44_DIR="$LOGDIR/e2e.s44.workdir"
+rm -rf "$S44_DIR"
+mkdir -p "$S44_DIR"
+
+S44_TOML="$S44_DIR/nanoguard.toml"
+S44_PROXY_LOG="$LOGDIR/ng.s44.proxy.log"
+S44_PRIMARY_PORT=11801
+S44_BACKUP_PORT=11802
+S44_PRIMARY_LOG="$LOGDIR/mock.s44.primary.log"
+S44_BACKUP_LOG="$LOGDIR/mock.s44.backup.log"
+
+# Spin up two mocks: primary forced to 503 on every POST; backup
+# returns 200 with a labelled echo so the test can confirm the
+# fallback fired.
+BACKEND_LABEL="primary" FAIL_STATUS=503 python3 "$MOCK" "$S44_PRIMARY_PORT" > "$S44_PRIMARY_LOG" 2>&1 &
+S44_PRIMARY_PID=$!
+BACKEND_LABEL="backup" python3 "$MOCK" "$S44_BACKUP_PORT" > "$S44_BACKUP_LOG" 2>&1 &
+S44_BACKUP_PID=$!
+sleep 0.4
+
+cat > "$S44_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:$NG_PORT"
+log_level = "info"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[backends.primary]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S44_PRIMARY_PORT"
+
+[backends.backup]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S44_BACKUP_PORT"
+
+[routing]
+default = "backup"
+rules = [
+    { model = "ha", backend = "primary", fallback = ["backup"] },
+    { model = "primary-only", backend = "primary" },
+]
+
+[budget]
+enabled = false
+db_path = "$S44_DIR/proxy.db"
+EOF
+
+NANOGUARD_CONFIG="$S44_TOML" "$BIN" > "$S44_PROXY_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "44-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+
+# 44a. `model: ha` matches the rule with `fallback = ["backup"]`. The
+# primary returns 503, so the proxy must walk to `backup` and surface
+# its 200 to the caller.
+RESP=$(curl -s "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"ha","messages":[{"role":"user","content":"hello-44a"}]}')
+ECHO_44A=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+case "$ECHO_44A" in
+    "[backup] You said: hello-44a") ok "44a. 5xx on primary triggers fallback to backup (200)" ;;
+    *) ng "44a. expected backup's echo on fallback; got: $ECHO_44A" ;;
+esac
+
+# 44b. `model: primary-only` has no fallback. A 5xx on primary must
+# surface verbatim to the caller — the fallback chain has length 1,
+# and the assert is that we don't silently retry on a different rule.
+RESP_CODE=$(curl -s -o "$LOGDIR/s44_primary_only.json" -w "%{http_code}" \
+    "$NG_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"primary-only","messages":[{"role":"user","content":"hello-44b"}]}')
+assert_eq "44b. rule without fallback surfaces primary's 503 unchanged" "$RESP_CODE" "503"
+
+# 44c. Anthropic /v1/messages walks the same chain. Use the same `ha`
+# model so the routing rule applies; the proxy's Anthropic adapter
+# must honor the chain identically. The body shape differs from
+# /v1/chat/completions but the routing layer doesn't care.
+RESP=$(curl -s "$NG_URL/v1/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"ha","max_tokens":64,"messages":[{"role":"user","content":"hello-44c"}]}')
+TYPE_44C=$(echo "$RESP" | jq -r '.type // empty')
+TEXT_44C=$(echo "$RESP" | jq -r '.content[0].text // empty')
+assert_eq "44c. /v1/messages fallback returns Anthropic-shape envelope (type=message)" "$TYPE_44C" "message"
+case "$TEXT_44C" in
+    "[backup] You said: hello-44c") ok "44c. /v1/messages text reflects backup's echo (fallback fired)" ;;
+    *) ng "44c. expected backup's echo via /v1/messages; got: $TEXT_44C" ;;
+esac
+
+# 44d. PUT /api/routing rejects a fallback that points at a backend
+# that isn't configured. (The proxy reload would also bail, but
+# catching it on the PUT means the operator sees the 400 in the UI
+# instead of having to dig through audit-log reload_failed entries.)
+S44_CONSOLE_PORT=18104
+# Spin a second proxy on a different listen port so we can drive PUT
+# /api/routing without disturbing the running 5xx-fallback proxy.
+S44_CONSOLE_DIR="$LOGDIR/e2e.s44.console"
+rm -rf "$S44_CONSOLE_DIR"
+mkdir -p "$S44_CONSOLE_DIR"
+S44_CONSOLE_TOML="$S44_CONSOLE_DIR/nanoguard.toml"
+S44_CONSOLE_RELOAD_SOCK="$S44_CONSOLE_DIR/reload.sock"
+cat > "$S44_CONSOLE_TOML" <<EOF
+[nanoguard]
+listen = "127.0.0.1:18105"
+log_level = "info"
+
+[input.pii]
+enabled = false
+action = "log"
+
+[backends.primary]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S44_PRIMARY_PORT"
+
+[backends.backup]
+provider = "openai"
+endpoint = "http://127.0.0.1:$S44_BACKUP_PORT"
+
+[routing]
+default = "backup"
+
+[budget]
+enabled = false
+db_path = "$S44_CONSOLE_DIR/console.db"
+
+[reload]
+socket = "$S44_CONSOLE_RELOAD_SOCK"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S44_CONSOLE_PORT"
+session_secret = "$(openssl rand -hex 32)"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+bootstrap_admin = { username = "admin", password_env = "S44_PW" }
+EOF
+S44_PW="s44-pw-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S44_CONSOLE_TOML" S44_PW="$S44_PW" \
+    "$BIN" > "$LOGDIR/ng.s44.console.log" 2>&1 &
+S44_CONSOLE_NG_PID=$!
+wait_for_url "44-pre. second proxy for console PUT" \
+    "http://127.0.0.1:$S44_CONSOLE_PORT/" 15 || exit 1
+
+S44_COOKIES="$LOGDIR/e2e.s44.cookies"
+S44_LOGIN=$(curl -s -c "$S44_COOKIES" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S44_PW\"}" \
+    "http://127.0.0.1:$S44_CONSOLE_PORT/api/login")
+S44_CSRF=$(echo "$S44_LOGIN" | jq -r '.csrf_token // empty')
+
+S44_BAD_CODE=$(curl -s -o "$LOGDIR/s44_bad.json" -w "%{http_code}" \
+    -b "$S44_COOKIES" -c "$S44_COOKIES" \
+    -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S44_CSRF" \
+    -d '{"default":"backup","rules":[{"model":"x","backend":"primary","fallback":["ghost"]}]}' \
+    "http://127.0.0.1:$S44_CONSOLE_PORT/api/routing")
+assert_eq "44d. PUT /api/routing rejects unknown fallback backend (400)" "$S44_BAD_CODE" "400"
+
+# 44e. Self-fallback (primary in its own fallback list) is rejected.
+S44_SELF_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S44_COOKIES" -c "$S44_COOKIES" \
+    -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S44_CSRF" \
+    -d '{"default":"backup","rules":[{"model":"x","backend":"primary","fallback":["primary"]}]}' \
+    "http://127.0.0.1:$S44_CONSOLE_PORT/api/routing")
+assert_eq "44e. PUT /api/routing rejects self-fallback (400)" "$S44_SELF_CODE" "400"
+
+kill "$NG_PID" "$S44_CONSOLE_NG_PID" 2>/dev/null || true
+wait "$NG_PID" "$S44_CONSOLE_NG_PID" 2>/dev/null || true
+kill "$S44_PRIMARY_PID" "$S44_BACKUP_PID" 2>/dev/null || true
+wait "$S44_PRIMARY_PID" "$S44_BACKUP_PID" 2>/dev/null || true
 
 # --- summary ---------------------------------------------------------------
 
