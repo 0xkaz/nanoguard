@@ -269,6 +269,10 @@ pub async fn run(
             "/api/users/:id/force-revoke-tokens",
             post(handlers::api_force_revoke_user_tokens),
         )
+        .route(
+            "/api/users/:id/reset-password",
+            post(handlers::api_reset_user_password),
+        )
         .route("/api/edit", post(handlers::api_edit_file))
         .route("/api/validate", post(handlers::api_validate_file))
         .route("/api/backups", get(handlers::api_list_backups))

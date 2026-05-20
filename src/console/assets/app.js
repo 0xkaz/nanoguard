@@ -571,11 +571,16 @@ async function loadBackups(path) {
 
 // ── Users (admin) ───────────────────────────────────────────
 
+// Cached list of the most-recent `loadUsers()` fetch so the Edit modal can
+// pull a row by id without a second round-trip.
+let usersCache = [];
+
 async function loadUsers() {
   try {
     const res = await api('/api/users');
+    usersCache = res.data || [];
     const tbody = $('#users-table tbody');
-    tbody.innerHTML = (res.data || []).map(u => `
+    tbody.innerHTML = usersCache.map(u => `
       <tr>
         <td>${u.id}</td>
         <td>${esc(u.username)}</td>
@@ -609,10 +614,88 @@ async function loadUsers() {
         loadUsers();
       });
     });
+    $$('#users-table [data-edit]').forEach(btn => {
+      btn.addEventListener('click', () => openEditUser(Number(btn.dataset.edit)));
+    });
   } catch (err) {
     $('#users-table tbody').innerHTML = `<tr><td colspan="6" class="error">${esc(err.message)}</td></tr>`;
   }
 }
+
+function openEditUser(id) {
+  const u = usersCache.find(x => x.id === id);
+  if (!u) return;
+  // The `allowed_models` column is stored as JSON text. Parse it back to a
+  // comma-separated string for the input; if the parse fails (legacy /
+  // hand-edited rows), show the raw value so the operator can still fix it.
+  let allowed = '';
+  try {
+    const arr = JSON.parse(u.allowed_models || '[]');
+    if (Array.isArray(arr)) allowed = arr.join(', ');
+    else allowed = u.allowed_models || '';
+  } catch (_) {
+    allowed = u.allowed_models || '';
+  }
+  $('#edit-user-id').textContent = String(u.id);
+  $('#edit-user-username').textContent = u.username;
+  $('#edit-user-role').value = u.role || 'user';
+  $('#edit-user-allowed-models').value = allowed;
+  $('#edit-user-new-password').value = '';
+  $('#edit-user-error').textContent = '';
+  $('#edit-user-status').textContent = '';
+  $('#edit-user-status').classList.remove('success', 'error');
+  $('#edit-user-modal').dataset.userId = String(u.id);
+  $('#edit-user-modal').showModal();
+}
+
+$('#edit-user-close').addEventListener('click', () => $('#edit-user-modal').close());
+
+$('#edit-user-save').addEventListener('click', async (e) => {
+  e.preventDefault();
+  $('#edit-user-error').textContent = '';
+  const id = Number($('#edit-user-modal').dataset.userId);
+  const role = $('#edit-user-role').value;
+  // Wire format for allowed_models is a JSON array string. Empty input ⇒
+  // "[]" ⇒ no restriction (matches the DB default).
+  const raw = $('#edit-user-allowed-models').value.trim();
+  const list = raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  try {
+    await api(`/api/users/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ role, allowed_models: JSON.stringify(list) }),
+    });
+    $('#edit-user-status').textContent = 'Saved.';
+    $('#edit-user-status').classList.add('success');
+    loadUsers();
+  } catch (err) {
+    $('#edit-user-error').textContent = err.message;
+  }
+});
+
+$('#edit-user-reset-pw').addEventListener('click', async (e) => {
+  e.preventDefault();
+  $('#edit-user-error').textContent = '';
+  $('#edit-user-status').textContent = '';
+  $('#edit-user-status').classList.remove('success', 'error');
+  const id = Number($('#edit-user-modal').dataset.userId);
+  const pw = $('#edit-user-new-password').value;
+  if (pw.length < 12) {
+    $('#edit-user-error').textContent = 'Password must be at least 12 characters.';
+    return;
+  }
+  if (!confirm('Reset this user’s password and sign them out of every session?')) return;
+  try {
+    await api(`/api/users/${id}/reset-password`, {
+      method: 'POST',
+      body: JSON.stringify({ password: pw }),
+    });
+    $('#edit-user-new-password').value = '';
+    $('#edit-user-status').textContent = 'Password reset. All sessions for this user have been invalidated.';
+    $('#edit-user-status').classList.add('success');
+  } catch (err) {
+    $('#edit-user-error').textContent = err.message;
+  }
+});
 
 $('#create-user-btn').addEventListener('click', () => {
   $('#user-modal').showModal();
