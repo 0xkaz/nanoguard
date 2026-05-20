@@ -205,6 +205,39 @@
   </form>
 </dialog>
 
+<!-- Edit User Modal -->
+<dialog id="user-edit-modal">
+  <form method="dialog" class="modal-form">
+    <h3>Edit User</h3>
+    <p class="hint">Editing <code id="edit-user-username"></code> <span class="hint subtle">(id <span id="edit-user-id"></span>)</span></p>
+    <div class="field">
+      <label for="edit-user-role">Role</label>
+      <select id="edit-user-role"><option value="user">user</option><option value="admin">admin</option></select>
+    </div>
+    <div class="field">
+      <label for="edit-user-allowed-models">Allowed models</label>
+      <input type="text" id="edit-user-allowed-models" placeholder="comma-separated, blank = all">
+      <p class="hint">Comma-separated model names. Leave blank to allow every model the routing config exposes.</p>
+    </div>
+    <p id="edit-user-error" class="error"></p>
+    <p id="edit-user-status" class="status" role="status" aria-live="polite"></p>
+    <div class="actions">
+      <button type="submit" id="edit-user-save" class="btn primary">Save</button>
+      <button type="button" id="edit-user-close" class="btn">Close</button>
+    </div>
+    <hr>
+    <h4>Reset password</h4>
+    <p class="hint">Replaces the password hash and signs the target user out of every session.</p>
+    <div class="field">
+      <label for="edit-user-new-password">New password (min 12 chars)</label>
+      <input type="password" id="edit-user-new-password" minlength="12" autocomplete="new-password">
+    </div>
+    <div class="actions">
+      <button type="button" id="edit-user-reset-pw" class="btn danger">Reset Password</button>
+    </div>
+  </form>
+</dialog>
+
 <script src="/app.js"></script>
 </body>
 </html>

@@ -3983,6 +3983,191 @@ esac
 kill "$NG_PID" 2>/dev/null || true
 wait "$NG_PID" 2>/dev/null || true
 
+# ============================================================================
+info "scenario 42: Console Users tab — allowed_models edit + password reset"
+# ============================================================================
+#
+# Two long-standing gaps closed in one feature:
+#
+#   - `allowed_models` was settable in the DB schema and `UpdateUserRequest`
+#     but had no Web UI / API exercise. The handler accepted it but nothing
+#     exercised the path end-to-end.
+#   - Password reset for a *different* user was CLI-only via
+#     `nanoguard-admin set-password`, forcing console admins to drop to a
+#     shell to recover a user. The new POST /api/users/:id/reset-password
+#     mirrors the CLI exactly (hash + session sweep in one transaction) and
+#     this scenario covers the security contract: the *target* user is
+#     signed out, and login with the *old* password no longer works.
+
+kill_leftover_nanoguards
+S42_PORT=18099
+S42_CONSOLE_URL="http://127.0.0.1:$S42_PORT"
+S42_DB="$LOGDIR/e2e.s42.db"
+S42_TOML="$LOGDIR/e2e.s42.toml"
+S42_LOG="$LOGDIR/ng.s42.log"
+S42_COOKIES_ADMIN="$LOGDIR/e2e.s42.admin.cookies"
+S42_COOKIES_TARGET="$LOGDIR/e2e.s42.target.cookies"
+S42_RELOAD_SOCK="$LOGDIR/e2e.s42.reload.sock"
+rm -f "$S42_DB" "$S42_COOKIES_ADMIN" "$S42_COOKIES_TARGET" "$S42_RELOAD_SOCK"
+
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S42_TOML"
+cat >> "$S42_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S42_DB"
+admin_api_key = "s42-admin"
+
+[reload]
+socket = "$S42_RELOAD_SOCK"
+
+[console]
+enabled = true
+listen = "127.0.0.1:$S42_PORT"
+session_secret = "$(openssl rand -hex 32)"
+session_ttl_hours = 1
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup = false
+bootstrap_admin = { username = "admin", password_env = "S42_BOOTSTRAP_PASSWORD" }
+EOF
+
+S42_ADMIN_PW="s42-admin-$(openssl rand -hex 8)"
+NANOGUARD_CONFIG="$S42_TOML" S42_BOOTSTRAP_PASSWORD="$S42_ADMIN_PW" \
+    "$BIN" > "$S42_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "42-pre. console boot" "$S42_CONSOLE_URL/" 15 || exit 1
+
+# 42a. Admin logs in, captures CSRF.
+ADMIN42=$(curl -s -c "$S42_COOKIES_ADMIN" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$S42_ADMIN_PW\"}" \
+    "$S42_CONSOLE_URL/api/login")
+S42_CSRF=$(echo "$ADMIN42" | jq -r '.csrf_token // empty')
+if [ -n "$S42_CSRF" ] && [ "$S42_CSRF" != "null" ]; then
+    ok "42a. admin login returns a csrf token"
+else
+    ng "42a. admin login failed: $ADMIN42"
+    kill "$NG_PID" 2>/dev/null || true
+    exit 1
+fi
+
+# 42b. Admin creates a target user we will edit.
+S42_TARGET_PW="s42-target-$(openssl rand -hex 8)"
+S42_CREATE_HDR="$LOGDIR/e2e.s42.create.hdr"
+S42_CREATE=$(curl -s -b "$S42_COOKIES_ADMIN" -c "$S42_COOKIES_ADMIN" \
+    -D "$S42_CREATE_HDR" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S42_CSRF" \
+    -d "{\"username\":\"alice\",\"password\":\"$S42_TARGET_PW\",\"role\":\"user\"}" \
+    "$S42_CONSOLE_URL/api/users")
+S42_TARGET_ID=$(echo "$S42_CREATE" | jq -r '.id // empty')
+if [ -n "$S42_TARGET_ID" ] && [ "$S42_TARGET_ID" != "null" ]; then
+    ok "42b. admin creates target user 'alice'"
+else
+    ng "42b. target user create failed: $S42_CREATE"
+fi
+S42_CSRF=$(grep -i '^x-csrf-token-next:' "$S42_CREATE_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S42_CSRF" ] && S42_CSRF=$(echo "$ADMIN42" | jq -r '.csrf_token // empty')
+
+# 42c. PUT /api/users/:id with allowed_models persists, list reflects it.
+S42_EDIT_HDR="$LOGDIR/e2e.s42.edit.hdr"
+curl -s -o /dev/null -b "$S42_COOKIES_ADMIN" -c "$S42_COOKIES_ADMIN" \
+    -D "$S42_EDIT_HDR" \
+    -X PUT \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S42_CSRF" \
+    -d '{"allowed_models":"[\"gpt-4o-mini\",\"claude-3-5-sonnet\"]"}' \
+    "$S42_CONSOLE_URL/api/users/$S42_TARGET_ID"
+S42_CSRF=$(grep -i '^x-csrf-token-next:' "$S42_EDIT_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S42_CSRF" ] && S42_CSRF=$(echo "$ADMIN42" | jq -r '.csrf_token // empty')
+
+S42_LIST=$(curl -s -b "$S42_COOKIES_ADMIN" "$S42_CONSOLE_URL/api/users")
+S42_ALLOWED=$(echo "$S42_LIST" | jq -r --arg id "$S42_TARGET_ID" \
+    '.data[] | select(.id == ($id|tonumber)) | .allowed_models')
+case "$S42_ALLOWED" in
+    *gpt-4o-mini*claude-3-5-sonnet*) ok "42c. allowed_models edit persisted ($S42_ALLOWED)" ;;
+    *) ng "42c. allowed_models not updated; got: $S42_ALLOWED" ;;
+esac
+
+# 42d. The target user logs in with the original password — baseline that
+# the account works before we reset it.
+S42_BASELINE=$(curl -s -o /dev/null -w "%{http_code}" -c "$S42_COOKIES_TARGET" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"alice\",\"password\":\"$S42_TARGET_PW\"}" \
+    "$S42_CONSOLE_URL/api/login")
+assert_eq "42d. target user can log in with the original password" "$S42_BASELINE" "200"
+
+# 42e. Admin resets the target's password through the new endpoint.
+S42_NEW_PW="s42-fresh-$(openssl rand -hex 8)"
+S42_RESET_HDR="$LOGDIR/e2e.s42.reset.hdr"
+S42_RESET_CODE=$(curl -s -o "$LOGDIR/s42_reset.json" -w "%{http_code}" \
+    -b "$S42_COOKIES_ADMIN" -c "$S42_COOKIES_ADMIN" \
+    -D "$S42_RESET_HDR" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S42_CSRF" \
+    -d "{\"password\":\"$S42_NEW_PW\"}" \
+    "$S42_CONSOLE_URL/api/users/$S42_TARGET_ID/reset-password")
+assert_eq "42e. POST /api/users/:id/reset-password returns 200" "$S42_RESET_CODE" "200"
+S42_RESET_USER=$(jq -r '.username // empty' "$LOGDIR/s42_reset.json")
+assert_eq "42e-body. reset response carries the target username" "$S42_RESET_USER" "alice"
+S42_CSRF=$(grep -i '^x-csrf-token-next:' "$S42_RESET_HDR" 2>/dev/null \
+    | awk '{print $2}' | tr -d '\r')
+[ -z "$S42_CSRF" ] && S42_CSRF=$(echo "$ADMIN42" | jq -r '.csrf_token // empty')
+
+# 42f. The old password is gone — login with it returns 401.
+S42_OLD_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"alice\",\"password\":\"$S42_TARGET_PW\"}" \
+    "$S42_CONSOLE_URL/api/login")
+assert_eq "42f. old password is rejected after reset (401)" "$S42_OLD_CODE" "401"
+
+# 42g. The new password works.
+S42_NEW_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"alice\",\"password\":\"$S42_NEW_PW\"}" \
+    "$S42_CONSOLE_URL/api/login")
+assert_eq "42g. new password lets the target user sign in (200)" "$S42_NEW_CODE" "200"
+
+# 42h. The target's prior session cookie (captured before the reset) is no
+# longer authoritative — /api/me with that cookie returns 401 because
+# delete_user_sessions ran inside the reset transaction.
+S42_STALE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -b "$S42_COOKIES_TARGET" "$S42_CONSOLE_URL/api/me")
+assert_eq "42h. target's pre-reset session is invalidated (401 on /api/me)" "$S42_STALE_CODE" "401"
+
+# 42i. Non-admin cannot reset another user's password — guarded by
+# require_admin() the same way the rest of the user-management surface is.
+# Mint a viewer and confirm the reset endpoint rejects it.
+S42_VIEWER_PW="s42-viewer-$(openssl rand -hex 8)"
+curl -s -o /dev/null -b "$S42_COOKIES_ADMIN" -c "$S42_COOKIES_ADMIN" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S42_CSRF" \
+    -d "{\"username\":\"bob\",\"password\":\"$S42_VIEWER_PW\",\"role\":\"user\"}" \
+    "$S42_CONSOLE_URL/api/users"
+S42_VIEWER_COOKIE="$LOGDIR/e2e.s42.viewer.cookies"
+S42_VIEWER_LOGIN=$(curl -s -c "$S42_VIEWER_COOKIE" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"bob\",\"password\":\"$S42_VIEWER_PW\"}" \
+    "$S42_CONSOLE_URL/api/login")
+S42_VIEWER_CSRF=$(echo "$S42_VIEWER_LOGIN" | jq -r '.csrf_token // empty')
+S42_FORBIDDEN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$S42_VIEWER_COOKIE" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $S42_VIEWER_CSRF" \
+    -X POST \
+    -d "{\"password\":\"s42-non-admin-attempt-pw-1\"}" \
+    "$S42_CONSOLE_URL/api/users/$S42_TARGET_ID/reset-password")
+assert_eq "42i. non-admin POST /api/users/:id/reset-password is rejected (403)" "$S42_FORBIDDEN_CODE" "403"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"

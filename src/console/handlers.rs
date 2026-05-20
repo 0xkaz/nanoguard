@@ -85,6 +85,11 @@ pub struct CreateUserRequest {
 }
 
 #[derive(Deserialize)]
+pub struct ResetPasswordRequest {
+    pub password: String,
+}
+
+#[derive(Deserialize)]
 pub struct UpdateUserRequest {
     #[serde(default)]
     pub display_name: Option<String>,
@@ -2778,6 +2783,117 @@ pub async fn api_force_revoke_user_tokens(
                 "method": reload.method,
                 "error": reload.error,
             },
+        })),
+    )
+        .into_response()
+}
+
+/// Admin-only password reset for another user. Mirrors the `nanoguard-admin
+/// set-password` CLI: hash the new password, rewrite `users.password_hash`,
+/// and invalidate every active session for the target — all inside one
+/// transaction so a crash mid-call cannot leave a freshly reset account with
+/// stale session cookies still alive. The point of resetting a password is
+/// usually that the prior credential or session has been compromised; the
+/// invariant the transaction protects is exactly that contract.
+pub async fn api_reset_user_password(
+    State(state): State<Arc<ConsoleState>>,
+    MutatingUser {
+        user: admin,
+        session_id,
+    }: MutatingUser,
+    Path(id): Path<i64>,
+    Json(body): Json<ResetPasswordRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&admin) {
+        return *e;
+    }
+
+    if body.password.len() < 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "password must be at least 12 characters"})),
+        )
+            .into_response();
+    }
+    if super::auth::is_common_password(&body.password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "password is too common"})),
+        )
+            .into_response();
+    }
+
+    let target = match state.db.with_conn(|conn| db::user_by_id(conn, id)) {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "user not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!("reset_user_password: lookup failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal error"})),
+            )
+                .into_response();
+        }
+    };
+
+    let hash = match super::auth::hash_password(&body.password) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("reset_user_password: hash failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "password hash failed"})),
+            )
+                .into_response();
+        }
+    };
+
+    let sweep_result: anyhow::Result<()> = state.db.with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        db::set_password_hash(&tx, target.id, &hash)?;
+        db::delete_user_sessions(&tx, target.id)?;
+        tx.commit()?;
+        Ok(())
+    });
+    if let Err(e) = sweep_result {
+        tracing::warn!("reset_user_password: write failed: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to reset password"})),
+        )
+            .into_response();
+    }
+
+    if let Some(ref log) = state.audit_log {
+        log.record_mutation(
+            &MutationRecord::new(
+                &admin.username,
+                admin.id,
+                "user_password_reset",
+                format!(
+                    "{} reset password for {} (sessions invalidated)",
+                    admin.username, target.username
+                ),
+            )
+            .with_target(target.username.clone()),
+        );
+    }
+
+    let next_csrf = rotate_csrf(&state, &session_id);
+    let headers = csrf_next_headers(next_csrf.as_deref());
+    (
+        StatusCode::OK,
+        headers,
+        Json(json!({
+            "user_id": target.id,
+            "username": target.username,
+            "sessions_invalidated": true,
         })),
     )
         .into_response()

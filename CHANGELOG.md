@@ -4,6 +4,17 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Added — Console Users tab: edit `allowed_models` and reset another user's password
+
+The Users tab gains an **Edit User** dialog reachable from each row's existing "Edit" button (which had no handler before — clicking it was a no-op). The dialog edits two fields that were previously TOML- or CLI-only:
+
+- **`allowed_models`** — comma-separated input that is serialised back into the JSON-array string the DB stores. Empty input means "no restriction" (matches the column's `'[]'` default). The `UpdateUserRequest` field had been present on the wire since the schema landed, but no surface exercised it; the row showed up in `/api/users` responses and was readable only via raw SQL.
+- **Reset password** — a second section in the same dialog. Replaces `users.password_hash` and runs `delete_user_sessions(target.user_id)` in **one SQLite transaction** so a crash mid-call cannot leave the new credential live while a compromised session cookie keeps working. The handler mirrors `nanoguard-admin set-password` byte-for-byte (same hash function, same sweep, same atomicity); the CLI was the only way to do this before, and it required shell access to the host.
+
+A new endpoint `POST /api/users/:id/reset-password` (admin-only, CSRF-rotated) backs the reset action. Audited as `user_password_reset` with `target = <target username>`; the body deliberately omits the new password from the audit record. Validation: `password.len() >= 12` and not on the common-password list — the same two gates `api_create_user` enforces.
+
+**e2e** — scenario 42 covers both features with 10 assertions: `allowed_models` edit persists and is visible in `/api/users`, target user can log in with the original password (baseline), reset endpoint returns 200 with the target username echoed, old password is rejected after reset (401), new password works (200), the target's pre-reset session cookie is invalidated (401 on `/api/me` — verifies the in-transaction session sweep), and a non-admin caller is 403 on the reset endpoint. Total `tools/e2e.sh` assertions: 219 (was 209 after PR #47).
+
 ### Changed — Client-auth Stage 2 (slice 2): Anthropic `/v1/messages` budget wiring
 
 `/v1/messages` joins `/v1/chat/completions` on the `ClientView.budget_key` contract. With `[auth].enabled = true`, Anthropic requests are accounted against `token:<id>` derived from the verifier middleware — the same bucket the OpenAI path uses, so a single token's quota covers both endpoints. A Claude SDK caller with a leaked token can no longer rack up unaccounted Anthropic spend, which was the asymmetry slice 1 left open.
