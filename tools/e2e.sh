@@ -3842,6 +3842,147 @@ wait "$NG_PID" 2>/dev/null || true
 kill "$S40_MOCK_A" "$S40_MOCK_B" 2>/dev/null || true
 wait "$S40_MOCK_A" "$S40_MOCK_B" 2>/dev/null || true
 
+# --- 41. Anthropic /v1/messages: per-token budget bucket ------------------
+# PR #45 wired ClientView.budget_key for /v1/chat/completions. /v1/messages
+# bypassed budget entirely, which meant a deployment running with [auth]
+# enabled could still rack up unaccounted Anthropic spend. This scenario
+# confirms the symmetric path: token mint → /v1/messages → spend tracked
+# under token:<id>, per-token limit enforced (429, Anthropic-shaped error
+# envelope), and with [auth].enabled = false the legacy `default` bucket
+# is used (Anthropic body has no OpenAI `user` field to fall back to).
+info "scenario 41: Anthropic /v1/messages — per-token budget bucket"
+
+kill_leftover_nanoguards
+S41_DB="$LOGDIR/e2e.s41.db"
+S41_TOML="$LOGDIR/e2e.s41.toml"
+S41_LOG="$LOGDIR/ng.s41.log"
+rm -f "$S41_DB"
+
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S41_TOML"
+cat >> "$S41_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S41_DB"
+admin_api_key = "s41-admin"
+
+[auth]
+enabled = true
+env_marker = "t"
+EOF
+
+NANOGUARD_CONFIG="$S41_TOML" "$BIN" > "$S41_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "41-pre. proxy boot" "$NG_URL/health" 15 || exit 1
+
+MINT41=$(curl -s "$NG_URL/v1/admin/clients" \
+    -H "Authorization: Bearer s41-admin" \
+    -H "Content-Type: application/json" \
+    -d '{"label":"s41-anthropic","user_id":7}')
+T41_WIRE=$(echo "$MINT41" | jq -r '.token // empty')
+T41_ID=$(echo "$MINT41" | jq -r '.id // empty')
+if [ -z "$T41_WIRE" ] || [ "$T41_WIRE" = "null" ]; then
+    ng "41-pre. token mint failed: $MINT41"
+    exit 1
+fi
+
+# 41a. Authed /v1/messages call succeeds + returns Anthropic-shape body.
+RESP41=$(curl -s "$NG_URL/v1/messages" \
+    -H "Authorization: Bearer $T41_WIRE" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","max_tokens":64,"messages":[{"role":"user","content":"hello anthropic"}]}')
+RESP41_TYPE=$(echo "$RESP41" | jq -r '.type // empty')
+assert_eq "41a. /v1/messages returns Anthropic-shape (type=message)" "$RESP41_TYPE" "message"
+
+# Give budget a moment to flush.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    USAGE_NOW=$(curl -s -H "Authorization: Bearer s41-admin" \
+        "$NG_URL/v1/admin/budget/token:$T41_ID" | jq -r '.usage // 0')
+    [ "$USAGE_NOW" -gt 0 ] && break
+    sleep 0.1
+done
+
+# 41b. Spend lands under token:<id> for /v1/messages — same bucket
+# semantics as /v1/chat/completions.
+USAGE_T=$(curl -s -H "Authorization: Bearer s41-admin" \
+    "$NG_URL/v1/admin/budget/token:$T41_ID" | jq -r '.usage // 0')
+case "$USAGE_T" in
+    ''|0) ng "41b. token:$T41_ID has zero usage after /v1/messages call" ;;
+    *)    ok "41b. /v1/messages spend tracked under token:$T41_ID ($USAGE_T tokens)" ;;
+esac
+
+# 41c. The legacy `default` bucket stays at zero — Anthropic body has
+# no OpenAI `user` field and we don't write to default when ClientView
+# is attached.
+USAGE_DEFAULT=$(curl -s -H "Authorization: Bearer s41-admin" \
+    "$NG_URL/v1/admin/budget/default" | jq -r '.usage // 0')
+assert_eq "41c. legacy \`default\` bucket is untouched when [auth].enabled" "$USAGE_DEFAULT" "0"
+
+# 41d. Per-token limit is enforced on /v1/messages and the 429 envelope
+# is Anthropic-shaped (type=error, error.type=rate_limit_error) so
+# Claude SDKs can read it the way they read upstream 429s.
+curl -s -X PUT -H "Authorization: Bearer s41-admin" \
+    -H "Content-Type: application/json" \
+    "$NG_URL/v1/admin/budget/token:$T41_ID" \
+    -d '{"limit":1}' > /dev/null
+LIM_RESP=$(curl -s -o "$LOGDIR/s41_lim.json" -w "%{http_code}" "$NG_URL/v1/messages" \
+    -H "Authorization: Bearer $T41_WIRE" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","max_tokens":64,"messages":[{"role":"user","content":"over"}]}')
+assert_eq "41d. per-token limit on /v1/messages returns 429" "$LIM_RESP" "429"
+LIM_TYPE=$(jq -r '.type // empty' "$LOGDIR/s41_lim.json")
+LIM_ERR_TYPE=$(jq -r '.error.type // empty' "$LOGDIR/s41_lim.json")
+assert_eq "41d-shape. 429 envelope is Anthropic-shaped (type=error)" "$LIM_TYPE" "error"
+assert_eq "41d-shape. 429 envelope carries error.type=rate_limit_error" "$LIM_ERR_TYPE" "rate_limit_error"
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
+# 41e. With [auth].enabled = false, /v1/messages records spend under
+# the literal "default" bucket — the legacy contract for unauthed
+# deployments. Anthropic has no body-side `user` field, so the
+# fallback is the constant string, not a per-request override.
+S41B_TOML="$LOGDIR/e2e.s41b.toml"
+S41B_DB="$LOGDIR/e2e.s41b.db"
+S41B_LOG="$LOGDIR/ng.s41b.log"
+rm -f "$S41B_DB"
+
+awk '/^\[budget\]/{skip=1; next} skip && /^\[/{skip=0} !skip' "$TOML" > "$S41B_TOML"
+cat >> "$S41B_TOML" <<EOF
+
+[budget]
+enabled = true
+db_path = "$S41B_DB"
+admin_api_key = "s41b-admin"
+
+[auth]
+enabled = false
+EOF
+
+NANOGUARD_CONFIG="$S41B_TOML" "$BIN" > "$S41B_LOG" 2>&1 &
+NG_PID=$!
+wait_for_url "41e-pre. legacy proxy boot" "$NG_URL/health" 15 || exit 1
+
+curl -s "$NG_URL/v1/messages" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"test","max_tokens":64,"messages":[{"role":"user","content":"unauthed"}]}' \
+    > /dev/null
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    USAGE_DEF=$(curl -s -H "Authorization: Bearer s41b-admin" \
+        "$NG_URL/v1/admin/budget/default" | jq -r '.usage // 0')
+    [ "$USAGE_DEF" -gt 0 ] && break
+    sleep 0.1
+done
+
+case "$USAGE_DEF" in
+    ''|0) ng "41e. /v1/messages with [auth] off did not record spend to default" ;;
+    *)    ok "41e. /v1/messages falls back to \`default\` bucket when [auth].enabled = false" ;;
+esac
+
+kill "$NG_PID" 2>/dev/null || true
+wait "$NG_PID" 2>/dev/null || true
+
 # --- summary ---------------------------------------------------------------
 
 printf "\n=== summary ===\n"
