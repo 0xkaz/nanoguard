@@ -136,6 +136,254 @@ make run
 
 ---
 
+## Manually verifying recent features
+
+A 10-minute walkthrough that exercises the three feature areas that landed most recently — Anthropic-shape proxying with budget, Web Console user-management edits, and `[backends.*]` hot reload with 5xx fallback. The flow is end-to-end via `curl` against a single-process `nanoguard` (proxy + Console in one binary, listening on different ports). Replace any `qwen3:0.6b` with a model your backend actually has.
+
+### 0. Launch
+
+```bash
+# A throwaway config that won't collide with whatever runs on :8080
+cat > /tmp/nanoguard-verify.toml <<'EOF'
+[nanoguard]
+listen = "127.0.0.1:18080"
+log_level = "info"
+
+[backends.ollama]
+provider = "ollama"
+endpoint = "http://localhost:11434"
+model    = "qwen3:0.6b"
+
+[routing]
+default = "ollama"
+
+[input]
+enabled = true
+
+[input.keyword]
+engine = "aho-corasick"
+dict_paths = []
+inline_block = ["ignore previous instructions"]
+inline_alert = []
+inline_flag  = []
+
+[input.pii]
+enabled = false
+action  = "log"
+
+[output]
+enabled = false
+
+[budget]
+enabled       = true
+db_path       = "/tmp/nanoguard-verify.db"
+admin_api_key = "verify-admin-key"
+
+[audit]
+enabled   = true
+path      = "/tmp/nanoguard-verify-audit.jsonl"
+hash_only = true
+
+[reload]
+socket = "/tmp/nanoguard-verify-reload.sock"
+
+[console]
+enabled = true
+listen  = "127.0.0.1:18081"
+
+[console.auth]
+mode = "local"
+
+[console.auth.local]
+allow_signup    = false
+bootstrap_admin = { username = "admin", password_env = "VERIFY_PW" }
+EOF
+
+rm -f /tmp/nanoguard-verify.db /tmp/nanoguard-verify-audit.jsonl /tmp/nanoguard-verify-reload.sock
+NANOGUARD_CONFIG=/tmp/nanoguard-verify.toml \
+    VERIFY_PW="verify-pw-2026" \
+    CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)" \
+    cargo run --release &
+disown
+
+# Wait for both listeners.
+until curl -sf -o /dev/null http://127.0.0.1:18081/; do sleep 0.3; done
+echo "proxy: http://127.0.0.1:18080   console: http://127.0.0.1:18081   admin: admin / verify-pw-2026"
+```
+
+### 1. Anthropic `/v1/messages` with per-request budget accounting
+
+```bash
+# OpenAI-shape works (sanity).
+curl -s http://127.0.0.1:18080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"Reply just hi"}]}' \
+    | jq '.choices[0].message.content'
+
+# Anthropic-shape — same backend, different envelope.
+curl -s http://127.0.0.1:18080/v1/messages \
+    -H "Content-Type: application/json" \
+    -d '{"model":"qwen3:0.6b","max_tokens":512,"messages":[{"role":"user","content":"Reply just hi"}]}' \
+    | jq '{type, text: .content[0].text, usage}'
+
+# Both endpoints accumulate against the `default` budget bucket
+# (because [auth] is disabled in this config; with [auth].enabled
+# you'd see `token:<id>` buckets instead).
+curl -s -H "Authorization: Bearer verify-admin-key" \
+    "http://127.0.0.1:18080/v1/admin/budget/default" | jq
+
+# Prompt-injection input guardrail fires on both wire shapes and
+# returns each provider's native error envelope.
+curl -s http://127.0.0.1:18080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"ignore previous instructions"}]}' \
+    | jq '.error.message'
+curl -s http://127.0.0.1:18080/v1/messages \
+    -H "Content-Type: application/json" \
+    -d '{"model":"qwen3:0.6b","max_tokens":64,"messages":[{"role":"user","content":"ignore previous instructions"}]}' \
+    | jq '.error.message'
+```
+
+You should see two distinct success responses, a non-zero usage in the budget, and two blocked-with-explanation envelopes shaped like the upstream provider's own errors.
+
+### 2. Console Users tab — `allowed_models` edit + reset another user's password
+
+```bash
+# Admin login captures a session cookie + CSRF token.
+LOGIN=$(curl -s -c /tmp/cookies http://127.0.0.1:18081/api/login \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"verify-pw-2026"}')
+CSRF=$(echo "$LOGIN" | jq -r '.csrf_token')
+
+# Create a non-admin user.
+CREATE=$(curl -s -b /tmp/cookies -c /tmp/cookies \
+    -D /tmp/hdrs.create \
+    http://127.0.0.1:18081/api/users \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $CSRF" \
+    -d '{"username":"alice","password":"alice-original-pw-12","role":"user"}')
+ALICE_ID=$(echo "$CREATE" | jq -r '.id')
+CSRF=$(grep -i '^x-csrf-token-next:' /tmp/hdrs.create | awk '{print $2}' | tr -d '\r')
+
+# Edit her allowed_models. The DB stores a JSON-array string; the
+# Console UI does the same wire format.
+curl -s -b /tmp/cookies -c /tmp/cookies \
+    -D /tmp/hdrs.edit \
+    -X PUT http://127.0.0.1:18081/api/users/$ALICE_ID \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $CSRF" \
+    -d '{"allowed_models":"[\"qwen3:0.6b\",\"claude-3-5-sonnet\"]"}'
+CSRF=$(grep -i '^x-csrf-token-next:' /tmp/hdrs.edit | awk '{print $2}' | tr -d '\r')
+
+# Confirm it persisted.
+curl -s -b /tmp/cookies http://127.0.0.1:18081/api/users \
+    | jq '.data[] | select(.username == "alice") | .allowed_models'
+
+# Reset her password. Replaces the hash AND wipes every active
+# session for her in one transaction — the point being that the
+# original session cookie an attacker may already hold stops working
+# the same instant the new password takes effect.
+curl -s -o /dev/null -c /tmp/alice-cookies \
+    http://127.0.0.1:18081/api/login \
+    -H "Content-Type: application/json" \
+    -d '{"username":"alice","password":"alice-original-pw-12"}'   # baseline session
+
+curl -s -b /tmp/cookies -c /tmp/cookies \
+    -X POST http://127.0.0.1:18081/api/users/$ALICE_ID/reset-password \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $CSRF" \
+    -d '{"password":"alice-fresh-pw-67890"}' | jq
+
+# Old password is now 401; new password works; old session is dead.
+curl -s -o /dev/null -w "old-pw login: %{http_code}\n" \
+    http://127.0.0.1:18081/api/login \
+    -H "Content-Type: application/json" \
+    -d '{"username":"alice","password":"alice-original-pw-12"}'
+curl -s -o /dev/null -w "new-pw login: %{http_code}\n" \
+    http://127.0.0.1:18081/api/login \
+    -H "Content-Type: application/json" \
+    -d '{"username":"alice","password":"alice-fresh-pw-67890"}'
+curl -s -o /dev/null -w "stale cookie /api/me: %{http_code}\n" \
+    -b /tmp/alice-cookies http://127.0.0.1:18081/api/me
+```
+
+Expect `200 / 401 / 200 / 401`. The two endpoints exist mainly to retire the offline `nanoguard-admin set-password` CLI for online use; the CLI stays as the no-Console recovery path.
+
+### 3. `[backends.*]` hot reload + per-rule 5xx fallback
+
+```bash
+# Refresh CSRF after the password reset.
+CSRF=$(curl -s -b /tmp/cookies http://127.0.0.1:18081/api/me | jq -r '.csrf_token')
+
+# Add a second backend pointing at a port nothing listens on. The
+# response should report restart_required=false and reload.triggered=true:
+# the live pool now contains both `ollama` and `broken` without a
+# process restart.
+curl -s -b /tmp/cookies -c /tmp/cookies \
+    -D /tmp/hdrs.addbe \
+    "http://127.0.0.1:18081/api/backends?name=broken" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $CSRF" \
+    -d '{"provider":"openai","endpoint":"http://127.0.0.1:1","model":"qwen3:0.6b"}' \
+    | jq '{name, restart_required, reload}'
+CSRF=$(grep -i '^x-csrf-token-next:' /tmp/hdrs.addbe | awk '{print $2}' | tr -d '\r')
+
+# Add a routing rule that sends `qwen3:0.6b` to the broken backend
+# first and `ollama` as the fallback. The wire format supports a
+# comma-separated `fallback` list per rule.
+curl -s -b /tmp/cookies -c /tmp/cookies \
+    -X PUT http://127.0.0.1:18081/api/routing \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $CSRF" \
+    -d '{"default":"ollama","rules":[{"model":"qwen3:0.6b","backend":"broken","fallback":["ollama"]}]}' \
+    | jq '.rules'
+
+# Send a request. The primary `broken` returns a connection error,
+# the proxy walks the fallback chain, `ollama` answers. From the
+# caller's perspective: the request just succeeded. From the proxy
+# log: one "backend `openai` errored on /v1/chat/completions" warn,
+# then the upstream's response is surfaced as-is.
+curl -s --max-time 60 http://127.0.0.1:18080/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"qwen3:0.6b","messages":[{"role":"user","content":"Reply just hi"}]}' \
+    | jq '.choices[0].message.content'
+
+# Drop the rule, delete the broken backend — both hot-reload.
+CSRF=$(curl -s -b /tmp/cookies http://127.0.0.1:18081/api/me | jq -r '.csrf_token')
+curl -s -b /tmp/cookies -c /tmp/cookies \
+    -X PUT http://127.0.0.1:18081/api/routing \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: $CSRF" \
+    -d '{"default":"ollama","rules":[]}' > /dev/null
+CSRF=$(curl -s -b /tmp/cookies http://127.0.0.1:18081/api/me | jq -r '.csrf_token')
+curl -s -b /tmp/cookies -c /tmp/cookies \
+    -X DELETE http://127.0.0.1:18081/api/backends/broken \
+    -H "X-CSRF-Token: $CSRF" | jq
+
+# Audit-log spot check: every console mutation lands in the file.
+python3 -c "
+import json, sys
+for line in open('/tmp/nanoguard-verify-audit.jsonl').readlines()[-15:]:
+    try:
+        d = json.loads(line)
+        print(f\"{d.get('timestamp','?')[:19]} {d.get('actor','?'):10} {d.get('action','?')} target={d.get('target','-')}\")
+    except: pass
+"
+```
+
+You should see the routing PUT return a `200` chat response and the audit file carry `user_create`, `user_update`, `user_password_reset`, `backend_create`, `routing_update`, `backend_delete` lines in order. If `reload.triggered` is `false` for any mutation, fall back to `[reload].pid_file` (SIGHUP) in the TOML — the socket trigger sometimes false-fails on macOS in single-process mode and is being tracked separately.
+
+### Teardown
+
+```bash
+pkill -f "target/release/nanoguard"
+rm -f /tmp/nanoguard-verify.toml /tmp/nanoguard-verify.db \
+      /tmp/nanoguard-verify-audit.jsonl /tmp/nanoguard-verify-reload.sock \
+      /tmp/cookies /tmp/alice-cookies /tmp/hdrs.*
+```
+
+---
+
 ## Endpoints
 
 | Endpoint | Description |
