@@ -4,6 +4,16 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Fixed — Console reload trigger over Unix socket no longer false-fails
+
+In single-process mode (Console + proxy on one tokio runtime) every Console mutation that called `trigger_reload` came back with `reload: { triggered: false, error: "reading socket response: Resource temporarily unavailable (os error 35)" }`, even though the proxy logged a successful reload moments later. The operator saw "reload failed" in the SPA's response while the change had in fact landed — exactly the kind of contradiction that pushes operators back to TOML-and-restart.
+
+Root cause was a tokio runtime starvation. The Console handler called `super::reload::trigger_reload(...)` synchronously, which did a blocking `UnixStream` connect + write + read on the worker thread it was running on. In single-process boot the proxy's `UnixListener::accept()` task lives on the same runtime, so the worker the Console pinned was the same worker the proxy needed to actually accept the connection. The proxy only accepted (and answered `OK\n`) five seconds later when the Console's read timed out and freed the worker; by then the trigger function had already returned the error.
+
+`trigger_reload` and `trigger_invalidate_tokens` are now `async` and route the blocking socket exchange through `tokio::task::spawn_blocking`. The blocking I/O lands on tokio's dedicated blocking pool, the worker stays free to drive `accept()`, the proxy answers in a few milliseconds, and the Console sees `triggered: true, error: null`. All nine call sites in `src/console/handlers.rs` were updated to `.await` the result.
+
+Scenario 43 in `tools/e2e.sh` gains a regression assertion (`43b-trig`) that locks in the contract: socket-mode reload trigger must report `triggered=true, method=socket, error=null`. Total assertions: 233 (was 232 after PR #49).
+
 ### Changed — `[backends.*]` is now hot-reloadable
 
 Adding, editing, or deleting a backend through the Console UI (POST / PUT / DELETE `/api/backends`) now takes effect on the very next request — no proxy restart required. Prior behavior was conservative: the live `BackendPoolRuntime` was preserved across reloads to avoid orphaning per-backend `reqwest::Client` connection pools mid-flight. That concern doesn't survive a closer look at the runtime model: every in-flight request holds its own `Arc<AppState>` snapshot via `shared.load_full()`, so the prior pool (and its connection pools) stays alive until the last in-flight request drops its Arc. Dropping the old `BackendPoolRuntime` from the swapped `AppState` only releases its connection pools *after* in-flight requests finish — no orphaning, no truncated responses.
