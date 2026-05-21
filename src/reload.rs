@@ -20,11 +20,13 @@ use crate::{audit, backend, budget, client_auth, config, AppState};
 /// pattern as `[backend]`.
 #[derive(Clone)]
 pub struct RuntimeHandles {
-    /// Resolved backend pool. Each entry's `reqwest::Client` is the
-    /// per-backend connection pool — preserved across hot reload
-    /// because orphaning a connection pool mid-request is unsafe.
-    /// Adding / removing backends is therefore restart-only;
-    /// `[routing]` changes ARE hot-reloadable (see `build_app_state`).
+    /// Resolved backend pool. `build_app_state` rebuilds this from
+    /// scratch on every reload; in-flight requests hold their own
+    /// `Arc<AppState>` snapshot via `shared.load_full()`, so the prior
+    /// pool (and its per-backend `reqwest::Client` connection pools)
+    /// stays alive until the last in-flight request drops its Arc —
+    /// no orphaning, no truncated responses. Both `[backends.*]` and
+    /// `[routing]` are hot-reloadable on this path.
     pub pool: backend::BackendPoolRuntime,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,

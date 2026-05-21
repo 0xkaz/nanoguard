@@ -180,6 +180,7 @@ impl Config {
                     r.backend
                 );
             }
+            let mut seen_fb = std::collections::BTreeSet::new();
             for fb in &r.fallback {
                 if !backends.contains_key(fb) {
                     anyhow::bail!(
@@ -191,6 +192,19 @@ impl Config {
                 if fb == &r.backend {
                     anyhow::bail!(
                         "[routing] rule for model `{}` lists its own primary `{}` as a fallback",
+                        r.model,
+                        fb
+                    );
+                }
+                if !seen_fb.insert(fb.as_str()) {
+                    // Duplicates would cause two attempts against the
+                    // same upstream on a single 5xx, which is never
+                    // useful and is almost certainly a typo. The
+                    // Console's `validate_routing_body` enforces the
+                    // same rule on PUT; mirror it here so a hand-edited
+                    // TOML can't slip past the boundary check.
+                    anyhow::bail!(
+                        "[routing] rule for model `{}` lists duplicate fallback `{}`",
                         r.model,
                         fb
                     );

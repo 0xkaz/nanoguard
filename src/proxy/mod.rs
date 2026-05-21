@@ -266,7 +266,11 @@ pub async fn chat_completions(
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
-                    "error": last_err.unwrap_or_else(|| "all backends failed".to_string()),
+                    "error": {
+                        "message": last_err.unwrap_or_else(|| "all backends failed".to_string()),
+                        "type": "api_error",
+                        "code": "all_backends_failed",
+                    },
                 })),
             )
                 .into_response();
