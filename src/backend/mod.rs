@@ -125,6 +125,38 @@ impl BackendPoolRuntime {
         Some(self.default_backend.as_str())
     }
 
+    /// Resolve a model to a list of `Backend` handles to try in
+    /// order: the primary first, then any per-rule `fallback`
+    /// labels. The proxy walks this list on upstream failure (network
+    /// error or 5xx) and surfaces the first non-5xx response. When
+    /// the catch-all default backend fires, no fallbacks apply —
+    /// fallbacks are a per-rule concept, not a pool-wide one.
+    /// Unknown labels are silently skipped; `Config::pool()` already
+    /// rejects them at parse time, so the only way one ends up here
+    /// is a bug.
+    pub fn route_chain(&self, model: Option<&str>) -> Vec<&Backend> {
+        let mut chain = Vec::with_capacity(1);
+        if let Some(model) = model {
+            for r in &self.rules {
+                if rule_matches(&r.model, model) {
+                    if let Some(b) = self.backends.get(&r.backend) {
+                        chain.push(b);
+                    }
+                    for fb in &r.fallback {
+                        if let Some(b) = self.backends.get(fb) {
+                            chain.push(b);
+                        }
+                    }
+                    return chain;
+                }
+            }
+        }
+        if let Some(b) = self.backends.get(&self.default_backend) {
+            chain.push(b);
+        }
+        chain
+    }
+
     /// Get a backend by label.
     pub fn get(&self, name: &str) -> Option<&Backend> {
         self.backends.get(name)

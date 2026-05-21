@@ -4,6 +4,26 @@ All notable changes to nanoguard are documented in this file. The format is loos
 
 ## [Unreleased]
 
+### Changed — `[backends.*]` is now hot-reloadable
+
+Adding, editing, or deleting a backend through the Console UI (POST / PUT / DELETE `/api/backends`) now takes effect on the very next request — no proxy restart required. Prior behavior was conservative: the live `BackendPoolRuntime` was preserved across reloads to avoid orphaning per-backend `reqwest::Client` connection pools mid-flight. That concern doesn't survive a closer look at the runtime model: every in-flight request holds its own `Arc<AppState>` snapshot via `shared.load_full()`, so the prior pool (and its connection pools) stays alive until the last in-flight request drops its Arc. Dropping the old `BackendPoolRuntime` from the swapped `AppState` only releases its connection pools *after* in-flight requests finish — no orphaning, no truncated responses.
+
+The reload path in `build_app_state` now rebuilds `BackendPoolRuntime` fresh from `cfg.pool()` (which already validates that every `[routing]` rule references a known backend and that `[routing].default` is one of them). The Console responses for backend mutations now report `restart_required: false`. The cross-validation block that used to gate routing edits against the LIVE pool is gone — `cfg.pool()` covers the same invariant at parse time, against the new pool the reload is about to install.
+
+The `[backends.*]` entry is dropped from the restart-only drift warning; the rest of the warning (listen address, `[auth].*`, `[budget].*`, `[audit].*`, legacy `[backend].*`) stays as-is. Scenario 36b in `tools/e2e.sh` flips its `restart_required` assertion from `true` to `false`.
+
+### Added — Per-routing-rule fallback chain on upstream 5xx
+
+`[routing].rules[].fallback` accepts an ordered list of backend labels to try if the rule's primary fails on `/v1/chat/completions` or `/v1/messages` (network error or upstream status >= 500). The proxy walks the chain in order, draining the failed response body before dialing the next backend, and commits to the first response with a non-5xx status. When the chain is exhausted the most recent 5xx (or the final network error as 502) is surfaced to the caller. Fallback **never fires mid-stream** — once the upstream has returned bytes the proxy is committed to that backend; streaming responses can never silently switch upstreams.
+
+The catch-all `[routing].default` does **not** use the chain: fallbacks are a per-rule concept. A request that matches no rule falls back to `default` and that's it — same as before.
+
+`Config::pool()` validates the new field: every entry must reference a real backend, must not name the rule's own primary, and must not repeat within the same rule. The Console's `validate_routing_body` re-runs the same checks so an invalid PUT returns a 400 with a specific message instead of a 200 followed by a `reload_failed` audit entry. The Routing editor in the Backends tab gains a "Fallback" column (comma-separated input per rule); existing TOML configs continue to parse unchanged because the field has `#[serde(default)]`.
+
+**Scope carve-out.** This is the simple part of failover: try-once on 5xx, then surface. Health checks, circuit breakers, per-backend retry budgets, multi-region failover, smart load balancing — all still LiteLLM territory per `docs/roadmap.md > Non-goals`. The minimal `fallback` list closes the most common operator request ("if my primary is down, try the backup") without growing nanoguard into a gateway.
+
+**e2e** — scenario 43 covers hot-reload (`[backends.*]` add/edit/delete take effect on the next request without a restart) with 7 assertions including a delete-then-fall-back-to-default and audit-log spot-checks. Scenario 44 covers the 5xx fallback contract with 5 assertions: a `503` on primary triggers a fallback walk to the backup (returns 200), a rule without fallback surfaces the primary's `503` unchanged, `/v1/messages` walks the same chain (Anthropic envelope intact), and the Console PUT rejects an unknown fallback or a self-fallback (400). Total `tools/e2e.sh` assertions: 232 (was 219 after PR #48).
+
 ### Added — Console Users tab: edit `allowed_models` and reset another user's password
 
 The Users tab gains an **Edit User** dialog reachable from each row's existing "Edit" button (which had no handler before — clicking it was a no-op). The dialog edits two fields that were previously TOML- or CLI-only:

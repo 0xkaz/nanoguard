@@ -1253,7 +1253,7 @@ pub async fn api_create_backend(
         headers,
         Json(json!({
             "name": name,
-            "restart_required": true,
+            "restart_required": false,
             "reload": reload_outcome_json(&reload),
         })),
     )
@@ -1317,7 +1317,7 @@ pub async fn api_update_backend(
         headers,
         Json(json!({
             "name": name,
-            "restart_required": true,
+            "restart_required": false,
             "reload": reload_outcome_json(&reload),
         })),
     )
@@ -1393,7 +1393,7 @@ pub async fn api_delete_backend(
         headers,
         Json(json!({
             "name": name,
-            "restart_required": true,
+            "restart_required": false,
             "reload": reload_outcome_json(&reload),
         })),
     )
@@ -1428,6 +1428,12 @@ pub struct RoutingUpdateRequest {
 pub struct RoutingRuleSpec {
     pub model: String,
     pub backend: String,
+    /// Ordered list of additional backend labels to try if `backend`
+    /// fails on /v1/chat/completions or /v1/messages (network error
+    /// or upstream status >= 500). Empty list is the default and
+    /// means no failover.
+    #[serde(default)]
+    pub fallback: Vec<String>,
 }
 
 /// `PUT /api/routing` — replace the entire `[routing]` section. We
@@ -1456,6 +1462,12 @@ pub async fn api_update_routing(
     for r in body.rules.iter_mut() {
         r.model = r.model.trim().to_string();
         r.backend = r.backend.trim().to_string();
+        r.fallback = r
+            .fallback
+            .iter()
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
     }
 
     let cfg = match fresh_config() {
@@ -1498,7 +1510,11 @@ pub async fn api_update_routing(
         headers,
         Json(json!({
             "default": body.default,
-            "rules": body.rules.iter().map(|r| json!({"model": r.model, "backend": r.backend})).collect::<Vec<_>>(),
+            "rules": body.rules.iter().map(|r| json!({
+                "model": r.model,
+                "backend": r.backend,
+                "fallback": r.fallback,
+            })).collect::<Vec<_>>(),
             // `[routing]` is hot-reloadable (see CLAUDE.md and
             // docs/design/multi-backend-routing.md), so the change
             // takes effect on the next reload, not on process
@@ -1538,6 +1554,34 @@ fn validate_routing_body(
             return Err(format!(
                 "rule[{i}].backend = `{backend}` is not a configured backend"
             ));
+        }
+        // Fallbacks must (a) all reference real backends, (b) not name
+        // the primary (no self-loop), and (c) not repeat a label within
+        // the same rule. `cfg.pool()` re-validates (a) and (b) at
+        // reload time, but catching the operator error here means the
+        // PUT returns a friendly 400 instead of a reload_failed audit
+        // entry the operator has to dig out of a log file.
+        let mut seen_fb = std::collections::HashSet::new();
+        for (fi, fb) in rule.fallback.iter().enumerate() {
+            let fb = fb.trim();
+            if fb.is_empty() {
+                return Err(format!("rule[{i}].fallback[{fi}] cannot be empty"));
+            }
+            if !cfg.backends.contains_key(fb) {
+                return Err(format!(
+                    "rule[{i}].fallback[{fi}] = `{fb}` is not a configured backend"
+                ));
+            }
+            if fb == backend {
+                return Err(format!(
+                    "rule[{i}].fallback[{fi}] = `{fb}` is the same as the rule's primary backend"
+                ));
+            }
+            if !seen_fb.insert(fb.to_string()) {
+                return Err(format!(
+                    "rule[{i}].fallback[{fi}] = `{fb}` is repeated in the same rule"
+                ));
+            }
         }
         if !seen_models.insert(model.to_string()) {
             // Duplicate model patterns are almost certainly a typo —
@@ -1580,6 +1624,16 @@ fn write_routing_to_toml(body: &RoutingUpdateRequest) -> anyhow::Result<()> {
         let mut t = InlineTable::new();
         t.insert("model", r.model.clone().into());
         t.insert("backend", r.backend.clone().into());
+        if !r.fallback.is_empty() {
+            // Only emit `fallback = [...]` when there is at least one
+            // entry, so configs that don't use failover stay
+            // byte-for-byte identical to pre-fallback ones on disk.
+            let mut arr = Array::new();
+            for fb in &r.fallback {
+                arr.push(fb.clone());
+            }
+            t.insert("fallback", arr.into());
+        }
         rules.push(t);
     }
     routing_tbl.insert("rules", Item::Value(rules.into()));
@@ -1612,7 +1666,11 @@ fn record_routing_mutation(
             .with_target("routing".to_string())
             .with_after(json!({
                 "default": body.default,
-                "rules": body.rules.iter().map(|r| json!({"model": r.model, "backend": r.backend})).collect::<Vec<_>>(),
+                "rules": body.rules.iter().map(|r| json!({
+                    "model": r.model,
+                    "backend": r.backend,
+                    "fallback": r.fallback,
+                })).collect::<Vec<_>>(),
             }));
         log.record_mutation(&rec);
     }
@@ -2315,6 +2373,7 @@ pub async fn api_overview(
         "rules": pool_view.rules.iter().map(|r| json!({
             "model": r.model,
             "backend": r.backend,
+            "fallback": r.fallback,
         })).collect::<Vec<_>>(),
     });
     // Legacy single-backend digest stays under `backend` for SPA

@@ -20,11 +20,13 @@ use crate::{audit, backend, budget, client_auth, config, AppState};
 /// pattern as `[backend]`.
 #[derive(Clone)]
 pub struct RuntimeHandles {
-    /// Resolved backend pool. Each entry's `reqwest::Client` is the
-    /// per-backend connection pool — preserved across hot reload
-    /// because orphaning a connection pool mid-request is unsafe.
-    /// Adding / removing backends is therefore restart-only;
-    /// `[routing]` changes ARE hot-reloadable (see `build_app_state`).
+    /// Resolved backend pool. `build_app_state` rebuilds this from
+    /// scratch on every reload; in-flight requests hold their own
+    /// `Arc<AppState>` snapshot via `shared.load_full()`, so the prior
+    /// pool (and its per-backend `reqwest::Client` connection pools)
+    /// stays alive until the last in-flight request drops its Arc —
+    /// no orphaning, no truncated responses. Both `[backends.*]` and
+    /// `[routing]` are hot-reloadable on this path.
     pub pool: backend::BackendPoolRuntime,
     pub http_client: reqwest::Client,
     pub budget: Option<Arc<dyn budget::BudgetStore>>,
@@ -202,45 +204,21 @@ pub fn build_app_state(mut cfg: config::Config, runtime: RuntimeHandles) -> Resu
     };
 
     // Hot reload semantics for the backend pool:
-    //   - [backends.*] map (= the Backend instances themselves) is
-    //     restart-only — preserved from `runtime.pool` to avoid
-    //     orphaning per-backend reqwest connection pools mid-request.
-    //   - [routing] (rules + default) IS hot-reloadable: we recompute
-    //     them from the freshly-parsed `cfg` and rebind so a SIGHUP
-    //     picks up new routing immediately.
-    let mut pool = runtime.pool.clone();
+    //   - [backends.*] map AND [routing] are both rebuilt from the
+    //     freshly-parsed config on every reload. In-flight requests
+    //     hold an `Arc<AppState>` snapshot via `shared.load_full()`,
+    //     so the prior `BackendPoolRuntime` (and the per-backend
+    //     `reqwest::Client` connection pools it owns) stays alive
+    //     until the last in-flight request drops its Arc. Dropping
+    //     the old pool only releases the connection pools *after*
+    //     they finish — no orphaning.
+    //   - `Config::pool()` already validates: every [routing] rule
+    //     references a known backend, [routing].default is one of
+    //     them. A reload that would route to nothing fails here
+    //     (the caller emits a reload_failed audit entry) rather
+    //     than silently 400'ing every matching request post-swap.
     let (new_view, _warnings) = cfg.pool()?;
-
-    // Cross-validate the new routing against the LIVE pool: the
-    // operator may have added a [routing] rule whose backend is
-    // declared in the new [backends.*] but not yet running (because
-    // [backends.*] is restart-only). Reload-then-route-to-nothing
-    // would silently 400 every matching request. Refuse the reload
-    // with a clear reason so the operator sees the problem now
-    // (audit log gets a reload_failed entry), not in production
-    // when requests start failing.
-    for r in &new_view.rules {
-        if !pool.backends.contains_key(&r.backend) {
-            anyhow::bail!(
-                "[routing] rule for model `{}` references backend `{}` which is not in the LIVE pool. \
-                 Restart the proxy to pick up new [backends.*] entries before adding routes that reference them.",
-                r.model,
-                r.backend,
-            );
-        }
-    }
-    if !pool.backends.contains_key(&new_view.default_backend) {
-        anyhow::bail!(
-            "[routing].default = `{}` is not in the LIVE pool. \
-             Restart the proxy to pick up new [backends.*] entries before changing the default.",
-            new_view.default_backend,
-        );
-    }
-
-    // Validation passed — bind the refreshed routing-only fields.
-    // The runtime backend map stays as-is (restart-only).
-    pool.rules = new_view.rules;
-    pool.default_backend = new_view.default_backend;
+    let pool = crate::backend::BackendPoolRuntime::build(&new_view);
 
     Ok(AppState {
         config: cfg,
@@ -471,57 +449,9 @@ fn reload_once(shared: &SharedState, runtime: &RuntimeHandles) -> anyhow::Result
 /// caller that has to deliver it. The list of restart-only keys here
 /// must stay in sync with `docs/design/hot-reload.md > What is not
 /// reloadable, and why` and with the `docs/operations.md` runbook.
-/// Compare two `Option<BackendConfig>` slots by some field accessor.
-/// Helper for the legacy `[backend]` drift detector.
-///
-/// Migration-aware: when either side is `None` (the operator either
-/// hadn't configured `[backend]` yet, or has migrated to
-/// `[backends.*]` and dropped the legacy section), we report "no
-/// change". Only when BOTH sides carry a `[backend]` and a field
-/// genuinely differs does this return true. The earlier
-/// implementation flagged `Some(_)` → `None` as drift, which
-/// produced noisy "[backend].provider changed" warnings on every
-/// SIGHUP during migration.
-#[cfg(unix)]
-fn backend_changed<F>(
-    live: &Option<crate::config::BackendConfig>,
-    new: &Option<crate::config::BackendConfig>,
-    f: F,
-) -> bool
-where
-    F: Fn(&Option<crate::config::BackendConfig>) -> Option<&str>,
-{
-    match (live.is_some(), new.is_some()) {
-        (true, true) => f(live) != f(new),
-        _ => false,
-    }
-}
-
-/// Detect whether the `[backends.*]` map structure (label set,
-/// provider/endpoint/api_key/model for each entry) differs between
-/// two configs. Used to fire the restart-only drift warning when an
-/// operator edited the pool definition while the proxy was running.
-#[cfg(unix)]
-fn same_backend_map(
-    a: &std::collections::BTreeMap<String, crate::config::BackendConfig>,
-    b: &std::collections::BTreeMap<String, crate::config::BackendConfig>,
-) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for (k, av) in a {
-        let Some(bv) = b.get(k) else { return false };
-        if av.provider != bv.provider
-            || av.endpoint != bv.endpoint
-            || av.api_key != bv.api_key
-            || av.model != bv.model
-        {
-            return false;
-        }
-    }
-    true
-}
-
+/// Diff the live and incoming configs for keys that the reload path
+/// does not honor in-place, and emit a single combined warning so the
+/// operator sees which edits were ignored.
 #[cfg(unix)]
 fn warn_on_restart_only_drift(live: &crate::config::Config, new: &crate::config::Config) {
     let mut ignored: Vec<&'static str> = Vec::new();
@@ -532,39 +462,14 @@ fn warn_on_restart_only_drift(live: &crate::config::Config, new: &crate::config:
     if live.nanoguard.log_level != new.nanoguard.log_level {
         ignored.push("[nanoguard].log_level");
     }
-    // Legacy single `[backend]` drift. Only fires when the operator
-    // is still on the pre-multi-backend schema. With `[backends.*]`
-    // configured, `live.backend` and `new.backend` are both None and
-    // the comparison short-circuits.
-    if backend_changed(&live.backend, &new.backend, |b| {
-        b.as_ref().map(|c| c.provider.as_str())
-    }) {
-        ignored.push("[backend].provider");
-    }
-    if backend_changed(&live.backend, &new.backend, |b| {
-        b.as_ref().map(|c| c.endpoint.as_str())
-    }) {
-        ignored.push("[backend].endpoint");
-    }
-    if live.backend.as_ref().and_then(|c| c.api_key.as_deref())
-        != new.backend.as_ref().and_then(|c| c.api_key.as_deref())
-    {
-        ignored.push("[backend].api_key");
-    }
-    if live.backend.as_ref().and_then(|c| c.model.as_deref())
-        != new.backend.as_ref().and_then(|c| c.model.as_deref())
-    {
-        ignored.push("[backend].model");
-    }
-
-    // Multi-backend pool drift. [backends.*] is restart-only — the
-    // Backend instances own per-backend reqwest connection pools,
-    // and adding/removing pool entries mid-flight would risk
-    // mid-request orphaning. [routing] IS hot-reloadable, so we
-    // skip it here.
-    if !same_backend_map(&live.backends, &new.backends) {
-        ignored.push("[backends.*]");
-    }
+    // Both the legacy single `[backend]` and the new `[backends.*]`
+    // are hot-reloadable as of the pool-rebuild path in
+    // `build_app_state`. `cfg.pool()` synthesizes a
+    // `[backends.default]` from any legacy `[backend]` and rebuilds
+    // the live `BackendPoolRuntime`. Old `reqwest::Client` pools
+    // stay alive on the prior `AppState` snapshot until the last
+    // in-flight request drops its Arc, so no warning fires for
+    // backend-pool drift.
     if live.budget.enabled != new.budget.enabled {
         ignored.push("[budget].enabled");
     }

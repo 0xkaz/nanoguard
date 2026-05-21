@@ -176,40 +176,102 @@ pub async fn chat_completions(
         }
     }
 
-    // Resolve which backend in the pool this request goes to. The
-    // routing table is consulted once per request; on miss we fall
-    // back to the default backend (covered by route()).
-    let backend = match state.pool.route(Some(&model)) {
-        Some(b) => b,
-        None => {
-            warn!("routing: no backend resolved for model `{}`", model);
-            // OpenAI-shape error envelope so SDKs / curl pipelines
-            // can parse it like any other 4xx from the backend. Same
-            // structure the rest of this handler uses on validation
-            // failures.
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": format!("no backend configured for model `{model}`"),
-                        "type": "invalid_request_error",
-                        "param": "model",
-                        "code": "model_unrouted",
-                    },
-                })),
-            )
-                .into_response();
-        }
-    };
+    // Resolve which backend(s) in the pool this request goes to.
+    // The chain is `[primary, fallback_1, fallback_2, ...]`. We walk
+    // it on upstream failure (network error or status >= 500) and
+    // commit to the first response with a non-5xx status. Fallback
+    // never fires mid-stream — once the upstream has returned bytes
+    // we are committed to that backend.
+    let chain = state.pool.route_chain(Some(&model));
+    if chain.is_empty() {
+        warn!("routing: no backend resolved for model `{}`", model);
+        // OpenAI-shape error envelope so SDKs / curl pipelines can
+        // parse it like any other 4xx from the backend. Same
+        // structure the rest of this handler uses on validation
+        // failures.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!("no backend configured for model `{model}`"),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_unrouted",
+                },
+            })),
+        )
+            .into_response();
+    }
 
-    // Forward to backend
-    let backend_resp = match backend.forward_chat(body).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("backend error: {}", e);
+    let chain_len = chain.len();
+    let mut last_err: Option<String> = None;
+    let mut last_5xx: Option<(StatusCode, bytes::Bytes)> = None;
+    let mut backend_resp_opt: Option<reqwest::Response> = None;
+    for (idx, backend) in chain.iter().enumerate() {
+        // Clone the body for every attempt past the first so a
+        // failed forward to backend N still leaves us a fresh body
+        // for N+1. The clone cost is paid only on actual failover;
+        // the common path forwards `body` directly on the first
+        // (and only) attempt.
+        let attempt_body = if idx + 1 == chain_len {
+            body.take()
+        } else {
+            body.clone()
+        };
+        match backend.forward_chat(attempt_body).await {
+            Ok(r) => {
+                let status = r.status();
+                if status.is_server_error() && idx + 1 < chain_len {
+                    // Drain the body so the chunked stream is fully
+                    // released back to the connection pool before we
+                    // dial the next backend. Without this drain the
+                    // reqwest pool would keep the socket reserved
+                    // for the duration of the fallback request.
+                    let bytes = r.bytes().await.unwrap_or_default();
+                    warn!(
+                        "backend `{}` returned {} on /v1/chat/completions; falling through to next",
+                        backend.provider(),
+                        status
+                    );
+                    last_5xx = Some((status, bytes));
+                    continue;
+                }
+                backend_resp_opt = Some(r);
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(
+                    "backend `{}` errored on /v1/chat/completions: {}",
+                    backend.provider(),
+                    msg
+                );
+                last_err = Some(msg);
+                if idx + 1 < chain_len {
+                    continue;
+                }
+            }
+        }
+    }
+    let backend_resp = match backend_resp_opt {
+        Some(r) => r,
+        None => {
+            // Every backend in the chain failed. Surface the most
+            // recent 5xx if we ever got one; otherwise the last
+            // network error. 502 either way — the proxy could not
+            // produce an upstream response.
+            if let Some((status, body)) = last_5xx {
+                return (status, body).into_response();
+            }
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": e.to_string()})),
+                Json(json!({
+                    "error": {
+                        "message": last_err.unwrap_or_else(|| "all backends failed".to_string()),
+                        "type": "api_error",
+                        "code": "all_backends_failed",
+                    },
+                })),
             )
                 .into_response();
         }

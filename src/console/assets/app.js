@@ -748,10 +748,10 @@ async function loadBackends() {
       </tr>
     `).join('');
     body.innerHTML = `
-      <p class="hint subtle">Add or change backends here. Adding / removing backends is
-      <strong>restart-only</strong> — the proxy keeps using its current pool until you
-      restart it. Routing rules (model → backend) are hot-reloadable and live in
-      <code>[routing]</code>.</p>
+      <p class="hint subtle">Add / edit / delete backends here. Changes are
+      <strong>hot-reloaded</strong> on save — the proxy swaps in the new pool on the
+      next request. Routing rules (model → backend) live in <code>[routing]</code>
+      below and reload the same way.</p>
       <p class="hint subtle">Default backend: <code>${esc(def || '—')}</code></p>
       <table class="table">
         <thead><tr><th>Name</th><th>Provider</th><th>Endpoint</th><th>Model</th><th>API Key</th><th></th></tr></thead>
@@ -772,7 +772,7 @@ async function loadBackends() {
     $$('#tab-backends [data-backend-delete]').forEach(btn => {
       btn.addEventListener('click', async () => {
         const name = btn.dataset.backendDelete;
-        if (!confirm(`Delete backend ${name}? (proxy must be restarted to drop the pool entry)`)) return;
+        if (!confirm(`Delete backend ${name}? Change is hot-reloaded immediately.`)) return;
         try {
           await api(`/api/backends/${encodeURIComponent(name)}`, { method: 'DELETE' });
           loadBackends();
@@ -806,7 +806,11 @@ async function loadRouting(backendList) {
     const r = ov.routing || { default: '', rules: [] };
     routingDraft = {
       default: r.default || (routingBackendNames[0] || ''),
-      rules: (r.rules || []).map(x => ({ model: x.model, backend: x.backend })),
+      rules: (r.rules || []).map(x => ({
+        model: x.model,
+        backend: x.backend,
+        fallback: Array.isArray(x.fallback) ? x.fallback.slice() : [],
+      })),
     };
     renderRouting();
   } catch (err) {
@@ -827,10 +831,12 @@ function renderRouting() {
       const sel = routingBackendNames
         .map(n => `<option value="${esc(n)}"${n === r.backend ? ' selected' : ''}>${esc(n)}</option>`)
         .join('');
+      const fbValue = (r.fallback || []).join(', ');
       return `
         <tr>
           <td><input type="text" data-rule-model="${i}" value="${esc(r.model)}" placeholder="gpt-4o-* or claude-3-opus" /></td>
           <td><select data-rule-backend="${i}">${sel}</select></td>
+          <td><input type="text" data-rule-fallback="${i}" value="${esc(fbValue)}" placeholder="comma-separated backends" /></td>
           <td>
             <button class="btn small" data-rule-up="${i}" aria-label="Move rule up" title="Move rule up" ${i === 0 ? 'disabled' : ''}>↑</button>
             <button class="btn small" data-rule-down="${i}" aria-label="Move rule down" title="Move rule down" ${i === routingDraft.rules.length - 1 ? 'disabled' : ''}>↓</button>
@@ -844,7 +850,9 @@ function renderRouting() {
     <p class="hint subtle">Rules are scanned in order; the first match wins. Patterns
     are exact strings or end with <code>*</code> for a prefix glob (e.g.
     <code>gpt-4o-*</code>). A request whose model matches no rule uses the default
-    backend below.</p>
+    backend below. <strong>Fallback</strong> is a comma-separated list of backend
+    labels the proxy will try in order if the primary returns a network error or a
+    5xx status — leave empty for no failover.</p>
     ${hasBackends ? '' : '<p class="hint warn">No backends configured yet — add a backend above before editing routing.</p>'}
     <div class="field">
       <label for="routing-default-select">Default backend</label>
@@ -855,8 +863,8 @@ function renderRouting() {
       </select>
     </div>
     <table class="table">
-      <thead><tr><th>Model pattern</th><th>Backend</th><th>Order</th></tr></thead>
-      <tbody>${ruleRows || `<tr><td colspan="3" class="hint">No rules — every request uses the default backend.</td></tr>`}</tbody>
+      <thead><tr><th>Model pattern</th><th>Backend</th><th>Fallback</th><th>Order</th></tr></thead>
+      <tbody>${ruleRows || `<tr><td colspan="4" class="hint">No rules — every request uses the default backend.</td></tr>`}</tbody>
     </table>
     <div class="actions">
       <button id="routing-add-rule" class="btn" ${disabledAttr}>Add rule</button>
@@ -878,6 +886,15 @@ function renderRouting() {
   $$('[data-rule-backend]').forEach(sel => {
     sel.addEventListener('change', e => {
       routingDraft.rules[Number(e.target.dataset.ruleBackend)].backend = e.target.value;
+    });
+  });
+  $$('[data-rule-fallback]').forEach(input => {
+    input.addEventListener('input', e => {
+      const i = Number(e.target.dataset.ruleFallback);
+      routingDraft.rules[i].fallback = e.target.value
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
     });
   });
   $$('[data-rule-up]').forEach(btn => {
@@ -906,7 +923,7 @@ function renderRouting() {
     });
   });
   $('#routing-add-rule').addEventListener('click', () => {
-    routingDraft.rules.push({ model: '', backend: routingBackendNames[0] || '' });
+    routingDraft.rules.push({ model: '', backend: routingBackendNames[0] || '', fallback: [] });
     renderRouting();
   });
   $('#routing-save').addEventListener('click', saveRouting);
@@ -927,7 +944,11 @@ async function saveRouting() {
     default: routingDraft.default,
     rules: routingDraft.rules
       .filter(r => r.model.trim() !== '' && r.backend !== '')
-      .map(r => ({ model: r.model.trim(), backend: r.backend })),
+      .map(r => ({
+        model: r.model.trim(),
+        backend: r.backend,
+        fallback: (r.fallback || []).map(s => s.trim()).filter(Boolean),
+      })),
   };
   statusEl.className = 'status';
   statusEl.textContent = 'Saving…';

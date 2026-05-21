@@ -102,6 +102,15 @@ pub struct RoutingRule {
     pub model: String,
     /// Label of an entry in `[backends.*]`.
     pub backend: String,
+    /// Ordered list of additional backend labels to try if `backend`
+    /// fails with a network error or a 5xx upstream status. Tried in
+    /// order, each backend exactly once per request. An empty list
+    /// (the default, and the wire-compat shape for pre-fallback
+    /// configs) means no failover — the primary's response is
+    /// surfaced verbatim. Fallback never fires mid-stream; once the
+    /// upstream has returned a non-5xx status we are committed to it.
+    #[serde(default)]
+    pub fallback: Vec<String>,
 }
 
 /// Resolved backend pool view: a single source of truth that the
@@ -159,7 +168,10 @@ impl Config {
             );
         }
 
-        // Validate every rule references a known backend.
+        // Validate every rule references a known backend (primary +
+        // fallbacks). An unknown label in `fallback` is the same class
+        // of operator error as an unknown primary — better to fail at
+        // parse time than to silently never failover.
         for r in &self.routing.rules {
             if !backends.contains_key(&r.backend) {
                 anyhow::bail!(
@@ -167,6 +179,36 @@ impl Config {
                     r.model,
                     r.backend
                 );
+            }
+            let mut seen_fb = std::collections::BTreeSet::new();
+            for fb in &r.fallback {
+                if !backends.contains_key(fb) {
+                    anyhow::bail!(
+                        "[routing] rule for model `{}` lists unknown fallback `{}`",
+                        r.model,
+                        fb
+                    );
+                }
+                if fb == &r.backend {
+                    anyhow::bail!(
+                        "[routing] rule for model `{}` lists its own primary `{}` as a fallback",
+                        r.model,
+                        fb
+                    );
+                }
+                if !seen_fb.insert(fb.as_str()) {
+                    // Duplicates would cause two attempts against the
+                    // same upstream on a single 5xx, which is never
+                    // useful and is almost certainly a typo. The
+                    // Console's `validate_routing_body` enforces the
+                    // same rule on PUT; mirror it here so a hand-edited
+                    // TOML can't slip past the boundary check.
+                    anyhow::bail!(
+                        "[routing] rule for model `{}` lists duplicate fallback `{}`",
+                        r.model,
+                        fb
+                    );
+                }
             }
         }
 

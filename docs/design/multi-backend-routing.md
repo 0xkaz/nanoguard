@@ -1,4 +1,4 @@
-> **Status:** partial (2026-05-17)
+> **Status:** partial (2026-05-20)
 
 # Multi-Backend Routing
 
@@ -9,14 +9,15 @@
 > - `[routing]` block with `default` + `rules`. Rule patterns: exact string or trailing-`*` glob. Rules scan in declared order, first match wins.
 > - Legacy `[backend]` single-section auto-promoted to `[backends.default]` with synthesized routing default.
 > - Required: `[routing].default` MUST be set whenever more than one backend is configured (no silent first-pick fallback).
-> - `[backends.*]` is restart-only; `[routing]` is hot-reloadable. Reload validates that every new rule references a backend present in the live pool — invalid reloads are refused with a `reload_failed` audit entry.
-> - Console: admin-only Backends tab + `GET|POST /api/backends` and `PUT|DELETE /api/backends/:name`. `api_key` has 3-state semantics (omit = keep, null = clear, string = replace).
+> - Both `[backends.*]` and `[routing]` are hot-reloadable. The reload path rebuilds `BackendPoolRuntime` from the fresh config; in-flight requests hold their own `Arc<AppState>` snapshot, so old `reqwest::Client` pools stay alive until the last request drops. `Config::pool()` validates that every rule references a real backend and that `[routing].default` is one of them — invalid reloads are refused with a `reload_failed` audit entry.
+> - Per-rule `fallback = [...]` lists are honored on `/v1/chat/completions` and `/v1/messages`. The proxy tries the primary; on network error or upstream status >= 500, walks the fallback list in order; commits to the first non-5xx response. Never fires mid-stream.
+> - Console: admin-only Backends tab + `GET|POST /api/backends` and `PUT|DELETE /api/backends/:name`. `api_key` has 3-state semantics (omit = keep, null = clear, string = replace). The Routing editor surfaces `fallback` as a comma-separated input per rule.
 >
 > **Proposed for Phase 2+** (everything below in this document that talks about):
 > - Per-client `allowed_models` and the audit verdicts `model_denied` / `model_unrouted`.
 > - The map-style routing schema (`[routing] "gpt-4o" = "openai"`) — superseded by `[routing.rules]` in the shipped form.
 > - `display_name` per backend, `/v1/models` allowlist intersection.
-> - Provider-side failover and per-backend budget partitioning (explicit non-goals of Phase 1).
+> - Health-checked / circuit-broken / cost-aware routing. The shipped `fallback` list is try-once on 5xx and no more.
 >
 > When reading the rest of this document, assume "shipped" means the bullets above and treat everything else as a future-state specification.
 
@@ -58,10 +59,13 @@ of several configured backends.
 
 ## Non-goals
 
-- **Provider-side fallback or retry across backends.** If
-  `backends.openai` is down, requests fail; nanoguard does not
-  silently re-route to `backends.anthropic`. That is a
-  load-balancer concern.
+- **Cost-aware, health-checked, or circuit-broken routing.** The
+  shipped per-rule `fallback = [...]` list is the bare minimum: try
+  primary, try each fallback once on 5xx or network error, surface.
+  No health probes, no rolling counters, no smart load balancing,
+  no per-backend retry budgets. Operators who want any of that
+  layer it downstream — LiteLLM is the supported tool. See
+  `docs/roadmap.md > Non-goals`.
 - **Cost-based routing.** Picking the cheapest backend that
   satisfies a model alias is out of scope. Operators who want this
   can implement it client-side and route to a specific model.
@@ -280,20 +284,15 @@ the routing table via the console fires the same SIGHUP-driven
 atomic swap; in-flight requests finish on the snapshot they
 acquired, the next request sees the new routing.
 
-The backend pool (`reqwest::Client` per backend) is reload-safe in
-structure but stays restart-only in behavior: changing a backend's
-endpoint or timeout requires a restart, same as `[backend]` keys
-do today. The reason is identical (`reqwest::Client` connection
-pools should not be orphaned mid-request). Adding or removing
-*entries* in `[backends.*]` is trickier and is deferred — the
-initial implementation requires a restart for any change to
-`[backends.*]`, while changes to `[routing]` and per-user
-allowlists are hot-reloadable.
+The backend pool (`reqwest::Client` per backend) is hot-reloadable.
+On reload, the new `AppState` is built with a fresh
+`BackendPoolRuntime` from the new config; in-flight requests hold
+their own `Arc<AppState>` snapshot via `shared.load_full()`, so the
+prior pool (and its `reqwest::Client` connection pools) stays alive
+until the last in-flight request drops its Arc. The old pools are
+dropped only after their last user finishes — no orphaning.
 
-The split is intentional. `[backends.*]` changes are operator-
-infrequent (you don't add a new provider every day). `[routing]`
-and allowlist changes are operator-frequent (you add a new model,
-you grant a user access to it).
+Per-user allowlists are hot-reloadable on the same swap.
 
 ## Audit and budget integration
 

@@ -268,39 +268,86 @@ pub async fn messages(
         }
     }
 
-    // Resolve which backend in the pool this request maps to.
+    // Resolve which backend(s) in the pool this request maps to.
     // /v1/messages carries `model` at the top level of the request
     // body (already extracted into `req.model`); routing rules in
-    // [routing] match against that.
-    let backend = match state.pool.route(Some(&req.model)) {
-        Some(b) => b,
-        None => {
-            warn!(
-                "routing: no backend resolved for model `{}` (anthropic)",
-                req.model
-            );
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": format!("no backend configured for model `{}`", req.model),
-                    },
-                })),
-            )
-                .into_response();
-        }
-    };
+    // [routing] match against that. The chain is the same shape the
+    // OpenAI handler walks — primary first, then per-rule fallbacks.
+    let chain = state.pool.route_chain(Some(&req.model));
+    if chain.is_empty() {
+        warn!(
+            "routing: no backend resolved for model `{}` (anthropic)",
+            req.model
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": format!("no backend configured for model `{}`", req.model),
+                },
+            })),
+        )
+            .into_response();
+    }
 
-    // Forward to backend (OpenAI-compatible)
-    let backend_resp = match backend.forward_chat(oai_body).await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("backend error (anthropic): {}", e);
+    // Forward to backend (OpenAI-compatible). On upstream failure
+    // (network error or status >= 500) walk the fallback chain. Once
+    // a backend returns a non-5xx status we are committed to that
+    // response — fallbacks are pre-status only.
+    let chain_len = chain.len();
+    let mut last_err: Option<String> = None;
+    let mut last_5xx_status: Option<StatusCode> = None;
+    let mut backend_resp_opt: Option<reqwest::Response> = None;
+    for (idx, backend) in chain.iter().enumerate() {
+        let attempt_body = if idx + 1 == chain_len {
+            oai_body.take()
+        } else {
+            oai_body.clone()
+        };
+        match backend.forward_chat(attempt_body).await {
+            Ok(r) => {
+                let status = r.status();
+                if status.is_server_error() && idx + 1 < chain_len {
+                    let _ = r.bytes().await;
+                    warn!(
+                        "backend `{}` returned {} on /v1/messages; falling through to next",
+                        backend.provider(),
+                        status
+                    );
+                    last_5xx_status = Some(status);
+                    continue;
+                }
+                backend_resp_opt = Some(r);
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(
+                    "backend `{}` errored on /v1/messages: {}",
+                    backend.provider(),
+                    msg
+                );
+                last_err = Some(msg);
+                if idx + 1 < chain_len {
+                    continue;
+                }
+            }
+        }
+    }
+    let backend_resp = match backend_resp_opt {
+        Some(r) => r,
+        None => {
+            // Every backend failed. Surface an Anthropic-shaped error
+            // — same envelope the upstream would return on its own
+            // failures, so Claude SDKs read the chain-exhausted case
+            // the way they read an upstream outage.
+            let status = last_5xx_status.unwrap_or(StatusCode::BAD_GATEWAY);
+            let msg = last_err.unwrap_or_else(|| "all backends failed".to_string());
             return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"type":"error","error":{"type":"api_error","message":e.to_string()}})),
+                status,
+                Json(json!({"type":"error","error":{"type":"api_error","message":msg}})),
             )
                 .into_response();
         }
