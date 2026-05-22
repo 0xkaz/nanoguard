@@ -4272,6 +4272,20 @@ S43_ADD=$(curl -s -b "$S43_COOKIES" -c "$S43_COOKIES" \
     "$S43_CONSOLE_URL/api/backends?name=beta")
 S43_RESTART=$(echo "$S43_ADD" | jq -r '.restart_required')
 assert_eq "43b. POST /api/backends reports restart_required=false" "$S43_RESTART" "false"
+# 43b-trig. Locks in the spawn_blocking fix for the socket reload
+# trigger. Pre-fix this came back as `triggered:false` with an
+# EAGAIN error because the sync read blocked a tokio worker the
+# proxy needed for `UnixListener::accept()`. Test that the
+# socket-mode reload reports back triggered=true / method=socket
+# the way SIGHUP-mode reload does (cf. 28d).
+S43_TRIG=$(echo "$S43_ADD" | jq -r '.reload.triggered')
+S43_METHOD=$(echo "$S43_ADD" | jq -r '.reload.method')
+S43_ERR=$(echo "$S43_ADD" | jq -r '.reload.error // empty')
+if [ "$S43_TRIG" = "true" ] && [ "$S43_METHOD" = "socket" ] && [ -z "$S43_ERR" ]; then
+    ok "43b-trig. socket reload trigger reports triggered=true, no error"
+else
+    ng "43b-trig. socket reload trigger malformed: triggered=$S43_TRIG method=$S43_METHOD error=$S43_ERR"
+fi
 S43_CSRF=$(grep -i '^x-csrf-token-next:' "$S43_ADD_HDR" 2>/dev/null \
     | awk '{print $2}' | tr -d '\r')
 [ -z "$S43_CSRF" ] && S43_CSRF=$(echo "$S43_LOGIN" | jq -r '.csrf_token // empty')

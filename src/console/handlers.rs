@@ -710,7 +710,7 @@ pub async fn api_revoke_token(
             // operator who configured `[reload]` and is watching for
             // revoke-then-200 regressions can spot a misconfigured
             // socket / pid_file at exactly the moment it bites them.
-            let reload = super::reload::trigger_invalidate_tokens(&state.config.reload);
+            let reload = super::reload::trigger_invalidate_tokens(&state.config.reload).await;
             let next_csrf = rotate_csrf(&state, &session_id);
             let headers = csrf_next_headers(next_csrf.as_deref());
             (
@@ -1245,7 +1245,7 @@ pub async fn api_create_backend(
     }
 
     record_backend_mutation(&state, &admin, "backend_create", name, Some(&body));
-    let reload = super::reload::trigger_reload(&state.config.reload);
+    let reload = super::reload::trigger_reload(&state.config.reload).await;
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (
@@ -1309,7 +1309,7 @@ pub async fn api_update_backend(
     }
 
     record_backend_mutation(&state, &admin, "backend_update", &name, Some(&body));
-    let reload = super::reload::trigger_reload(&state.config.reload);
+    let reload = super::reload::trigger_reload(&state.config.reload).await;
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (
@@ -1385,7 +1385,7 @@ pub async fn api_delete_backend(
     }
 
     record_backend_mutation(&state, &admin, "backend_delete", &name, None);
-    let reload = super::reload::trigger_reload(&state.config.reload);
+    let reload = super::reload::trigger_reload(&state.config.reload).await;
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (
@@ -1502,7 +1502,7 @@ pub async fn api_update_routing(
         prev_default.as_deref(),
         prev_rule_count,
     );
-    let reload = super::reload::trigger_reload(&state.config.reload);
+    let reload = super::reload::trigger_reload(&state.config.reload).await;
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (
@@ -2827,7 +2827,7 @@ pub async fn api_force_revoke_user_tokens(
     // a forced mass-revoke is exactly the scenario where leaving up to
     // 60s of cached "verified" results on the proxy would be a security
     // bug. See `api_revoke_token` for the design rationale.
-    let reload = super::reload::trigger_invalidate_tokens(&state.config.reload);
+    let reload = super::reload::trigger_invalidate_tokens(&state.config.reload).await;
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (
@@ -3073,7 +3073,7 @@ pub async fn api_edit_file(
     }
 
     // Trigger reload.
-    let reload = super::reload::trigger_reload(&state.config.reload);
+    let reload = super::reload::trigger_reload(&state.config.reload).await;
 
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
@@ -3216,7 +3216,7 @@ pub async fn api_revert_file(
         );
     }
 
-    let reload = super::reload::trigger_reload(&state.config.reload);
+    let reload = super::reload::trigger_reload(&state.config.reload).await;
 
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
@@ -3244,7 +3244,7 @@ pub async fn api_trigger_reload(
         return *e;
     }
 
-    let outcome = super::reload::trigger_reload(&state.config.reload);
+    let outcome = super::reload::trigger_reload(&state.config.reload).await;
     let next_csrf = rotate_csrf(&state, &session_id);
     let headers = csrf_next_headers(next_csrf.as_deref());
     (StatusCode::OK, headers, Json(json!(outcome))).into_response()

@@ -16,8 +16,19 @@ pub struct ReloadOutcome {
 }
 
 /// Trigger a reload via the configured method.
-pub fn trigger_reload(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
-    dispatch(cfg, "RELOAD")
+///
+/// This is `async` so the blocking socket exchange runs on tokio's
+/// dedicated blocking pool via `spawn_blocking`. Earlier versions
+/// were sync and called `read()` on the calling worker; in
+/// single-process mode (Console + proxy on one runtime) that pinned
+/// the worker that was supposed to also run the proxy's
+/// `UnixListener::accept()`, so the proxy never accepted the
+/// connection until the read timed out — the Console reported
+/// "reload failed" every time even though no reload was attempted.
+/// Routing the blocking exchange through `spawn_blocking` lets the
+/// runtime schedule both ends.
+pub async fn trigger_reload(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
+    dispatch(cfg.clone(), "RELOAD").await
 }
 
 /// Ask the proxy to drop its in-memory client-token verification cache.
@@ -32,11 +43,27 @@ pub fn trigger_reload(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
 /// same end (a fresh `AppState` snapshot whose cache starts empty when
 /// `[auth]` is freshly resolved). Prefer `[reload].socket` when revoke
 /// latency matters.
-pub fn trigger_invalidate_tokens(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
-    dispatch(cfg, "INVALIDATE_TOKENS")
+pub async fn trigger_invalidate_tokens(cfg: &crate::config::ReloadConfig) -> ReloadOutcome {
+    dispatch(cfg.clone(), "INVALIDATE_TOKENS").await
 }
 
-fn dispatch(cfg: &crate::config::ReloadConfig, command: &str) -> ReloadOutcome {
+async fn dispatch(cfg: crate::config::ReloadConfig, command: &'static str) -> ReloadOutcome {
+    // Offload the synchronous socket / signal call to tokio's blocking
+    // pool. The handler that called us is on a worker; running stdlib
+    // I/O directly here would block that worker, and in single-process
+    // mode the very same runtime owns the proxy's reload listener.
+    let result = tokio::task::spawn_blocking(move || dispatch_blocking(&cfg, command)).await;
+    match result {
+        Ok(outcome) => outcome,
+        Err(e) => ReloadOutcome {
+            triggered: false,
+            method: "spawn_blocking".to_string(),
+            error: Some(format!("spawn_blocking failed: {e}")),
+        },
+    }
+}
+
+fn dispatch_blocking(cfg: &crate::config::ReloadConfig, command: &str) -> ReloadOutcome {
     // Prefer Unix socket if configured.
     if let Some(ref socket_path) = cfg.socket {
         match trigger_via_socket(socket_path, command) {
@@ -102,27 +129,17 @@ fn trigger_via_pid_file(_pid_file: &str) -> Result<()> {
 
 #[cfg(unix)]
 fn trigger_via_socket(socket_path: &str, command: &str) -> Result<()> {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    // Connect with timeout to avoid blocking indefinitely.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let socket_path_owned = socket_path.to_string();
-    std::thread::spawn(move || {
-        let _ = tx.send(UnixStream::connect(&socket_path_owned));
-    });
-    let timeout = Duration::from_secs(5);
-    let mut stream = match rx.recv_timeout(timeout) {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return Err(e).with_context(|| format!("connecting to reload socket {}", socket_path));
-        }
-        Err(_) => {
-            bail!("connect to reload socket timed out after {:?}", timeout);
-        }
-    };
-
+    // This runs on tokio's blocking pool (see `dispatch`). Stdlib
+    // blocking I/O here is safe because the worker thread the
+    // Console handler runs on stays free to drive the proxy's
+    // `UnixListener::accept()`. An earlier sync-on-worker version
+    // deadlocked the single-process boot until the read timed out.
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connecting to reload socket {}", socket_path))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .with_context(|| "setting read timeout")?;
@@ -135,17 +152,18 @@ fn trigger_via_socket(socket_path: &str, command: &str) -> Result<()> {
         .with_context(|| format!("writing {} to socket", command))?;
     stream.flush().with_context(|| "flushing socket")?;
 
-    let mut buf = [0u8; 256];
-    let n = stream
-        .read(&mut buf)
+    let mut resp = String::new();
+    BufReader::new(&mut stream)
+        .read_line(&mut resp)
         .with_context(|| "reading socket response")?;
-    let resp = String::from_utf8_lossy(&buf[..n]);
+    let resp = resp.trim();
+    if let Some(rest) = resp.strip_prefix("ERR") {
+        bail!("proxy returned error:{}", rest);
+    }
     if resp.starts_with("OK") {
         Ok(())
-    } else if resp.starts_with("ERR") {
-        bail!("proxy returned error: {}", resp.trim());
     } else {
-        bail!("unexpected proxy response: {}", resp.trim());
+        bail!("unexpected proxy response: {}", resp);
     }
 }
 
