@@ -188,8 +188,9 @@ hash_only = true
 socket = "/tmp/nanoguard-verify-reload.sock"
 
 [console]
-enabled = true
-listen  = "127.0.0.1:18081"
+enabled    = true
+listen     = "127.0.0.1:18081"
+audit_path = "/tmp/nanoguard-verify-console-audit.jsonl"
 
 [console.auth]
 mode = "local"
@@ -199,11 +200,12 @@ allow_signup    = false
 bootstrap_admin = { username = "admin", password_env = "VERIFY_PW" }
 EOF
 
-rm -f /tmp/nanoguard-verify.db /tmp/nanoguard-verify-audit.jsonl /tmp/nanoguard-verify-reload.sock
+rm -f /tmp/nanoguard-verify.db /tmp/nanoguard-verify-audit.jsonl \
+      /tmp/nanoguard-verify-console-audit.jsonl /tmp/nanoguard-verify-reload.sock
 NANOGUARD_CONFIG=/tmp/nanoguard-verify.toml \
     VERIFY_PW="verify-pw-2026" \
     CONSOLE_SESSION_SECRET="$(openssl rand -hex 32)" \
-    cargo run --release &
+    cargo run --release --bin nanoguard &
 disown
 
 # Wait for both listeners.
@@ -361,9 +363,12 @@ curl -s -b /tmp/cookies -c /tmp/cookies \
     -H "X-CSRF-Token: $CSRF" | jq
 
 # Audit-log spot check: every console mutation lands in the file.
+# The Console writes its own audit log separately from the proxy's
+# (request-level) audit log — `[console].audit_path` above is the
+# one that carries actor / action / target rows.
 python3 -c "
 import json, sys
-for line in open('/tmp/nanoguard-verify-audit.jsonl').readlines()[-15:]:
+for line in open('/tmp/nanoguard-verify-console-audit.jsonl').readlines()[-15:]:
     try:
         d = json.loads(line)
         print(f\"{d.get('timestamp','?')[:19]} {d.get('actor','?'):10} {d.get('action','?')} target={d.get('target','-')}\")
@@ -371,14 +376,16 @@ for line in open('/tmp/nanoguard-verify-audit.jsonl').readlines()[-15:]:
 "
 ```
 
-You should see the routing PUT return a `200` chat response and the audit file carry `user_create`, `user_update`, `user_password_reset`, `backend_create`, `routing_update`, `backend_delete` lines in order. If `reload.triggered` is `false` for any mutation, fall back to `[reload].pid_file` (SIGHUP) in the TOML — the socket trigger sometimes false-fails on macOS in single-process mode and is being tracked separately.
+You should see the routing PUT return a `200` chat response and the console audit file carry `user_create`, `user_update`, `user_password_reset`, `backend_create`, `routing_update`, `backend_delete` lines in order. If `reload.triggered` is `false` for any mutation, fall back to `[reload].pid_file` (SIGHUP) in the TOML — historically the socket trigger could false-fail on macOS in single-process mode (fixed in #50; the workaround note stays in case you're testing an older binary).
 
 ### Teardown
 
 ```bash
 pkill -f "target/release/nanoguard"
 rm -f /tmp/nanoguard-verify.toml /tmp/nanoguard-verify.db \
-      /tmp/nanoguard-verify-audit.jsonl /tmp/nanoguard-verify-reload.sock \
+      /tmp/nanoguard-verify-audit.jsonl \
+      /tmp/nanoguard-verify-console-audit.jsonl \
+      /tmp/nanoguard-verify-reload.sock \
       /tmp/cookies /tmp/alice-cookies /tmp/hdrs.*
 ```
 
